@@ -1,0 +1,18 @@
+[package]
+name = "tile_hal"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+description = "Hardware Abstraction Layer for multi-backend accelerator dispatch"
+
+[features]
+default = []
+cuda = ["libloading"]
+
+[dependencies]
+libloading = { version = "0.8", optional = true }
+
+[dev-dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("ascend"))'] }
