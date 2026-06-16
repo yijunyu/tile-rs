@@ -1,0 +1,113 @@
+[workspace]
+
+members = [
+    "crates/*",
+
+]
+
+exclude = [
+    "crates/rustc_codegen_tile",
+    # ds4_cuda: FFI bindings to antirez's CUDA backend (ds4_gpu.h) for the
+    # Mac(Metal)->DGX-Spark(CUDA) migration. Excluded from the default
+    # macOS build (members = ["crates/*"] would otherwise auto-include it).
+    # Build on the Linux/CUDA host with: cargo build -p ds4_cuda --features cuda
+    "crates/ds4_cuda",
+    # tile_codegen: the open tile-rs codegen skeleton (CodegenTarget trait +
+    # TargetRegistry). Default build is std-only (no LLVM) and builds anywhere;
+    # the real emitters wire in via `--features emitters` on an LLVM-20 box.
+    # Excluded from the default macOS workspace build like the other emitter
+    # crates. Build/test standalone: cd crates/tile_codegen && cargo test
+    "crates/tile_codegen",
+    # tile_spec: the open executable Gherkin (Given/When/Then) spec layer. Has
+    # its own standalone [workspace] (its cucumber harness #[path]-includes the
+    # real mlir_to_* emitters with no LLVM dep), so it is excluded from the root
+    # workspace like tile_codegen. Build/test standalone: cd crates/tile_spec &&
+    # cargo test  (or via scripts/coverage.sh).
+    "crates/tile_spec",
+    "examples/acl_rs_vec_add",
+    "examples/acl_vec_mul",
+    "examples/acl_vec_add_mb",
+    "examples/acl_softmax",
+    "examples/bench_softmax_rs",
+    "examples/bench_softmax_cpp",
+    "examples/bench_vec_add_rs",
+    "examples/bench_vec_add_cpp",
+    "examples/bench_matmul_rs",
+    "examples/bench_matmul_cpp",
+    "examples/bench_layernorm_rs",
+    "examples/bench_layernorm_cpp",
+    "examples/bench_conv1d_dilated_rs",
+    "examples/bench_conv1d_dilated_cpp",
+    "examples/conv2d",
+    "examples/mha",
+    "examples/safety_case_studies",
+    "examples/tile_conv1d",
+    "examples/tile_softmax",
+    "examples/tile_matmul",
+    "examples/tile_matmul_transposed",
+    "examples/bench_softmax_tile",
+    "examples/bench_layernorm_tile",
+    "examples/bench_gelu_tile",
+    "examples/bench_conv1d_tile",
+    "examples/bench_softmax_mixed",
+    "examples/bench_softmax_mixed/kernels_cpp",
+    "examples/bench_softmax_mixed/kernels_pto",
+    "examples/ch11_exploit",
+    "crates/mlir_to_nki_tests",
+    "crates/mlir_to_aie_tests",
+    "crates/mlir_to_gpu_tests",
+    "crates/mlir_to_spirv_tests",
+    "examples/tile_softmax_nki",
+    "examples/tile_softmax_aie",
+    "examples/tile_softmax_vulkan",
+    # tile_rsqrt_metal: END-TO-END Metal (MSL) numerical-equivalence example —
+    # one tile_std kernel -> rustc_codegen_tile (TILERS_CODEGEN_PATH=metal) ->
+    # .metal/.metallib -> dispatched on this Mac's Metal GPU -> compared to a CPU
+    # reference (max abs err < 1e-4). Build/run standalone (needs LLVM-20 env for
+    # the codegen + xcrun metal):
+    #   cd examples/tile_rsqrt_metal && cargo run --release
+    "examples/tile_rsqrt_metal",
+    "examples/tile_rsqrt_metal/kernels",
+    # tile_exp_cuda: standalone CUDA codegen example (declares its own
+    # [workspace]); excluded so the root `examples/*` glob doesn't collide with
+    # its nested workspace root.
+    "examples/tile_exp_cuda",
+    "examples/tile_exp_cuda/kernels",
+    # tile_exp_vulkan: standalone Vulkan/SPIR-V codegen example. One tile_std exp
+    # kernel -> rustc_codegen_tile (TILERS_CODEGEN_PATH=vulkan) -> GLSL .comp ->
+    # glslang SPIR-V -> wgpu/MoltenVK compute, compared to a CPU reference
+    # (validated on this Mac's M1 Ultra GPU, max abs err < 1e-4). The kernels
+    # subcrate carries its own [workspace]; the host crate pulls wgpu + a
+    # codegen build-dep, so both are excluded from the default workspace build.
+    # Build/run standalone (needs LLVM-20 env + glslang + MoltenVK):
+    #   bash debug/run_kernel_equiv_vulkan.sh
+    "examples/tile_exp_vulkan",
+    "examples/tile_exp_vulkan/kernels",
+    "crates/tile_metal_py",
+    "benchmarks/deepseek_tile_kernels",
+    "benchmarks/deepseek_mixed",
+    "benchmarks/deepseek_mixed/kernels_cpp",
+    "benchmarks/deepseek_mixed/kernels_pto",
+    "benchmarks/deepseek_e2e",
+    "benchmarks/deepseek_e2e/kernels_cpp",
+    "benchmarks/deepseek_e2e/kernels_pto",
+    # kernels_pto_matmul: smoke-test subcrate exercising the K/N-blocked
+    # pto.tmatmul emitter. Gated behind ACLRS_BUILD_PTO_MATMUL=1 in
+    # benchmarks/deepseek_e2e/build.rs — the e2e bench itself uses
+    # aclnnMatmul; this subcrate exists to validate the emitter.
+    "benchmarks/deepseek_e2e/kernels_pto_matmul",
+    "benchmarks/tier1_cpp_emitters",
+    "benchmarks/tier1_cpp_emitters/kernels",
+    "benchmarks/linalg_bridge_bench",
+    "crates/pto_to_rust",
+    "crates/deepseek_metal",
+    "crates/gmview_prototype",
+]
+
+resolver = "3"
+
+[profile.dev.package.tile_std]
+debug = 0
+
+[profile.test.package.tile_std]
+debug = 0
