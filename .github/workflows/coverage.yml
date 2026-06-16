@@ -1,0 +1,37 @@
+name: coverage
+
+# Framework CI for the open tile-rs surface: no CANN/Ascend toolchain — just the
+# no-toolchain codegen + spec crates and the cargo-llvm-cov coverage gate.
+# (The Ascend build / compiletest / NPU jobs live in the ascend-rs repo's ci.yml.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Slim rust-toolchain.toml for CI
+        run: |
+          cat > rust-toolchain.toml << 'TOML'
+          [toolchain]
+          channel = "nightly-2025-08-04"
+          components = ["rustc", "cargo", "llvm-tools"]
+          TOML
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run coverage gate (open, no-toolchain surface)
+        # Ratchet set BELOW the achieved total (90.28% line on a clean run; see
+        # docs/TILE_RS_COVERAGE.md) so it catches regressions with ~2 points of
+        # headroom, not an aspirational number.
+        run: bash scripts/coverage.sh --gate 88
