@@ -1,0 +1,31 @@
+[package]
+name = "tile_codegen"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "tile-rs open codegen skeleton: the CodegenTarget trait + target registry. Std-only (no LLVM/MLIR/melior/rustc deps) — the open core of tile-rs. Target backends plug in as CodegenTarget impls; the closed Ascend (AscendC/PTO) backend registers the same way behind the `ascend` feature."
+
+# Standalone workspace: this open crate is `exclude`d from the repo root
+# workspace, and an empty `[workspace]` table here makes `cd crates/tile_codegen
+# && cargo test` (and `cargo llvm-cov`) resolve against THIS manifest rather than
+# walking up to the repo-root workspace — which the documented standalone build
+# (and the coverage harness in scripts/coverage.sh) relies on.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Default = the open, LLVM-free skeleton (trait + registry + a self-contained
+# reference target). This is what builds & tests on any box, including macOS.
+default = []
+
+# `emitters` wires the real MLIR->source emitters (convert_mlir_to_*). They live
+# in the full `rustc_codegen_tile` tree and import `crate::mlir_parse`; built on
+# an LLVM-20 box (adablue/910c). Kept off here so the skeleton stays standalone.
+emitters = []
+
+# `ascend` adds the CLOSED AscendC + PTO targets (non-open-source). Registered as
+# a peer of every other target — demoting Ascend "to the same level" is exactly a
+# `register(Box::new(AscendTarget::cpp()))` call, not a special code path.
+ascend = ["emitters"]
