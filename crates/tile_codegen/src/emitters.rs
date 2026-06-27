@@ -2,7 +2,7 @@
 //!
 //! GATE: `feature = "emitters"`. These files import `crate::mlir_parse` (the
 //! std-only parser, included by `lib.rs` under the same feature) and are part of
-//! the LLVM-20 codegen crate, so this module compiles on adablue/910c — NOT in a
+//! the LLVM-20 codegen crate, so this module compiles on an LLVM-20 host — NOT in a
 //! bare macOS build. The inclusion set mirrors `crates/mlir_to_aie_tests`
 //! (the established no-NPU emitter test harness).
 //!

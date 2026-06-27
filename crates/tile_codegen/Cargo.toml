@@ -22,7 +22,7 @@ default = []
 
 # `emitters` wires the real MLIR->source emitters (convert_mlir_to_*). They live
 # in the full `rustc_codegen_tile` tree and import `crate::mlir_parse`; built on
-# an LLVM-20 box (adablue/910c). Kept off here so the skeleton stays standalone.
+# an LLVM-20 box. Kept off here so the skeleton stays standalone.
 emitters = []
 
 # `ascend` adds the CLOSED AscendC + PTO targets (non-open-source). Registered as
