@@ -5,7 +5,7 @@
 //! * The real MLIR->source emitters (`gpu`, `msl`, `spirv`, `nki`, `aie`, …) are
 //!   wired under the `emitters` feature — they live in the full
 //!   `rustc_codegen_tile` tree and import `crate::mlir_parse`, so they compile on
-//!   an LLVM-20 box (adablue/910c). See `register_emitters`.
+//!   an LLVM-20 box. See `register_emitters`.
 //! * The CLOSED AscendC + PTO targets come in under `ascend` — registered the
 //!   SAME WAY (`register(Box::new(..))`), which is the entire point: "move
 //!   ascend-specific codegen to the same level as the other targets" reduces to
@@ -52,7 +52,7 @@ impl CodegenTarget for DebugTarget {
     }
 }
 
-// ── Real emitters (adablue / LLVM-20 build) ───────────────────────────────────
+// ── Real emitters (LLVM-20 build) ─────────────────────────────────────────────
 // Each wraps an existing `convert_mlir_to_<t>` from the rustc_codegen_tile tree.
 // 14 of 15 share the signature `(mlir: &str) -> Result<String, String>`; only
 // AscendC takes `ub_size` and returns richer metadata — handled in `crate::ascend`.

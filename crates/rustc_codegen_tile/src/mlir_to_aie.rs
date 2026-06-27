@@ -2,7 +2,7 @@
 //!
 //! Converts merged MLIR modules (LLVM dialect with `__tile_*` intrinsics)
 //! into IRON Python source (the MLIR-AIE high-level Python DSL), which can be
-//! compiled by `aiecc.py` and simulated on adablue without any hardware.
+//! compiled by `aiecc.py` and simulated in software without any hardware.
 //!
 //! # IRON Python Output Format
 //!
