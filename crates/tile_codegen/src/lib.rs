@@ -42,6 +42,23 @@ pub use targets::{DebugTarget, EmitterTarget};
 #[path = "../../rustc_codegen_tile/src/mlir_parse.rs"]
 pub(crate) mod mlir_parse;
 
+// Emitters that other emitters import via crate-root paths must be declared here
+// under their `mlir_to_*` names, not aliased inside `mod emitters`:
+//   - `mlir_to_pto`: shared PTO/MLIR helper used by 9 emitters (`use crate::mlir_to_pto`)
+//   - `mlir_to_gpu`: imported by `mlir_to_musa` (`use crate::mlir_to_gpu`)
+// `emitters` re-exports their public `convert_mlir_to_*` entry points.
+// PTO is a closed target: the open emitters import `mlir_to_pto`'s shared
+// helpers, but its own `convert_mlir_to_pto` entry and PTO-specific translators
+// are unused in the open build — allow the resulting dead_code here.
+#[cfg(feature = "emitters")]
+#[path = "../../rustc_codegen_tile/src/mlir_to_pto.rs"]
+#[allow(dead_code)]
+pub(crate) mod mlir_to_pto;
+
+#[cfg(feature = "emitters")]
+#[path = "../../rustc_codegen_tile/src/mlir_to_gpu.rs"]
+pub(crate) mod mlir_to_gpu;
+
 #[cfg(feature = "emitters")]
 pub(crate) mod emitters;
 
