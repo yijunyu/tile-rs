@@ -10,8 +10,8 @@
 //! (the 14 uniform open targets). AscendC/PTO are NOT here — they are closed and
 //! live in `crate::ascend`.
 
-#[path = "../../rustc_codegen_tile/src/mlir_to_gpu.rs"]
-mod gpu;
+// `mlir_to_gpu` is declared at crate root (in lib.rs) because `mlir_to_musa`
+// imports it as `crate::mlir_to_gpu`; re-export its entry point from here.
 #[path = "../../rustc_codegen_tile/src/mlir_to_musa.rs"]
 mod musa;
 #[path = "../../rustc_codegen_tile/src/mlir_to_spirv.rs"]
@@ -41,7 +41,7 @@ pub use aie::convert_mlir_to_aie;
 pub use bang::convert_mlir_to_bang;
 pub use csl::convert_mlir_to_csl;
 pub use gaudi::convert_mlir_to_gaudi;
-pub use gpu::convert_mlir_to_gpu;
+pub use crate::mlir_to_gpu::convert_mlir_to_gpu;
 pub use hexagon::convert_mlir_to_hexagon;
 pub use linalg::convert_mlir_to_linalg;
 pub use msl::convert_mlir_to_msl;
