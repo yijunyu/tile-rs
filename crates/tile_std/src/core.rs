@@ -128,7 +128,8 @@ pub mod marker {
 
     #[lang = "destruct"]
     #[rustc_deny_explicit_impl]
-    #[rustc_do_not_implement_via_object]
+    // Renamed from `#[rustc_do_not_implement_via_object]` after nightly-2025-08-04.
+    #[rustc_dyn_incompatible_trait]
     pub trait Destruct: PointeeSized {}
 
     #[lang = "freeze"]
@@ -246,6 +247,11 @@ pub mod clone {
     pub trait Clone: Sized {
         fn clone(&self) -> Self;
     }
+
+    // The built-in `#[derive(Clone)]` expansion references
+    // `core::clone::TrivialClone` on nightlies after 2025-08-04 to fast-path
+    // field-trivial clones. This `no_core` crate must supply the marker itself.
+    pub unsafe trait TrivialClone: Clone {}
 
     // region:builtin_impls
     macro_rules! impl_clone {
@@ -433,7 +439,9 @@ pub mod mem {
     }
 
     // region:deref
-    impl<T: PointeeSized> crate::core::ops::Deref for ManuallyDrop<T> {
+    // Use `?Sized` (relaxes to PointeeSized) to match the Deref::Target bound;
+    // an explicit `PointeeSized` bound instead over-constrains to MetaSized here.
+    impl<T: ?Sized> crate::core::ops::Deref for ManuallyDrop<T> {
         type Target = T;
         fn deref(&self) -> &T {
             &self.value
@@ -656,11 +664,11 @@ pub mod ptr {
     }
 
     // region:addr_of
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     pub macro addr_of($place:expr) {
         &raw const $place
     }
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     pub macro addr_of_mut($place:expr) {
         &raw mut $place
     }
@@ -731,12 +739,13 @@ pub mod intrinsics {
     #[rustc_intrinsic]
     pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);
 
+    // Float intrinsics became `safe` after 2025-08-04; sqrt/exp/log stayed non-const.
     #[rustc_intrinsic]
-    pub unsafe fn expf32(x: f32) -> f32;
+    pub fn expf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn logf32(x: f32) -> f32;
+    pub fn logf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn sqrtf32(x: f32) -> f32;
+    pub fn sqrtf32(x: f32) -> f32;
 
     // Bit manipulation intrinsics
     #[rustc_intrinsic]
@@ -754,25 +763,25 @@ pub mod intrinsics {
     #[rustc_intrinsic]
     pub const fn rotate_right<T: Copy>(x: T, shift: u32) -> T;
 
-    // Float intrinsics
+    // Float intrinsics — these became `safe const fn` after 2025-08-04.
     #[rustc_intrinsic]
-    pub unsafe fn floorf32(x: f32) -> f32;
+    pub const fn floorf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn ceilf32(x: f32) -> f32;
+    pub const fn ceilf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn roundf32(x: f32) -> f32;
+    pub const fn roundf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn truncf32(x: f32) -> f32;
+    pub const fn truncf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn fabsf32(x: f32) -> f32;
+    pub const fn fabsf32(x: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn copysignf32(x: f32, y: f32) -> f32;
+    pub const fn copysignf32(x: f32, y: f32) -> f32;
     #[rustc_intrinsic]
-    pub unsafe fn fmaf32(a: f32, b: f32, c: f32) -> f32;
-    #[rustc_intrinsic]
-    pub fn minnumf32(x: f32, y: f32) -> f32;
-    #[rustc_intrinsic]
-    pub fn maxnumf32(x: f32, y: f32) -> f32;
+    pub const fn fmaf32(a: f32, b: f32, c: f32) -> f32;
+    // `minnumf32`/`maxnumf32` intrinsics were removed after 2026-02-28 (superseded
+    // by `minimumf32`/`maximumf32`, which differ in NaN/signed-zero semantics).
+    // They were unused workspace-wide, so drop the dead declarations rather than
+    // re-point them at intrinsics with different behavior.
 }
 
 pub mod ops {
@@ -809,13 +818,13 @@ pub mod ops {
             fn deref(&self) -> &Self::Target;
         }
 
-        impl<T: PointeeSized> Deref for &T {
+        impl<T: ?Sized> Deref for &T {
             type Target = T;
             fn deref(&self) -> &T {
                 *self
             }
         }
-        impl<T: PointeeSized> Deref for &mut T {
+        impl<T: ?Sized> Deref for &mut T {
             type Target = T;
             fn deref(&self) -> &T {
                 *self
@@ -835,7 +844,7 @@ pub mod ops {
             type Target: ?Sized;
         }
 
-        impl<P: PointeeSized, T: PointeeSized> Receiver for P
+        impl<P: PointeeSized, T: ?Sized> Receiver for P
         where
             P: Deref<Target = T>,
         {
@@ -1988,14 +1997,15 @@ pub mod fmt {
             Unknown,
         }
 
-        #[lang = "format_count"]
+        // `format_count`/`format_placeholder`/`format_unsafe_arg` are no longer
+        // lang items after 2025-08-04; the `format_args!` expansion resolves these
+        // types by path. Keep the types, drop the removed `#[lang]` attributes.
         pub enum Count {
             Is(usize),
             Param(usize),
             Implied,
         }
 
-        #[lang = "format_placeholder"]
         pub struct Placeholder {
             pub position: usize,
             pub fill: char,
@@ -2026,7 +2036,6 @@ pub mod fmt {
         }
 
         // region:fmt_before_1_89_0
-        #[lang = "format_unsafe_arg"]
         pub struct UnsafeArg {
             _private: (),
         }
@@ -2066,6 +2075,7 @@ pub mod fmt {
                 args: &[],
             }
         }
+
 
         pub fn new_v1_formatted(
             pieces: &'a [&'static str],
@@ -3061,9 +3071,17 @@ pub mod panic {
             panic_cold_display(&$arg);
         }),
         ($($t:tt)+) => ({
-            // Semicolon to prevent temporaries inside the formatting machinery from
-            // being considered alive in the caller after the panic_fmt call.
-            $crate::core::panicking::panic_fmt($crate::const_format_args!($($t)+));
+            // ANALYSIS-ONLY DIVERGENCE (nightly >2025-08-04 port): the built-in
+            // `const_format_args!` expansion now emits `Arguments::from_str`/`new`
+            // against a repacked `fmt::Arguments` layout this crate does not
+            // implement. Since `panic_fmt` is a `loop {}` stub on-device and kernels
+            // never format, route the formatted-panic arm through the surviving
+            // `new_const` constructor with a placeholder instead of building real
+            // format args. Restore `const_format_args!` if host-side panic messages
+            // are needed (requires porting the `Arguments` ABI).
+            $crate::core::panicking::panic_fmt(
+                $crate::core::fmt::Arguments::new_const(&["explicit panic"]),
+            );
         }),
     }
 
@@ -3076,9 +3094,18 @@ pub mod panic {
 }
 
 pub mod panicking {
-    #[rustc_const_panic_str] // enforce a &&str argument in const-check and hook this by const-eval
+    // `#[rustc_const_panic_str]` was removed from rustc after nightly-2025-08-04;
+    // it only enforced a `&&str` argument during const-check, so dropping it is safe here.
     pub fn panic_display<T: crate::core::fmt::Display>(x: &T) -> ! {
-        panic_fmt(crate::format_args!("{}", *x));
+        // ANALYSIS-ONLY DIVERGENCE (nightly >2025-08-04 port): the built-in
+        // `format_args!` expansion now targets a repacked `fmt::Arguments`
+        // (`Arguments::from_str`/`new` over a NonNull tagged-pointer layout) that
+        // this crate's pre-restructure `Arguments` does not implement. On-device
+        // panics are `loop {}` stubs and kernels never format, so we diverge here
+        // instead of porting the whole `Arguments` ABI. Restore real formatting if
+        // host-side panic messages are ever needed. See panic_2021 catch-all below.
+        let _ = x;
+        loop {}
     }
 
     // This function is used instead of panic_fmt in const eval.
@@ -3155,7 +3182,7 @@ mod arch {
 #[macro_use]
 pub mod macros {
     #[rustc_builtin_macro]
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     pub macro stringify($($t:tt)*) {
         /* compiler built-in */
     }
