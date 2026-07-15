@@ -1,3 +1,16 @@
+# DELIBERATE PIN — do not bump casually.
+#
+# tile_std is `#![no_core]` and declares `rustc_intrinsic`s (rotate_left, sqrtf32,
+# ...) that are only satisfied by the tile MIR->MLIR codegen backend, which links a
+# specific rustc/LLVM version. `cargo build` therefore works ONLY on the nightly the
+# backend was built against; a newer nightly's stock backend ICEs
+# ("intrinsic rotate_left must be overridden by codegen backend, but isn't").
+# `cargo check` works on newer nightlies (no codegen), and the `.github/workflows/
+# toolchain-drift.yml` guard enforces both: build on this pin, check on current.
+#
+# To move the pin you must first rebuild the codegen backend against the new
+# nightly's LLVM (that backend lives outside this repo). tile_std itself is already
+# two-way source-compatible via crates/tile_std/build.rs commit-date cfg gates.
 [toolchain]
 channel = "nightly-2025-08-04"
 components = ["rustc", "cargo", "clippy", "llvm-tools", "rust-src", "rustc-dev", "rustfmt", "rust-analyzer", "miri"]
