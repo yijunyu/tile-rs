@@ -74,15 +74,10 @@ jobs:
           # incomplete `generic_const_exprs` feature, which always warns.
           rustflags: ""
 
-      - name: Check tile_std on the current nightly (report-only)
-        # Forward-compat is informational: a brand-new nightly may add compiler-
-        # internal churn the port has not caught up to yet. Surface it as a CI
-        # notice so it is visible, but never fail the check — only the pinned
-        # build is a hard gate. When this warns, port the drift and the warning
-        # clears on its own.
-        run: |
-          if cargo check -p tile_std; then
-            echo "tile_std checks clean on the current nightly."
-          else
-            echo "::warning title=tile_std forward-compat drift::tile_std does not check on the latest nightly; the #![no_core] surface needs a port. This is informational and does not block."
-          fi
+      - name: Check tile_std on the current nightly
+        # tile_std is forward-compatible: its build.rs commit-date cfg gates keep
+        # the #![no_core] surface checking across the whole supported nightly range
+        # (pinned 2025-08-04 through current). A failure here is real drift from a
+        # new nightly and must be ported (add a dated cfg gate), so this is a hard
+        # gate, not report-only.
+        run: cargo check -p tile_std
