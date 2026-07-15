@@ -128,8 +128,12 @@ pub mod marker {
 
     #[lang = "destruct"]
     #[rustc_deny_explicit_impl]
-    // Renamed from `#[rustc_do_not_implement_via_object]` after nightly-2025-08-04.
-    #[rustc_dyn_incompatible_trait]
+    // This marker attribute was renamed `rustc_do_not_implement_via_object` ->
+    // `rustc_dyn_incompatible_trait` within the 2026-02 nightly cycle. Gate on the
+    // `build.rs`-detected commit date so tile_std builds on both the pinned
+    // 2025-08-04 toolchain and current nightlies.
+    #[cfg_attr(rustc_dyn_incompatible_trait_attr, rustc_dyn_incompatible_trait)]
+    #[cfg_attr(not(rustc_dyn_incompatible_trait_attr), rustc_do_not_implement_via_object)]
     pub trait Destruct: PointeeSized {}
 
     #[lang = "freeze"]
@@ -739,13 +743,27 @@ pub mod intrinsics {
     #[rustc_intrinsic]
     pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);
 
-    // Float intrinsics became `safe` after 2025-08-04; sqrt/exp/log stayed non-const.
+    // Float intrinsics became `safe` right after 2025-08-04 (sqrt/exp/log stayed
+    // non-const). Gate both spellings so tile_std builds on the pinned toolchain
+    // and on current nightlies. See build.rs `rustc_float_intrinsics_safe`.
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub fn expf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub fn logf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub fn sqrtf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn expf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn logf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn sqrtf32(x: f32) -> f32;
 
     // Bit manipulation intrinsics
     #[rustc_intrinsic]
@@ -763,21 +781,50 @@ pub mod intrinsics {
     #[rustc_intrinsic]
     pub const fn rotate_right<T: Copy>(x: T, shift: u32) -> T;
 
-    // Float intrinsics — these became `safe const fn` after 2025-08-04.
+    // Float intrinsics — these became `safe const fn` right after 2025-08-04.
+    // Gate both spellings (see build.rs `rustc_float_intrinsics_safe`).
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn floorf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn ceilf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn roundf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn truncf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn fabsf32(x: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn copysignf32(x: f32, y: f32) -> f32;
+    #[cfg(rustc_float_intrinsics_safe)]
     #[rustc_intrinsic]
     pub const fn fmaf32(a: f32, b: f32, c: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn floorf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn ceilf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn roundf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn truncf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn fabsf32(x: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn copysignf32(x: f32, y: f32) -> f32;
+    #[cfg(not(rustc_float_intrinsics_safe))]
+    #[rustc_intrinsic]
+    pub unsafe fn fmaf32(a: f32, b: f32, c: f32) -> f32;
     // `minnumf32`/`maxnumf32` intrinsics were removed after 2026-02-28 (superseded
     // by `minimumf32`/`maximumf32`, which differ in NaN/signed-zero semantics).
     // They were unused workspace-wide, so drop the dead declarations rather than
