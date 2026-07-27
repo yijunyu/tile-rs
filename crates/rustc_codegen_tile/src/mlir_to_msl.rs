@@ -2337,8 +2337,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Clamp        => emit_clamp_msl(out),
         KernelType::CastF32F16   => emit_cast_msl(out, "half"),
         KernelType::CastF16F32   => emit_cast_msl(out, "float"),
-        KernelType::PartitionCell => emit_partition_cell_msl(out),
-        KernelType::PartitionCellStore => emit_partition_cell_store_msl(out),
+        KernelType::PartitionCell => emit_partition_cell_msl(out, num_bufs),
+        KernelType::PartitionCellStore => emit_partition_cell_store_msl(out, num_bufs),
         KernelType::Slice        => emit_slice_msl(out),
         KernelType::Concat       => emit_concat_msl(out),
         KernelType::Scatter      => emit_scatter_msl(out),
@@ -3257,19 +3257,24 @@ fn emit_cast_msl(out: &mut String, target_type: &str) {
 /// Here that is partition_disjoint -- distinct in-grid indices own disjoint footprints -- so
 /// two stores to (0,0) and (0,1) are safe by typing and the emitted code needs no guard.
 /// Buffers: p0 = source tile, p1 = destination buffer.
-fn emit_partition_cell_store_msl(out: &mut String) {
+fn emit_partition_cell_store_msl(out: &mut String, num_bufs: usize) {
+    let dst = format!("p{}", num_bufs.saturating_sub(1).max(1));
     writeln!(out, "    uint ci = (cell_i != 0u) ? cell_i : tgpig.x;").unwrap();
     writeln!(out, "    uint cj = (cell_j != 0u) ? cell_j : tgpig.y;").unwrap();
     writeln!(out, "    uint base = ci * tile_rows * src_cols + cj * tile_cols;").unwrap();
     writeln!(out, "    uint r = tgpig.z;").unwrap();
     writeln!(out, "    if (r < tile_rows) {{").unwrap();
     writeln!(out, "        for (uint c = _tid_v.x; c < tile_cols; c += _tc_v.x) {{").unwrap();
-    writeln!(out, "            p1[base + r * src_cols + c] = p0[r * tile_cols + c];").unwrap();
+    writeln!(out, "            {dst}[base + r * src_cols + c] = p0[r * tile_cols + c];").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
 }
 
-fn emit_partition_cell_msl(out: &mut String) {
+fn emit_partition_cell_msl(out: &mut String, num_bufs: usize) {
+    // Only the LAST buffer is writable under the default qualifier rule, so the destination
+    // is p{n-1}, not a hardcoded p1. With three buffers p1 is `device const` and writing to
+    // it fails Metal compilation with "read-only variable is not assignable".
+    let dst = format!("p{}", num_bufs.saturating_sub(1).max(1));
     // The cell index comes from the dispatch grid (tgpig.x/.y), matching cuTile's
     // `partition.load([pid.0, pid.1])`; cell_i/cell_j remain as uniforms for the
     // single-cell case, and the grid overrides them when it is larger than 1x1.
@@ -3280,7 +3285,7 @@ fn emit_partition_cell_msl(out: &mut String) {
     writeln!(out, "    if (r < tile_rows) {{").unwrap();
     // The 3-D grid path binds uint3 _tid_v / _tc_v, not scalar tid/tcount.
     writeln!(out, "        for (uint c = _tid_v.x; c < tile_cols; c += _tc_v.x) {{").unwrap();
-    writeln!(out, "            p1[r * tile_cols + c] = p0[base + r * src_cols + c];").unwrap();
+    writeln!(out, "            {dst}[r * tile_cols + c] = p0[base + r * src_cols + c];").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
 }
