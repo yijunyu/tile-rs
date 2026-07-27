@@ -35,6 +35,13 @@
 //! loaded at runtime via the `metal` Rust crate's
 //! `Device::new_library_with_source` or `Device::new_library_with_file`.
 
+// GGUF quant formats (Q2_K, Q4_K) are proper nouns, and every emitter here is named after
+// the format it lowers -- emit_mul_mv_id_q4_K_f32_msl and friends. Snake-casing the K would
+// sever the 1:1 correspondence between an emitter, its test, and the format name used
+// throughout llama.cpp and the GGUF spec, making a failure harder to trace. These are
+// internal function names; nothing dispatches on them, so the casing has no bearing on
+// correctness.
+#![allow(non_snake_case)]
 use std::collections::HashMap;
 use std::fmt::Write;
 
