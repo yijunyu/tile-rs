@@ -30,7 +30,7 @@
 //!
 //! # Usage
 //!
-//! Set `TILERS_CODEGEN_PATH=metal` before building.  The generated `.metal`
+//! Set `ACLRS_CODEGEN_PATH=metal` before building.  The generated `.metal`
 //! file is compiled by `xcrun metal` (via build.rs) into `.metallib`, then
 //! loaded at runtime via the `metal` Rust crate's
 //! `Device::new_library_with_source` or `Device::new_library_with_file`.
@@ -60,6 +60,8 @@ enum KernelType {
     ScatterAdd,  // EMA: atomic scatter-add for code_sum/code_count
     Where,       // L1-smooth loss: cond ? a : b element-wise select
     Transpose,   // 2D matrix transpose
+    PartitionCell, // Copy one cell (i,j) of a Tr x Tc partition (thm:partdisj)
+    PartitionCellStore, // Write one cell (i,j) of a Tr x Tc partition (thm:partdisj)
     Rsqrt,       // Element-wise reciprocal square root
     Log,         // Element-wise natural logarithm
     Sigmoid,     // Element-wise sigmoid: 1/(1+exp(-x))
@@ -73,7 +75,8 @@ enum KernelType {
     Scatter,     // Indexed scatter
     Gather,      // Indexed gather
     TopK,        // Top-K per row via insertion sort
-    MatmulF16,   // f16 matrix multiply
+    MatmulF16,   // f16 matrix multiply (scalar triple loop)
+    MatmulF16Simdgroup, // f16 matmul via simdgroup_matrix_multiply_accumulate (8x8 tiles)
     Fill,        // Fill with scalar
     Max,         // Element-wise max
     Div,         // Element-wise divide
@@ -237,6 +240,9 @@ enum KernelType {
     MulMvIdQ4KPairF32,      // DS4 kernel_mul_mv_id_q4_K_pair_f32 M130 (moe.metal:1106): paired gate+up q4_K MoE-routed matvec. 6 char* bufs (src0_gate, src0_up, src1, dst_gate, dst_up, ids); same is_mul_mv_id_pair predicate + 11-uint shell as M128. Inner reuses M112 (kernel_mul_mv_q4_K_f32_impl) per row in a fused loop sharing y, yl, yh, sumy loads across paired sumg/sumu. NR0=2, no threadgroup table required.
     MulMvIdQ4KPairSwigluF32, // DS4 kernel_mul_mv_id_q4_K_pair_swiglu_f32 M131 (moe.metal:1160): SwiGLU-fused tri-output sibling of M130 (paired q4_K matvec with inline SwiGLU + route_weight). 8 char* bufs (src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, ids, weights); idx 3/4/5 writable via is_mul_mv_id_pair_swiglu. M130 paired q4_K inner produces raw gate/up; finalize block matches M129: dst_gate/dst_up offsets use i11 (=idx%ne11), dst_mid offset uses idx*mid_row_stride; per row: clamp gated by c>1e-6 (g=fmin(g,c); u=clamp(u,-c,c)); writes dst_gate=raw_gate, dst_up=raw_up, dst_mid=silu(g)*u*route_weight. 14 uniforms (M130's 11 + mid_row_stride/weight_stride/clamp_value as f32).
     MulMvIdQ2KSum6F32,      // DS4 kernel_mul_mv_id_q2_K_sum6_f32 M132 (moe.metal:1245): q2_K MoE matvec summing 6 fixed-slot experts per token into one dst. 4 char* bufs (src0s, src1, dst, ids). Outer loop over expert_slot in 0..6 reads token_ids[expert_slot] as routing index for src0 (×nb02) and src1 (×nb11); token = tgpig.y. Per-expert inner runs q2_K decode identical to M111 (NSG=2, NR0=N_R0_Q2_K=4). 8 uniforms (ne00, ne0, nbi1, nb01, nb02, nb11, nb12, nb1).
+    MulMvRmsGateUpSwigluQ4KF32, // F2: F1 + RMS-norm folded into prologue. 5 bufs (gate_w, up_w, norm_w, x, dst_mid), 4 uniforms (ne00, ne0, nb01, eps). Cooperative RMS over x[D], stages normalized x*scale*norm_w into threadgroup, inner reads threadgroup. Normalized activation never round-trips DRAM.
+    MulMvQkvQ4KF32, // F3 fused Q/K/V tri-output q4_K matvec: three independent matvecs on shared xin[D] -> distinct q/k/v outputs, sharing the x-load for GPU occupancy (Phase-10 lever, like F1). 7 bufs (q_w, k_w, v_w, x, q_out, k_out, v_out), 4 uniforms (ne00, n_q, n_kv, nb01). Grid over n_q+2*n_kv rows; each threadgroup maps to one matrix.
+    MulMvGateUpSwigluQ4KF32, // F1 dense gate/up+SwiGLU fused q4_K matvec: dense sibling of MulMvIdQ4KPairSwigluF32 (M131) with ids/route-weight/clamp/tri-output stripped. 4 bufs (gate_w, up_w, x, dst_mid); writes only dst_mid=silu(gate)*up so gate/up never hit DRAM. Qwen3 dense FFN gate/up matvec + silu_mul fused.
     MulMvIdQ4KSum6F32,      // DS4 kernel_mul_mv_id_q4_K_sum6_f32 M133 (moe.metal:1336): q4_K sibling of M132. Same 4-buf + 8-uniform shell + sum6 routing; inner uses q4_K decode (M112 kmask1/2/3 6-bit scale unpack + 4-bit nibble masks). NR0=N_R0_Q4_K=2, block_q4_K=144B.
     Dsv4AttnOutLowQ8_0F32,  // DS4 kernel_dsv4_attn_out_low_q8_0_f32 M93: stripped-down M92 with id=group (i02 = idx, no ids buffer); 3 char* bufs (src0s, src1, dst).
     Dsv4SharedGateUpSwigluQ8_0, // DS4 kernel_dsv4_shared_gate_up_swiglu_q8_0 M114 (dense.metal:203): fused shared-expert gate+up q8_0 matvec with inline SwiGLU. 6 char* bufs (src0_gate, src0_up, src1 const; dst_gate, dst_up, dst_mid writable). NSG=2, NR0=N_R0_Q8_0=2, NQ=8, QK8_0=32, block_q8_0=34B. Two parallel src0 streams share y load; sumg/sumu accumulators per row reduced via baked threadgroup float shmem_f32[2*NR0*NW]; final write produces gate, up, and mid=silu(gate)*up to three dst buffers.
@@ -287,7 +293,26 @@ enum KernelType {
     MatvecF16,      // matvec with f16 weights, f32 accum, cooperative simd_sum + shared mem
     MatvecF16Bias,  // same with bias
     MatvecF16Add,   // matvec with f16 weights + residual add: out = A@B + R
-    RopeInplace,    // in-place RoPE for decode (position as runtime param)
+    MatvecI8V4,     // matvec with int8 weights, per-row f16 scale, float4/char4 vectorized loads
+    MatvecI8V4Batched, // batched (M=8) int8 matvec: M-partition of MatvecI8V4 — one weight read reused across 8 activation columns
+    // Batched (M=8) non-matmul kernels: M-partition of a single-stream kernel, stream index from 2D grid .y.
+    // Each is emitted verbatim (full kernel incl. exotic signature) by its emit fn; the generic wrapper is skipped.
+    RmsNormMulBatched,   // batched rms_norm*w, 2D grid (row,stream), simd reduction + threadgroup float sh[32]
+    RmsNormMulV4Batched, // batched rms_norm*w, float4-vectorized body
+    RopeSplitBatched,    // batched split-half RoPE in-place, 2D grid, no simd/shared
+    AttnDecodeBatched,   // batched decode attention, 2D grid (head,stream), simd reduction + scores[256]
+    AttnDecodeV4Batched, // batched decode attention, float4 Q.K dot
+    AttnDecodeSplitK,    // split-K decode attention, per-split flash partial (acc/m/l in registers, red[256] sized to dh threads — H3-bounded)
+    AttnDecodeSplitKV2,  // split-K decode attention v2: one simdgroup/head, simd_sum QK dot, f16 K/V, no barrier tree (3.9–4.5× faster)
+    AttnDecodeCombine,   // flash-merge of split-K partials into final normalized output
+    SiluMulBatched,      // batched silu(g)*u, uint2 grid, no simd/shared
+    AddInplaceBatched,   // batched a += b, uint2 grid, no simd/shared
+    KvWriteBatched,      // batched KV-cache write, uint2 grid, no simd/shared
+    MatvecQ4K,      // matvec over Q4_K packed super-blocks (144B/256w), quantized-domain decode
+    MatvecQ4KReg,   // register-blocked scalar Q4_K matvec (llama.cpp mul_mv_q design): 4 rows/simdgroup, emitted verbatim
+    MatvecQ4KCoop,  // cooperative-read Q4_K matvec (llama.cpp mul_mv_q4_K single-read): 2 rows/simdgroup, 402 GB/s, emitted verbatim
+    RopeInplace,    // in-place RoPE for decode, INTERLEAVED (GPT-J): rotate (x[2i],x[2i+1])
+    RopeInplaceSplit, // in-place RoPE, SPLIT-HALF (NeoX/HF Qwen2): rotate x[i] against x[i+d/2]
     KvCacheUpdate,  // copy vector into KV cache at position
     AttentionDecode, // decode attention: threadgroup shared scores, simd reduction
     GateUpSiLU,     // fused gate+up matvec + silu*mul: silu(A@W_gate) * (A@W_up)
@@ -409,6 +434,27 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
 
     classify_body(&func.body_lines, &mut ctx);
 
+    // Batched (M=8) non-matmul kernels have exotic signatures (2D/3D grid position
+    // attributes, in-place buffers, many params) that the generic signature machinery
+    // does not produce. Emit the complete `kernel void NAME(...) { ... }` verbatim and
+    // return early, bypassing the generic wrapper entirely.
+    match ctx.kernel_type {
+        KernelType::RmsNormMulBatched   => { emit_rms_norm_mul_batched_msl(out); return Ok(()); }
+        KernelType::RmsNormMulV4Batched => { emit_rms_norm_mul_v4_batched_msl(out); return Ok(()); }
+        KernelType::RopeSplitBatched    => { emit_rope_split_batched_msl(out); return Ok(()); }
+        KernelType::AttnDecodeBatched   => { emit_attn_decode_batched_msl(out); return Ok(()); }
+        KernelType::AttnDecodeV4Batched => { emit_attn_decode_v4_batched_msl(out); return Ok(()); }
+        KernelType::AttnDecodeSplitK    => { emit_attn_decode_splitk_msl(out); return Ok(()); }
+        KernelType::AttnDecodeSplitKV2  => { emit_attn_decode_splitk_v2_msl(out); return Ok(()); }
+        KernelType::AttnDecodeCombine   => { emit_attn_decode_combine_msl(out); return Ok(()); }
+        KernelType::SiluMulBatched      => { emit_silu_mul_batched_msl(out); return Ok(()); }
+        KernelType::AddInplaceBatched   => { emit_add_inplace_batched_msl(out); return Ok(()); }
+        KernelType::KvWriteBatched      => { emit_kv_write_batched_msl(out); return Ok(()); }
+        KernelType::MatvecQ4KReg        => { emit_matvec_q4k_reg_msl(out); return Ok(()); }
+        KernelType::MatvecQ4KCoop       => { emit_matvec_q4k_coop_msl(out); return Ok(()); }
+        _ => {}
+    }
+
     let num_bufs = ptr_args.len().max(match ctx.kernel_type {
         KernelType::Add | KernelType::Sub | KernelType::Mul => 3,
         KernelType::LayerNorm => 4,  // input, gamma, beta, output
@@ -421,7 +467,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::GetRows    => 3, // table(float), ids(int), output(float)
         KernelType::SetRows    => 3, // src(float), ids(int), dst(float)
         KernelType::TopK       => 3, // input, out_values, out_indices
-        KernelType::MatmulF16  => 3, // A, B, C
+        KernelType::MatmulF16 | KernelType::MatmulF16Simdgroup => 3, // A, B, C
         KernelType::Max | KernelType::Div => 3, // a, b, output
         KernelType::Fill => 1, // output only
         KernelType::Quantize | KernelType::Dequantize => 3, // src, scale, output
@@ -573,6 +619,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::MulMvIdIq2XxsPairF32 => 6,         // M128: paired iq2_xxs (gate+up) — src0_gate, src0_up, src1, dst_gate, dst_up, ids
         KernelType::MulMvIdIq2XxsPairSwigluF32 => 8,   // M129: paired iq2_xxs SwiGLU tri-out — src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, ids, weights
         KernelType::MulMvIdQ4KPairF32 => 6,            // M130: paired q4_K (gate+up) — src0_gate, src0_up, src1, dst_gate, dst_up, ids
+        KernelType::MulMvRmsGateUpSwigluQ4KF32 => 5,     // F2: gate_w, up_w, norm_w, x, dst_mid
+        KernelType::MulMvQkvQ4KF32 => 7,                // F3: q_w, k_w, v_w, x, q_out, k_out, v_out
+        KernelType::MulMvGateUpSwigluQ4KF32 => 4,       // F1 dense: gate_w, up_w, x, dst_mid
         KernelType::MulMvIdQ4KPairSwigluF32 => 8,      // M131: paired q4_K SwiGLU tri-out — src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, ids, weights
         KernelType::MulMvIdQ2KSum6F32 => 4,            // M132: q2_K sum-of-6-experts — src0s, src1, dst, ids
         KernelType::MulMvIdQ4KSum6F32 => 4,            // M133: q4_K sum-of-6-experts — src0s, src1, dst, ids
@@ -624,8 +673,13 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::ResidualAdd  => 3,  // a, b, output
         // Decode-optimized ops
         KernelType::MatvecF16     => 3, // activation(f32), weight(f16), output(f32)
+        KernelType::MatvecI8V4    => 4, // activation(f32/float4), weight(i8/char), output(f32), scale(f16 per-row)
+        KernelType::MatvecI8V4Batched => 4, // same 4 buffers: activation(f32), weight(char), output(f32), scale(f16 per-row)
+        KernelType::MatvecQ4K     => 3, // weight(uchar packed blocks), activation(f32), output(f32)
+        KernelType::MatvecQ4KReg  => 3, // weight(uchar packed blocks), activation(f32), output(f32) — same as MatvecQ4K
+        KernelType::MatvecQ4KCoop => 3, // weight(block_q4_K packed blocks), activation(f32), output(f32) — same as MatvecQ4K
         KernelType::MatvecF16Bias => 4, // activation(f32), weight(f16), output(f32), bias(f32)
-        KernelType::RopeInplace   => 1, // x (modified in-place)
+        KernelType::RopeInplace | KernelType::RopeInplaceSplit => 1, // x (in-place)
         KernelType::KvCacheUpdate => 2, // src, cache
         KernelType::AttentionDecode => 4, // Q, K, V, out
         _ => 2,
@@ -697,7 +751,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     let is_int_ids_p1 = matches!(ctx.kernel_type, KernelType::GetRows | KernelType::SetRows | KernelType::RopeDsv4 | KernelType::Dsv4RouterWeightsOne);
     let is_int_ids_p0 = matches!(ctx.kernel_type, KernelType::TopkMaskScatter);
     let is_all_int_bufs = matches!(ctx.kernel_type, KernelType::SortI32RowsAsc);
-    let is_all_byte_bufs = matches!(ctx.kernel_type, KernelType::FlashAttnExtPad | KernelType::FlashAttnExtBlk | KernelType::Dsv4IndexerScoreOneDirect | KernelType::Dsv4IndexerScoresTiledF32 | KernelType::Dsv4IndexerScoresTiled | KernelType::Dsv4IndexedMixedAttentionH8 | KernelType::Dsv4IndexedMixedAttentionH8Rb4 | KernelType::FlashAttnExtVecReduce | KernelType::FlashAttnExtVecSetup | KernelType::FlashAttnExtVecScore | KernelType::FlashAttnExtVecOut | KernelType::FlashAttnExtVecOutMS | KernelType::FlashAttnExtSetup | KernelType::FlashAttnExtScore | KernelType::FlashAttnExtOut | KernelType::FlashAttnExtOutMS | KernelType::Dsv4HcExpand | KernelType::Dsv4HcExpand4 | KernelType::Dsv4HcWeightedSum | KernelType::Dsv4MoeSwigluWeight | KernelType::Dsv4MoeSwigluWeightF16 | KernelType::Dsv4MulMmIdMap0 | KernelType::Dsv4MulMmIdMap0Ne20_8Full | KernelType::Dsv4MulMmIdMap0Ne20_4Full | KernelType::Dsv4MulMmIdMap0Ne20_1Full | KernelType::Dsv4MulMmIdMap0Ne20_2Full | KernelType::Dsv4MulMmIdMap0Ne20_5Full | KernelType::Dsv4MulMmIdMap0Ne20_6Full | KernelType::Dsv4MulMmIdMap0Ne20_10Full | KernelType::Dsv4MulMmIdMap0Ne20_16Full | KernelType::Dsv4MulMmIdMap0Ne20_22Full | KernelType::Dsv4QkvRmsNormF32_4 | KernelType::RmsNormMulF32_4 | KernelType::Dsv4SoftplusSqrtF32_4 | KernelType::MulMvF32F32Short | KernelType::MulMvF16F32Short | KernelType::MulMvF32F32Setup | KernelType::MulMvF32F32Acc | KernelType::MulMvF32F32Reduce | KernelType::MulMvF16F32Reduce | KernelType::MulMvF32F32_4Reduce | KernelType::MulMvF16F32_4Reduce | KernelType::MulMvF16F32Pair_4 | KernelType::MulMvQ8_0F32 | KernelType::MulMvIdQ8_0F32 | KernelType::MulMvIdQ2KF32 | KernelType::MulMvIdQ4KF32 | KernelType::MulMvIdIq2XxsF32 | KernelType::Dsv4AttnOutLowQ8_0F32 | KernelType::Dsv4SharedGateUpSwigluQ8_0 | KernelType::MulMvF32F32 | KernelType::MulMvF16F32 | KernelType::MulMvF32F32_4 | KernelType::MulMvF16F32_4 | KernelType::SoftMaxFullF32 | KernelType::SoftMaxFullF32_4 | KernelType::BinFuseF32F32F32 | KernelType::UnaryF32F32 | KernelType::UnaryF32F32_4 | KernelType::UnaryF16F16 | KernelType::Dsv4RopeTailF32 | KernelType::FlashAttnExtF16Dk512Dv512 | KernelType::FlashAttnExtVecF16Dk512Dv512 | KernelType::MulMvExtF16F32R1_2 | KernelType::MulMvExtF16F32R1_3 | KernelType::MulMvExtF16F32R1_4 | KernelType::MulMvExtF16F32R1_5 | KernelType::MulMvExtQ8_0F32R1_2 | KernelType::MulMvExtQ8_0F32R1_3 | KernelType::MulMvExtQ8_0F32R1_4 | KernelType::MulMvExtQ8_0F32R1_5 | KernelType::MulMmF16F32 | KernelType::MulMmQ8_0F32 | KernelType::MulMmIdQ8_0F32 | KernelType::MulMmIdQ8_0F16 | KernelType::MulMmIdQ2KF32 | KernelType::MulMmIdQ2KF16 | KernelType::MulMmIdQ4KF32 | KernelType::MulMmIdQ4KF16 | KernelType::MulMmIdIq2XxsF32 | KernelType::MulMmIdIq2XxsF16 | KernelType::RmsNormF32_4 | KernelType::SigmoidF32_4 | KernelType::ReluF32_4 | KernelType::TanhF32_4 | KernelType::GeluF32_4 | KernelType::SqrF32_4 | KernelType::NegF32_4 | KernelType::AbsF32_4 | KernelType::StepF32_4 | KernelType::ExpF32_4 | KernelType::LogF32_4 | KernelType::SiluF32_4 | KernelType::HardSigmoidF32_4 | KernelType::HardSwishF32_4 | KernelType::SigmoidF16 | KernelType::ReluF16 | KernelType::TanhF16 | KernelType::GeluF16 | KernelType::SiluF16 | KernelType::HardSigmoidF16 | KernelType::HardSwishF16 | KernelType::SqrF16 | KernelType::NegF16 | KernelType::AbsF16 | KernelType::StepF16 | KernelType::ExpF16 | KernelType::LogF16 | KernelType::SigmoidF32Scalar | KernelType::ReluF32Scalar | KernelType::TanhF32Scalar | KernelType::GeluF32Scalar | KernelType::SiluF32Scalar | KernelType::HardSigmoidF32Scalar | KernelType::HardSwishF32Scalar | KernelType::SqrF32Scalar | KernelType::NegF32Scalar | KernelType::AbsF32Scalar | KernelType::StepF32Scalar | KernelType::ExpF32Scalar | KernelType::LogF32Scalar | KernelType::SoftMaxF32_4 | KernelType::SoftMaxF32_4MaskF16 | KernelType::SoftMaxF32_4MaskF32 | KernelType::SoftMaxF32Scalar | KernelType::SoftMaxF32ScalarMaskF16 | KernelType::SoftMaxF32ScalarMaskF32 | KernelType::SoftMaxF32_4Sink | KernelType::SoftMaxF32ScalarSink | KernelType::SoftMaxF32_4MaskF16Sink | KernelType::SoftMaxF32_4MaskF32Sink | KernelType::SoftMaxF32ScalarMaskF16Sink | KernelType::SoftMaxF32ScalarMaskF32Sink | KernelType::SoftMaxF32_4AlibiF16 | KernelType::SoftMaxF32_4AlibiF32 | KernelType::SoftMaxF32_4AlibiF16Sink | KernelType::SoftMaxF32_4AlibiF32Sink | KernelType::SoftMaxF32ScalarAlibiF16 | KernelType::SoftMaxF32ScalarAlibiF32 | KernelType::SoftMaxF32ScalarAlibiF16Sink | KernelType::SoftMaxF32ScalarAlibiF32Sink | KernelType::SumRowsF32 | KernelType::SwigluF32 | KernelType::CpyF32F32 | KernelType::CpyF32F16 | KernelType::CpyF16F32 | KernelType::ConcatF32 | KernelType::RepeatF32 | KernelType::GetRowsF32 | KernelType::GetRowsF16 | KernelType::GetRowsI32 | KernelType::SetRowsF32I32 | KernelType::Dsv4TopkMask | KernelType::Dsv4Q8HcExpand4Q8_0 | KernelType::Dsv4SharedDownHcExpand4Q8_0 | KernelType::MulMvIdIq2XxsPairF32 | KernelType::MulMvIdIq2XxsPairSwigluF32 | KernelType::MulMvIdQ4KPairF32 | KernelType::MulMvIdQ4KPairSwigluF32 | KernelType::MulMvIdQ2KSum6F32 | KernelType::MulMvIdQ4KSum6F32);
+    let is_all_byte_bufs = matches!(ctx.kernel_type, KernelType::FlashAttnExtPad | KernelType::FlashAttnExtBlk | KernelType::Dsv4IndexerScoreOneDirect | KernelType::Dsv4IndexerScoresTiledF32 | KernelType::Dsv4IndexerScoresTiled | KernelType::Dsv4IndexedMixedAttentionH8 | KernelType::Dsv4IndexedMixedAttentionH8Rb4 | KernelType::FlashAttnExtVecReduce | KernelType::FlashAttnExtVecSetup | KernelType::FlashAttnExtVecScore | KernelType::FlashAttnExtVecOut | KernelType::FlashAttnExtVecOutMS | KernelType::FlashAttnExtSetup | KernelType::FlashAttnExtScore | KernelType::FlashAttnExtOut | KernelType::FlashAttnExtOutMS | KernelType::Dsv4HcExpand | KernelType::Dsv4HcExpand4 | KernelType::Dsv4HcWeightedSum | KernelType::Dsv4MoeSwigluWeight | KernelType::Dsv4MoeSwigluWeightF16 | KernelType::Dsv4MulMmIdMap0 | KernelType::Dsv4MulMmIdMap0Ne20_8Full | KernelType::Dsv4MulMmIdMap0Ne20_4Full | KernelType::Dsv4MulMmIdMap0Ne20_1Full | KernelType::Dsv4MulMmIdMap0Ne20_2Full | KernelType::Dsv4MulMmIdMap0Ne20_5Full | KernelType::Dsv4MulMmIdMap0Ne20_6Full | KernelType::Dsv4MulMmIdMap0Ne20_10Full | KernelType::Dsv4MulMmIdMap0Ne20_16Full | KernelType::Dsv4MulMmIdMap0Ne20_22Full | KernelType::Dsv4QkvRmsNormF32_4 | KernelType::RmsNormMulF32_4 | KernelType::Dsv4SoftplusSqrtF32_4 | KernelType::MulMvF32F32Short | KernelType::MulMvF16F32Short | KernelType::MulMvF32F32Setup | KernelType::MulMvF32F32Acc | KernelType::MulMvF32F32Reduce | KernelType::MulMvF16F32Reduce | KernelType::MulMvF32F32_4Reduce | KernelType::MulMvF16F32_4Reduce | KernelType::MulMvF16F32Pair_4 | KernelType::MulMvQ8_0F32 | KernelType::MulMvIdQ8_0F32 | KernelType::MulMvIdQ2KF32 | KernelType::MulMvIdQ4KF32 | KernelType::MulMvIdIq2XxsF32 | KernelType::Dsv4AttnOutLowQ8_0F32 | KernelType::Dsv4SharedGateUpSwigluQ8_0 | KernelType::MulMvF32F32 | KernelType::MulMvF16F32 | KernelType::MulMvF32F32_4 | KernelType::MulMvF16F32_4 | KernelType::SoftMaxFullF32 | KernelType::SoftMaxFullF32_4 | KernelType::BinFuseF32F32F32 | KernelType::UnaryF32F32 | KernelType::UnaryF32F32_4 | KernelType::UnaryF16F16 | KernelType::Dsv4RopeTailF32 | KernelType::FlashAttnExtF16Dk512Dv512 | KernelType::FlashAttnExtVecF16Dk512Dv512 | KernelType::MulMvExtF16F32R1_2 | KernelType::MulMvExtF16F32R1_3 | KernelType::MulMvExtF16F32R1_4 | KernelType::MulMvExtF16F32R1_5 | KernelType::MulMvExtQ8_0F32R1_2 | KernelType::MulMvExtQ8_0F32R1_3 | KernelType::MulMvExtQ8_0F32R1_4 | KernelType::MulMvExtQ8_0F32R1_5 | KernelType::MulMmF16F32 | KernelType::MulMmQ8_0F32 | KernelType::MulMmIdQ8_0F32 | KernelType::MulMmIdQ8_0F16 | KernelType::MulMmIdQ2KF32 | KernelType::MulMmIdQ2KF16 | KernelType::MulMmIdQ4KF32 | KernelType::MulMmIdQ4KF16 | KernelType::MulMmIdIq2XxsF32 | KernelType::MulMmIdIq2XxsF16 | KernelType::RmsNormF32_4 | KernelType::SigmoidF32_4 | KernelType::ReluF32_4 | KernelType::TanhF32_4 | KernelType::GeluF32_4 | KernelType::SqrF32_4 | KernelType::NegF32_4 | KernelType::AbsF32_4 | KernelType::StepF32_4 | KernelType::ExpF32_4 | KernelType::LogF32_4 | KernelType::SiluF32_4 | KernelType::HardSigmoidF32_4 | KernelType::HardSwishF32_4 | KernelType::SigmoidF16 | KernelType::ReluF16 | KernelType::TanhF16 | KernelType::GeluF16 | KernelType::SiluF16 | KernelType::HardSigmoidF16 | KernelType::HardSwishF16 | KernelType::SqrF16 | KernelType::NegF16 | KernelType::AbsF16 | KernelType::StepF16 | KernelType::ExpF16 | KernelType::LogF16 | KernelType::SigmoidF32Scalar | KernelType::ReluF32Scalar | KernelType::TanhF32Scalar | KernelType::GeluF32Scalar | KernelType::SiluF32Scalar | KernelType::HardSigmoidF32Scalar | KernelType::HardSwishF32Scalar | KernelType::SqrF32Scalar | KernelType::NegF32Scalar | KernelType::AbsF32Scalar | KernelType::StepF32Scalar | KernelType::ExpF32Scalar | KernelType::LogF32Scalar | KernelType::SoftMaxF32_4 | KernelType::SoftMaxF32_4MaskF16 | KernelType::SoftMaxF32_4MaskF32 | KernelType::SoftMaxF32Scalar | KernelType::SoftMaxF32ScalarMaskF16 | KernelType::SoftMaxF32ScalarMaskF32 | KernelType::SoftMaxF32_4Sink | KernelType::SoftMaxF32ScalarSink | KernelType::SoftMaxF32_4MaskF16Sink | KernelType::SoftMaxF32_4MaskF32Sink | KernelType::SoftMaxF32ScalarMaskF16Sink | KernelType::SoftMaxF32ScalarMaskF32Sink | KernelType::SoftMaxF32_4AlibiF16 | KernelType::SoftMaxF32_4AlibiF32 | KernelType::SoftMaxF32_4AlibiF16Sink | KernelType::SoftMaxF32_4AlibiF32Sink | KernelType::SoftMaxF32ScalarAlibiF16 | KernelType::SoftMaxF32ScalarAlibiF32 | KernelType::SoftMaxF32ScalarAlibiF16Sink | KernelType::SoftMaxF32ScalarAlibiF32Sink | KernelType::SumRowsF32 | KernelType::SwigluF32 | KernelType::CpyF32F32 | KernelType::CpyF32F16 | KernelType::CpyF16F32 | KernelType::ConcatF32 | KernelType::RepeatF32 | KernelType::GetRowsF32 | KernelType::GetRowsF16 | KernelType::GetRowsI32 | KernelType::SetRowsF32I32 | KernelType::Dsv4TopkMask | KernelType::Dsv4Q8HcExpand4Q8_0 | KernelType::Dsv4SharedDownHcExpand4Q8_0 | KernelType::MulMvIdIq2XxsPairF32 | KernelType::MulMvIdIq2XxsPairSwigluF32 | KernelType::MulMvIdQ4KPairF32 | KernelType::MulMvIdQ4KPairSwigluF32 | KernelType::MulMvIdQ2KSum6F32 | KernelType::MulMvIdQ4KSum6F32 | KernelType::MulMvGateUpSwigluQ4KF32 | KernelType::MulMvRmsGateUpSwigluQ4KF32 | KernelType::MulMvQkvQ4KF32);
     // Dsv4RouterFinalizeOne: p0=probs(float), p1=bias(float), p2=hash(int), p3=tokens(int), p4=selected(int, writable)
     let is_router_finalize_one = matches!(ctx.kernel_type, KernelType::Dsv4RouterFinalizeOne);
     // split_weighted_sum HC=4: p0=mixes(char*), p1=scale(float*), p2=base(float*),
@@ -733,10 +787,27 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     let is_mul_mv_id_pair = matches!(ctx.kernel_type, KernelType::MulMvIdIq2XxsPairF32 | KernelType::MulMvIdQ4KPairF32);
     // mul_mv_id_iq2_xxs_pair_swiglu_f32 (M129): 8 bufs (src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, ids, weights); idx 3,4,5 writable.
     let is_mul_mv_id_pair_swiglu = matches!(ctx.kernel_type, KernelType::MulMvIdIq2XxsPairSwigluF32 | KernelType::MulMvIdQ4KPairSwigluF32);
+    let is_gate_up_swiglu_dense = matches!(ctx.kernel_type, KernelType::MulMvGateUpSwigluQ4KF32); // F1: 4 bufs, only p3 writable
+    let is_qkv_fused = matches!(ctx.kernel_type, KernelType::MulMvQkvQ4KF32); // F3: 7 bufs, p4/p5/p6 writable
+    let is_rms_gate_up_swiglu_dense = matches!(ctx.kernel_type, KernelType::MulMvRmsGateUpSwigluQ4KF32); // F2: 5 bufs, only p4 writable
     // mul_mv_id_q2_K_sum6_f32 (M132) / q4_K_sum6_f32 (M133): 4 bufs (src0s, src1, dst, ids); idx 2 (dst) writable, idx 3 (ids) const.
     let is_mul_mv_id_sum6 = matches!(ctx.kernel_type, KernelType::MulMvIdQ2KSum6F32 | KernelType::MulMvIdQ4KSum6F32);
+    // rope_inplace: p0 (x) is modified in place, so it must be writable even when
+    // the lowering carries a second (output) buffer that would otherwise make p0
+    // the non-last, const buffer.
+    let is_rope_inplace = matches!(ctx.kernel_type, KernelType::RopeInplace | KernelType::RopeInplaceSplit);
+    // matvec_i8_v4: p0=activation(float* const), p1=weight(char* const),
+    //   p2=output(float* writable), p3=scale(half* const).
+    let is_matvec_i8_v4 = ctx.kernel_type == KernelType::MatvecI8V4;
+    let is_matvec_i8_v4_batched = ctx.kernel_type == KernelType::MatvecI8V4Batched;
+    // matvec_q4k: p0=weight(uchar* const packed blocks), p1=activation(float* const),
+    //   p2=output(float* writable).
+    let is_matvec_q4k = ctx.kernel_type == KernelType::MatvecQ4K
+        || ctx.kernel_type == KernelType::MatvecQ4KReg
+        || ctx.kernel_type == KernelType::MatvecQ4KCoop;
     for i in 0..num_bufs {
         let qualifier = if all_buffers_writable { "" }
+            else if is_rope_inplace { "" } // every buffer writable; p0 is in-place
             else if last_two_writable { if i + 2 < num_bufs { "const" } else { "" } }
             else if last_three_writable { if i + 3 < num_bufs { "const" } else { "" } }
             else if is_moe_swiglu_weight { if i == 3 { "const" } else { "" } }
@@ -745,8 +816,13 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             else if is_q8_hc_expand4 { if i == 2 || i == 6 { "" } else { "const" } }
             else if is_shared_down_hc_expand4 { if i == 2 || i == 7 { "" } else { "const" } }
             else if is_mul_mv_id_pair { if i == 3 || i == 4 { "" } else { "const" } }
+            else if is_rms_gate_up_swiglu_dense { if i == 4 { "" } else { "const" } }
+            else if is_qkv_fused { if i == 4 || i == 5 || i == 6 { "" } else { "const" } }
+            else if is_gate_up_swiglu_dense { if i == 3 { "" } else { "const" } }
             else if is_mul_mv_id_pair_swiglu { if i == 3 || i == 4 || i == 5 { "" } else { "const" } }
             else if is_mul_mv_id_sum6 { if i == 2 { "" } else { "const" } }
+            else if (is_matvec_i8_v4 || is_matvec_i8_v4_batched) { if i == 2 { "" } else { "const" } }
+            else if is_matvec_q4k { if i == 2 { "" } else { "const" } }
             else if is_split_weighted_sum_hc4 { if i < 4 { "const" } else { "" } }
             else if is_split_weighted_sum_norm4 {
                 // const for p0..p3 and p6 (norm_weight); writable for p4 (split), p5 (dst), p7 (norm_dst)
@@ -758,6 +834,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         // TopkMaskScatter: p0=topk is int*, p1=dst is float*
         // SortI32RowsAsc: all buffers are int*
         let buf_type = if is_mixed_precision && i == 1 { "half" }
+            else if (is_matvec_i8_v4 || is_matvec_i8_v4_batched) && i == 1 { "char" }
+            else if (is_matvec_i8_v4 || is_matvec_i8_v4_batched) && i == 3 { "half" }
+            else if is_matvec_q4k && i == 0 { "uchar" }
             else if is_int_ids_p1 && i == 1 { "int" }
             else if is_int_ids_p0 && i == 0 { "int" }
             else if is_all_int_bufs { "int" }
@@ -806,6 +885,13 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 2).unwrap();
+        }
+        KernelType::PartitionCell | KernelType::PartitionCellStore => {
+            writeln!(out, "    constant uint& src_cols   [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& tile_rows  [[ buffer({}) ]],", params_idx + 1).unwrap();
+            writeln!(out, "    constant uint& tile_cols  [[ buffer({}) ]],", params_idx + 2).unwrap();
+            writeln!(out, "    constant uint& cell_i     [[ buffer({}) ]],", params_idx + 3).unwrap();
+            writeln!(out, "    constant uint& cell_j     [[ buffer({}) ]],", params_idx + 4).unwrap();
         }
         KernelType::Slice => {
             writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
@@ -1611,6 +1697,26 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint&  nb11   [[ buffer({}) ]],", params_idx + 9).unwrap();
             writeln!(out, "    constant uint&  nb12   [[ buffer({}) ]],", params_idx + 10).unwrap();
         }
+        KernelType::MulMvRmsGateUpSwigluQ4KF32 => {
+            // F2: ne00 (=D), ne0 (=INTER out rows), nb01 (weight row stride), eps.
+            writeln!(out, "    constant uint&  ne00            [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint&  ne0             [[ buffer({}) ]],", params_idx + 1).unwrap();
+            writeln!(out, "    constant uint&  nb01            [[ buffer({}) ]],", params_idx + 2).unwrap();
+            writeln!(out, "    constant float& eps             [[ buffer({}) ]],", params_idx + 3).unwrap();
+        }
+        KernelType::MulMvQkvQ4KF32 => {
+            // F3: ne00 (=D), n_q (Q rows), n_kv (K=V rows), nb01 (q4_K row stride).
+            writeln!(out, "    constant uint&  ne00            [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint&  n_q             [[ buffer({}) ]],", params_idx + 1).unwrap();
+            writeln!(out, "    constant uint&  n_kv            [[ buffer({}) ]],", params_idx + 2).unwrap();
+            writeln!(out, "    constant uint&  nb01            [[ buffer({}) ]],", params_idx + 3).unwrap();
+        }
+        KernelType::MulMvGateUpSwigluQ4KF32 => {
+            // F1 dense: 3 uniforms — ne00 (=D), ne0 (=INTER out rows), nb01 (weight row stride).
+            writeln!(out, "    constant uint&  ne00            [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint&  ne0             [[ buffer({}) ]],", params_idx + 1).unwrap();
+            writeln!(out, "    constant uint&  nb01            [[ buffer({}) ]],", params_idx + 2).unwrap();
+        }
         KernelType::MulMvIdIq2XxsPairSwigluF32 | KernelType::MulMvIdQ4KPairSwigluF32 => {
             // mul_mv_id_iq2_xxs_pair_swiglu_f32 (M129) / q4_K_pair_swiglu_f32 (M131): M128/M130 params + 3 act extras.
             writeln!(out, "    constant uint&  ne00            [[ buffer({}) ]],", params_idx).unwrap();
@@ -1779,7 +1885,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& N            [[ buffer({}) ]],", params_idx + 2).unwrap();
             writeln!(out, "    constant uint& K            [[ buffer({}) ]],", params_idx + 3).unwrap();
         }
-        KernelType::MatmulF16 => {
+        KernelType::MatmulF16 | KernelType::MatmulF16Simdgroup => {
             writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& M            [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& N            [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -1799,7 +1905,25 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& K            [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& N            [[ buffer({}) ]],", params_idx + 2).unwrap();
         }
-        KernelType::RopeInplace => {
+        KernelType::MatvecI8V4 => {
+            // p0=activation(f32), p1=weight(char, N×K), p2=output(f32), p3=scale(half, per-row)
+            writeln!(out, "    constant uint& M            [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& K            [[ buffer({}) ]],", params_idx + 1).unwrap();
+            writeln!(out, "    constant uint& N            [[ buffer({}) ]],", params_idx + 2).unwrap();
+        }
+        KernelType::MatvecI8V4Batched => {
+            // batched M=8: M is compile-time in the body, so only K and N are runtime params.
+            // p0=activation(f32, M×K), p1=weight(char, N×K), p2=output(f32, M×N), p3=scale(half, per-row)
+            // K at buffer(params_idx)=4, N at buffer(params_idx+1)=5 to match the hand-written signature.
+            writeln!(out, "    constant uint& K            [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& N            [[ buffer({}) ]],", params_idx + 1).unwrap();
+        }
+        KernelType::MatvecQ4K | KernelType::MatvecQ4KReg | KernelType::MatvecQ4KCoop => {
+            // p0=weight(uchar packed Q4_K blocks), p1=activation(f32), p2=output(f32)
+            writeln!(out, "    constant uint& d_in         [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& d_out        [[ buffer({}) ]],", params_idx + 1).unwrap();
+        }
+        KernelType::RopeInplace | KernelType::RopeInplaceSplit => {
             // p0=x (modified in-place), num_heads, head_dim, position, theta
             writeln!(out, "    constant uint&  num_heads    [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint&  head_dim     [[ buffer({}) ]],", params_idx + 1).unwrap();
@@ -1866,15 +1990,23 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     let is_cooperative = matches!(
         ctx.kernel_type,
         KernelType::MatvecF16 | KernelType::MatvecF16Bias | KernelType::MatvecF16Add
+            | KernelType::MatvecI8V4 | KernelType::MatvecI8V4Batched | KernelType::MatvecQ4K
+            | KernelType::MatvecQ4KReg | KernelType::MatvecQ4KCoop
             | KernelType::GateUpSiLU | KernelType::AttentionDecode | KernelType::AttentionPrefill
     );
-    let needs_3d_grid = matches!(ctx.kernel_type, KernelType::RopeDsv4 | KernelType::Dsv4RopeTailF32 | KernelType::FlashAttnExtPad | KernelType::FlashAttnExtBlk | KernelType::FlashAttnExtF16Dk512Dv512 | KernelType::FlashAttnExtVecF16Dk512Dv512);
+    // PartitionCell takes its cell index (i,j) from the dispatch grid: that is exactly what
+    // cuTile's `partition.load([pid.0, pid.1])` means, so the grid IS the index and no
+    // uniform is needed for it. Requires the 3-D tgpig binding.
+    let needs_3d_grid = matches!(ctx.kernel_type, KernelType::PartitionCell | KernelType::PartitionCellStore | KernelType::RopeDsv4 | KernelType::Dsv4RopeTailF32 | KernelType::FlashAttnExtPad | KernelType::FlashAttnExtBlk | KernelType::FlashAttnExtF16Dk512Dv512 | KernelType::FlashAttnExtVecF16Dk512Dv512);
     let needs_simd_attrs_only = matches!(ctx.kernel_type, KernelType::Dsv4IndexerScoreOneDirect | KernelType::FlashAttnExtVecReduce | KernelType::Dsv4HcSplitWeightedSumNorm4);
     let needs_2d_grid_simd = matches!(ctx.kernel_type, KernelType::Dsv4IndexerScoresTiledF32 | KernelType::Dsv4IndexerScoresTiled | KernelType::Dsv4IndexedMixedAttentionH8 | KernelType::Dsv4IndexedMixedAttentionH8Rb4);
+    // 2D grid, no per-thread attrs: the whole simdgroup cooperates via the
+    // simdgroup_matrix_* intrinsics, so the body needs only tgpig (output-tile id).
+    let needs_2d_grid_only = matches!(ctx.kernel_type, KernelType::MatmulF16Simdgroup);
     let needs_2d_grid_simd_tcount = matches!(ctx.kernel_type, KernelType::Dsv4QkvRmsNormF32_4 | KernelType::RmsNormMulF32_4 | KernelType::RmsNormF32_4 | KernelType::SoftMaxF32_4 | KernelType::SoftMaxF32_4MaskF16 | KernelType::SoftMaxF32_4MaskF32 | KernelType::SoftMaxF32Scalar | KernelType::SoftMaxF32ScalarMaskF16 | KernelType::SoftMaxF32ScalarMaskF32 | KernelType::SoftMaxF32_4Sink | KernelType::SoftMaxF32ScalarSink | KernelType::SoftMaxF32_4MaskF16Sink | KernelType::SoftMaxF32_4MaskF32Sink | KernelType::SoftMaxF32ScalarMaskF16Sink | KernelType::SoftMaxF32ScalarMaskF32Sink | KernelType::SoftMaxF32_4AlibiF16 | KernelType::SoftMaxF32_4AlibiF32 | KernelType::SoftMaxF32_4AlibiF16Sink | KernelType::SoftMaxF32_4AlibiF32Sink | KernelType::SoftMaxF32ScalarAlibiF16 | KernelType::SoftMaxF32ScalarAlibiF32 | KernelType::SoftMaxF32ScalarAlibiF16Sink | KernelType::SoftMaxF32ScalarAlibiF32Sink);
     // 3D grid + thread_index_in_simdgroup only (single-simdgroup tg pattern); used by mul_mv_*_short.
     let needs_3d_grid_simdlane = matches!(ctx.kernel_type, KernelType::MulMvF32F32Short | KernelType::MulMvF16F32Short);
-    let needs_3d_grid_simd = matches!(ctx.kernel_type, KernelType::MulMvIdQ4KSum6F32 | KernelType::MulMvIdQ2KSum6F32 | KernelType::MulMvIdQ4KPairSwigluF32 | KernelType::MulMvIdQ4KPairF32 | KernelType::MulMvIdIq2XxsPairSwigluF32 | KernelType::MulMvIdIq2XxsPairF32 | KernelType::Dsv4Q8HcExpand4Q8_0 | KernelType::Dsv4SharedDownHcExpand4Q8_0 | KernelType::FlashAttnExtVecSetup | KernelType::FlashAttnExtVecScore | KernelType::FlashAttnExtVecOut | KernelType::FlashAttnExtVecOutMS | KernelType::FlashAttnExtSetup | KernelType::FlashAttnExtScore | KernelType::FlashAttnExtOut | KernelType::FlashAttnExtOutMS | KernelType::MulMvF32F32Setup | KernelType::MulMvF32F32Acc | KernelType::MulMvF32F32Reduce | KernelType::MulMvF16F32Reduce | KernelType::MulMvF32F32_4Reduce | KernelType::MulMvF16F32_4Reduce | KernelType::MulMvF16F32Pair_4 | KernelType::MulMvQ8_0F32 | KernelType::MulMvIdQ8_0F32 | KernelType::MulMvIdQ2KF32 | KernelType::MulMvIdQ4KF32 | KernelType::MulMvIdIq2XxsF32 | KernelType::Dsv4AttnOutLowQ8_0F32 | KernelType::Dsv4SharedGateUpSwigluQ8_0 | KernelType::MulMvF32F32 | KernelType::MulMvF16F32 | KernelType::MulMvF32F32_4 | KernelType::MulMvF16F32_4 | KernelType::MulMvExtF16F32R1_2 | KernelType::MulMvExtF16F32R1_3 | KernelType::MulMvExtF16F32R1_4 | KernelType::MulMvExtF16F32R1_5 | KernelType::MulMvExtQ8_0F32R1_2 | KernelType::MulMvExtQ8_0F32R1_3 | KernelType::MulMvExtQ8_0F32R1_4 | KernelType::MulMvExtQ8_0F32R1_5 | KernelType::MulMmF16F32 | KernelType::MulMmQ8_0F32 | KernelType::MulMmIdQ8_0F32 | KernelType::MulMmIdQ8_0F16 | KernelType::MulMmIdQ2KF32 | KernelType::MulMmIdQ2KF16 | KernelType::MulMmIdQ4KF32 | KernelType::MulMmIdQ4KF16 | KernelType::MulMmIdIq2XxsF32 | KernelType::MulMmIdIq2XxsF16);
+    let needs_3d_grid_simd = matches!(ctx.kernel_type, KernelType::MulMvIdQ4KSum6F32 | KernelType::MulMvIdQ2KSum6F32 | KernelType::MulMvIdQ4KPairSwigluF32 | KernelType::MulMvIdQ4KPairF32 | KernelType::MulMvIdIq2XxsPairSwigluF32 | KernelType::MulMvIdIq2XxsPairF32 | KernelType::Dsv4Q8HcExpand4Q8_0 | KernelType::Dsv4SharedDownHcExpand4Q8_0 | KernelType::FlashAttnExtVecSetup | KernelType::FlashAttnExtVecScore | KernelType::FlashAttnExtVecOut | KernelType::FlashAttnExtVecOutMS | KernelType::FlashAttnExtSetup | KernelType::FlashAttnExtScore | KernelType::FlashAttnExtOut | KernelType::FlashAttnExtOutMS | KernelType::MulMvF32F32Setup | KernelType::MulMvF32F32Acc | KernelType::MulMvF32F32Reduce | KernelType::MulMvF16F32Reduce | KernelType::MulMvF32F32_4Reduce | KernelType::MulMvF16F32_4Reduce | KernelType::MulMvF16F32Pair_4 | KernelType::MulMvQ8_0F32 | KernelType::MulMvIdQ8_0F32 | KernelType::MulMvIdQ2KF32 | KernelType::MulMvIdQ4KF32 | KernelType::MulMvIdIq2XxsF32 | KernelType::Dsv4AttnOutLowQ8_0F32 | KernelType::Dsv4SharedGateUpSwigluQ8_0 | KernelType::MulMvF32F32 | KernelType::MulMvF16F32 | KernelType::MulMvF32F32_4 | KernelType::MulMvF16F32_4 | KernelType::MulMvExtF16F32R1_2 | KernelType::MulMvExtF16F32R1_3 | KernelType::MulMvExtF16F32R1_4 | KernelType::MulMvExtF16F32R1_5 | KernelType::MulMvExtQ8_0F32R1_2 | KernelType::MulMvExtQ8_0F32R1_3 | KernelType::MulMvExtQ8_0F32R1_4 | KernelType::MulMvExtQ8_0F32R1_5 | KernelType::MulMmF16F32 | KernelType::MulMmQ8_0F32 | KernelType::MulMmIdQ8_0F32 | KernelType::MulMmIdQ8_0F16 | KernelType::MulMmIdQ2KF32 | KernelType::MulMmIdQ2KF16 | KernelType::MulMmIdQ4KF32 | KernelType::MulMmIdQ4KF16 | KernelType::MulMmIdIq2XxsF32 | KernelType::MulMmIdIq2XxsF16 | KernelType::MulMvGateUpSwigluQ4KF32 | KernelType::MulMvRmsGateUpSwigluQ4KF32 | KernelType::MulMvQkvQ4KF32);
     // 3D grid + simd attrs + tcount; sum_rows-style per-row reductions over (i1,i2,i3) batches.
     let needs_3d_grid_simd_tcount = matches!(ctx.kernel_type, KernelType::SumRowsF32 | KernelType::SoftMaxFullF32 | KernelType::SoftMaxFullF32_4);
     // 3D grid + tiitg + ushort3 ntg; cpy.metal-style strided copy with src dims (ne00..ne03) and dst dims (ne0..ne3).
@@ -1895,6 +2027,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         writeln!(out, "    uint tcount  [[ threads_per_threadgroup ]],").unwrap();
         writeln!(out, "    uint simd_lane [[ thread_index_in_simdgroup ]],").unwrap();
         writeln!(out, "    uint simd_id   [[ simdgroup_index_in_threadgroup ]]").unwrap();
+    } else if needs_2d_grid_only {
+        writeln!(out, "    uint2 tgpig    [[ threadgroup_position_in_grid ]],").unwrap();
+        writeln!(out, "    uint  tid      [[ thread_index_in_threadgroup ]]").unwrap();
     } else if needs_2d_grid_simd {
         writeln!(out, "    uint2 tgpig    [[ threadgroup_position_in_grid ]],").unwrap();
         writeln!(out, "    uint tid       [[ thread_index_in_threadgroup ]],").unwrap();
@@ -1952,6 +2087,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     let needs_cooperative_shared = matches!(
         ctx.kernel_type,
         KernelType::MatvecF16 | KernelType::MatvecF16Bias | KernelType::MatvecF16Add
+            | KernelType::MatvecI8V4 | KernelType::MatvecI8V4Batched | KernelType::MatvecQ4K
+            | KernelType::MatvecQ4KReg | KernelType::MatvecQ4KCoop
             | KernelType::GateUpSiLU | KernelType::AttentionDecode | KernelType::AttentionPrefill
     );
     if needs_reduction {
@@ -1968,7 +2105,13 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     // doesn't declare num_elements (they use explicit shape params instead).
     let has_own_indexing = matches!(
         ctx.kernel_type,
-        KernelType::Rope | KernelType::RopeInplace | KernelType::RopePrefill
+        // PartitionCell computes its own base from the grid geometry (i*Tr*C + j*Tc),
+        // which is the address map the mechanization reasons about; the generic
+        // `base = row * num_elements` prologue would both shadow it and be wrong.
+                KernelType::PartitionCell
+            | KernelType::PartitionCellStore
+    | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
+            | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
             | KernelType::FlashAttnExtF16Dk512Dv512
@@ -2118,6 +2261,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::MulMvIdIq2XxsPairSwigluF32
             | KernelType::MulMvIdQ4KPairF32
             | KernelType::MulMvIdQ4KPairSwigluF32
+            | KernelType::MulMvGateUpSwigluQ4KF32
+            | KernelType::MulMvRmsGateUpSwigluQ4KF32
+            | KernelType::MulMvQkvQ4KF32
             | KernelType::MulMvIdQ2KSum6F32
             | KernelType::MulMvIdQ4KSum6F32
             | KernelType::Dsv4AttnOutLowQ8_0F32
@@ -2184,12 +2330,15 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Clamp        => emit_clamp_msl(out),
         KernelType::CastF32F16   => emit_cast_msl(out, "half"),
         KernelType::CastF16F32   => emit_cast_msl(out, "float"),
+        KernelType::PartitionCell => emit_partition_cell_msl(out),
+        KernelType::PartitionCellStore => emit_partition_cell_store_msl(out),
         KernelType::Slice        => emit_slice_msl(out),
         KernelType::Concat       => emit_concat_msl(out),
         KernelType::Scatter      => emit_scatter_msl(out),
         KernelType::Gather       => emit_gather_msl(out),
         KernelType::TopK         => emit_topk_msl(out, msl_type),
         KernelType::MatmulF16    => emit_matmul_f16_msl(out),
+        KernelType::MatmulF16Simdgroup => emit_matmul_f16_simdgroup_msl(out),
         KernelType::Fill         => emit_fill_msl(out),
         KernelType::Max          => emit_max_msl(out),
         KernelType::Div          => emit_binop_msl(out, "/"),
@@ -2351,6 +2500,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::MulMvIdIq2XxsPairSwigluF32 => emit_mul_mv_id_iq2_xxs_pair_swiglu_f32_msl(out),
         KernelType::MulMvIdQ4KPairF32 => emit_mul_mv_id_q4_K_pair_f32_msl(out),
         KernelType::MulMvIdQ4KPairSwigluF32 => emit_mul_mv_id_q4_K_pair_swiglu_f32_msl(out),
+        KernelType::MulMvGateUpSwigluQ4KF32 => emit_mul_mv_gate_up_swiglu_q4_K_f32_msl(out),
+        KernelType::MulMvQkvQ4KF32 => emit_mul_mv_qkv_q4_K_f32_msl(out),
+        KernelType::MulMvRmsGateUpSwigluQ4KF32 => emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl(out),
         KernelType::MulMvIdQ2KSum6F32 => emit_mul_mv_id_q2_K_sum6_f32_msl(out),
         KernelType::MulMvIdQ4KSum6F32 => emit_mul_mv_id_q4_K_sum6_f32_msl(out),
         KernelType::Dsv4AttnOutLowQ8_0F32 => emit_dsv4_attn_out_low_q8_0_f32_msl(out),
@@ -2403,7 +2555,13 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::MatvecF16         => emit_matvec_f16_msl(out),
         KernelType::MatvecF16Bias     => emit_matvec_f16_bias_msl(out),
         KernelType::MatvecF16Add      => emit_matvec_f16_add_msl(out),
+        KernelType::MatvecI8V4        => emit_matvec_i8_v4_msl(out),
+        KernelType::MatvecI8V4Batched => emit_matvec_i8_v4_batched_msl(out),
+        KernelType::MatvecQ4K         => emit_matvec_q4k_msl(out),
+        KernelType::MatvecQ4KReg      => emit_matvec_q4k_reg_msl(out),
+        KernelType::MatvecQ4KCoop     => emit_matvec_q4k_coop_msl(out),
         KernelType::RopeInplace       => emit_rope_inplace_msl(out),
+        KernelType::RopeInplaceSplit  => emit_rope_inplace_split_msl(out),
         KernelType::KvCacheUpdate     => emit_kv_cache_update_msl(out),
         KernelType::AttentionDecode   => emit_attention_decode_msl(out),
         KernelType::GateUpSiLU        => emit_gate_up_silu_msl(out),
@@ -2411,6 +2569,19 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::RopePrefill          => emit_rope_prefill_msl(out),
         KernelType::KvCacheUpdatePrefill => emit_kv_cache_update_prefill_msl(out),
         KernelType::AttentionPrefill     => emit_attention_prefill_msl(out),
+        // Batched (M=8) non-matmul kernels are handled earlier in generate_func_msl
+        // (full-kernel verbatim emit + early return); they never reach this dispatch.
+        KernelType::RmsNormMulBatched
+        | KernelType::RmsNormMulV4Batched
+        | KernelType::RopeSplitBatched
+        | KernelType::AttnDecodeBatched
+        | KernelType::AttnDecodeV4Batched
+        | KernelType::AttnDecodeSplitK
+        | KernelType::AttnDecodeSplitKV2
+        | KernelType::AttnDecodeCombine
+        | KernelType::SiluMulBatched
+        | KernelType::AddInplaceBatched
+        | KernelType::KvWriteBatched => unreachable!("batched non-matmul kernels emit verbatim earlier"),
     }
 
     writeln!(out, "}}").unwrap();
@@ -2537,6 +2708,20 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_scatter_add_f32"                               => { ctx.kernel_type = KernelType::ScatterAdd; }
                 "__tile_where_f32"                                     => { ctx.kernel_type = KernelType::Where; }
                 "__tile_transpose_f32"                                    => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Transpose; } }
+                // Partition cell access. Disjointness of distinct cells is thm:partdisj
+                // (Rocq: partition_disjoint / _nd / _perm), so the emitter only computes the
+                // cell's base address; no aliasing check is needed in generated code.
+                "__tile_partition_cell_f32"
+                | "__tile_partition_f32" | "__tile_partition_perm_f32" => {
+                    if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::PartitionCell; }
+                }
+                // The _mut form is a store DESTINATION: it writes a tile into cell (i,j)
+                // rather than reading one out. partition_disjoint is what makes several such
+                // writes to distinct cells safe without a runtime aliasing check -- the
+                // obligation cuTile discharges with `unsafe` at all 26 of its sites.
+                "__tile_partition_cell_mut_f32" => {
+                    ctx.kernel_type = KernelType::PartitionCellStore;
+                }
                 "__tile_rsqrt_f32"                                        => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Rsqrt; } }
                 "__tile_log_f32"                                          => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Log; } }
                 "__tile_sigmoid_f32"                                      => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Sigmoid; } }
@@ -2551,6 +2736,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_gather_f32"                                       => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Gather; } }
                 "__tile_topk_f32"                                         => { ctx.kernel_type = KernelType::TopK; }
                 "__tile_matmul_f16"                                       => { ctx.kernel_type = KernelType::MatmulF16; }
+                "__tile_matmul_simdgroup_f16"                             => { ctx.kernel_type = KernelType::MatmulF16Simdgroup; }
                 "__tile_fill_f32"       | "__tile_fill_f16"       => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Fill; } }
                 "__tile_max_f32"        | "__tile_max_f16"        => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Max; } }
                 "__tile_div_f32"        | "__tile_div_f16"        => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Div; } }
@@ -2712,6 +2898,9 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_mul_mv_id_iq2_xxs_pair_swiglu_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvIdIq2XxsPairSwigluF32; } }
                 "__tile_mul_mv_id_q4_K_pair_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvIdQ4KPairF32; } }
                 "__tile_mul_mv_id_q4_K_pair_swiglu_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvIdQ4KPairSwigluF32; } }
+                "__tile_mul_mv_gate_up_swiglu_q4_K_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvGateUpSwigluQ4KF32; } }
+                "__tile_mul_mv_qkv_q4_K_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvQkvQ4KF32; } }
+                "__tile_mul_mv_rms_gate_up_swiglu_q4_K_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvRmsGateUpSwigluQ4KF32; } }
                 "__tile_mul_mv_id_q2_K_sum6_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvIdQ2KSum6F32; } }
                 "__tile_mul_mv_id_q4_K_sum6_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::MulMvIdQ4KSum6F32; } }
                 "__tile_dsv4_attn_out_low_q8_0_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Dsv4AttnOutLowQ8_0F32; } }
@@ -2761,7 +2950,35 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_matvec_f16"           => { ctx.kernel_type = KernelType::MatvecF16; }
                 "__tile_matvec_f16_bias"       => { ctx.kernel_type = KernelType::MatvecF16Bias; }
                 "__tile_matvec_f16_add"        => { ctx.kernel_type = KernelType::MatvecF16Add; }
+                "__tile_matvec_i8_v4"          => { ctx.kernel_type = KernelType::MatvecI8V4; }
+                "__tile_matvec_i8_v4_batched"  => { ctx.kernel_type = KernelType::MatvecI8V4Batched; }
+                "__tile_rms_norm_mul_batched"    => { ctx.kernel_type = KernelType::RmsNormMulBatched; }
+                "__tile_rms_norm_mul_v4_batched" => { ctx.kernel_type = KernelType::RmsNormMulV4Batched; }
+                "__tile_rope_split_batched"      => { ctx.kernel_type = KernelType::RopeSplitBatched; }
+                "__tile_attn_decode_batched"     => { ctx.kernel_type = KernelType::AttnDecodeBatched; }
+                "__tile_attn_decode_v4_batched"  => { ctx.kernel_type = KernelType::AttnDecodeV4Batched; }
+                "__tile_attn_decode_splitk"      => { ctx.kernel_type = KernelType::AttnDecodeSplitK; }
+                "__tile_attn_decode_splitk_v2"   => { ctx.kernel_type = KernelType::AttnDecodeSplitKV2; }
+                "__tile_attn_decode_combine"     => { ctx.kernel_type = KernelType::AttnDecodeCombine; }
+                "__tile_silu_mul_batched"        => { ctx.kernel_type = KernelType::SiluMulBatched; }
+                "__tile_add_inplace_batched"     => { ctx.kernel_type = KernelType::AddInplaceBatched; }
+                "__tile_kv_write_batched"        => { ctx.kernel_type = KernelType::KvWriteBatched; }
+                "__tile_matvec_qblock"         => { ctx.kernel_type = KernelType::MatvecQ4K; }
+                "__tile_matvec_q4_k"           => { ctx.kernel_type = KernelType::MatvecQ4K; }
+                "__tile_matvec_qblock_reg"     => { ctx.kernel_type = KernelType::MatvecQ4KReg; }
+                "__tile_matvec_qblock_coop"    => { ctx.kernel_type = KernelType::MatvecQ4KCoop; }
+                // Quant-matvec SELECTION by bits-per-weight (measured audit rule, see below):
+                //  <= 6-bit k-quant (Q4_K/Q5_K/Q6_K/Q2_K): the sub-byte unpack is ALU-bound, so a
+                //   register-blocked SCALAR kernel wins (vectorizing the dot adds widening work).
+                //  >= 8-bit (Q8_0/int8): decode is one multiply, so the matvec is bandwidth-bound
+                //   and a vectorized per-row kernel wins; register-blocking REGRESSES it 3.7-10x.
+                // One intrinsic, the emitter picks the kernel — the caller need not know the shape.
+                name if name.starts_with("__tile_matvec_quant_") => {
+                    let fmt = &name["__tile_matvec_quant_".len()..];
+                    ctx.kernel_type = quant_matvec_kernel_for(fmt);
+                }
                 "__tile_rope_inplace_f32"      => { ctx.kernel_type = KernelType::RopeInplace; }
+                "__tile_rope_split_f32"        => { ctx.kernel_type = KernelType::RopeInplaceSplit; }
                 "__tile_kv_cache_update_f32"   => { ctx.kernel_type = KernelType::KvCacheUpdate; }
                 "__tile_attention_decode_f32"   => { ctx.kernel_type = KernelType::AttentionDecode; }
                 "__tile_gate_up_silu_f16"      => { ctx.kernel_type = KernelType::GateUpSiLU; }
@@ -2914,13 +3131,15 @@ fn emit_l2dist_msl(out: &mut String, msl_type: &str) {
 /// Params: num_elements=N (rows), code_dim=K (cols to scan).
 /// Dispatch: (N, 1, 1) — one workgroup per row.
 fn emit_argmin_msl(out: &mut String, msl_type: &str) {
+    // Reduction width is `num_elements` (the argmin kernel's only shape param);
+    // one row per threadgroup, so row_base = row * num_elements.
     writeln!(out, "    uint n_row = row;").unwrap();
-    writeln!(out, "    uint row_base = n_row * code_dim;").unwrap();
+    writeln!(out, "    uint row_base = n_row * num_elements;").unwrap();
     writeln!(out).unwrap();
     // Each thread finds local min + argmin over its stripe
     writeln!(out, "    {} local_min = MAXFLOAT;", msl_type).unwrap();
     writeln!(out, "    uint local_idx = 0;").unwrap();
-    writeln!(out, "    for (uint k = tid; k < code_dim; k += tcount) {{").unwrap();
+    writeln!(out, "    for (uint k = tid; k < num_elements; k += tcount) {{").unwrap();
     writeln!(out, "        {} v = p0[row_base + k];", msl_type).unwrap();
     writeln!(out, "        if (v < local_min) {{ local_min = v; local_idx = k; }}").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -3020,6 +3239,45 @@ fn emit_cast_msl(out: &mut String, target_type: &str) {
 /// Slice: copy a subrange of columns from src to dst.
 /// Buffers: p0=input, p1=output.
 /// Params: num_elements (rows), src_cols, dst_cols, col_offset.
+/// PartitionCell: copy cell (i,j) of a Tr x Tc partition out of a src_cols-wide buffer.
+/// Base address is addr(C, i*Tr, j*Tc) = i*Tr*C + j*Tc -- the arithmetic the mechanization
+/// uses (in_cell / partition_cell_surj). partition_disjoint proves distinct in-grid indices
+/// own disjoint footprints, so concurrent writes to several cells need no runtime check.
+/// PartitionCellStore: write a tile INTO cell (i,j) of a Tr x Tc partition.
+///
+/// The inverse of emit_partition_cell_msl, and the operation cuTile can only express behind
+/// `unsafe`: writing several cells of one buffer requires knowing the writes do not alias.
+/// Here that is partition_disjoint -- distinct in-grid indices own disjoint footprints -- so
+/// two stores to (0,0) and (0,1) are safe by typing and the emitted code needs no guard.
+/// Buffers: p0 = source tile, p1 = destination buffer.
+fn emit_partition_cell_store_msl(out: &mut String) {
+    writeln!(out, "    uint ci = (cell_i != 0u) ? cell_i : tgpig.x;").unwrap();
+    writeln!(out, "    uint cj = (cell_j != 0u) ? cell_j : tgpig.y;").unwrap();
+    writeln!(out, "    uint base = ci * tile_rows * src_cols + cj * tile_cols;").unwrap();
+    writeln!(out, "    uint r = tgpig.z;").unwrap();
+    writeln!(out, "    if (r < tile_rows) {{").unwrap();
+    writeln!(out, "        for (uint c = _tid_v.x; c < tile_cols; c += _tc_v.x) {{").unwrap();
+    writeln!(out, "            p1[base + r * src_cols + c] = p0[r * tile_cols + c];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+fn emit_partition_cell_msl(out: &mut String) {
+    // The cell index comes from the dispatch grid (tgpig.x/.y), matching cuTile's
+    // `partition.load([pid.0, pid.1])`; cell_i/cell_j remain as uniforms for the
+    // single-cell case, and the grid overrides them when it is larger than 1x1.
+    writeln!(out, "    uint ci = (cell_i != 0u) ? cell_i : tgpig.x;").unwrap();
+    writeln!(out, "    uint cj = (cell_j != 0u) ? cell_j : tgpig.y;").unwrap();
+    writeln!(out, "    uint base = ci * tile_rows * src_cols + cj * tile_cols;").unwrap();
+    writeln!(out, "    uint r = tgpig.z;").unwrap();
+    writeln!(out, "    if (r < tile_rows) {{").unwrap();
+    // The 3-D grid path binds uint3 _tid_v / _tc_v, not scalar tid/tcount.
+    writeln!(out, "        for (uint c = _tid_v.x; c < tile_cols; c += _tc_v.x) {{").unwrap();
+    writeln!(out, "            p1[r * tile_cols + c] = p0[base + r * src_cols + c];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
 fn emit_slice_msl(out: &mut String) {
     writeln!(out, "    uint r = row;").unwrap();
     writeln!(out, "    for (uint c = tid; c < dst_cols; c += tcount) {{").unwrap();
@@ -3144,6 +3402,42 @@ fn emit_matmul_f16_msl(out: &mut String) {
     writeln!(out, "        for (uint kk = 0; kk < K; kk++)").unwrap();
     writeln!(out, "            acc += p0[m * K + kk] * p1[kk * N + n];").unwrap();
     writeln!(out, "        p2[m * N + n] = acc;").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// f16 matmul via `simdgroup_matrix_multiply_accumulate` — the direct lowering of
+/// the tile-rs `mma` op to the Metal hardware intrinsic (Phase 2). One simdgroup
+/// (32 threads, one threadgroup) computes one 8x8 output tile of C = A·B;
+/// accumulates over 8-wide K tiles. Bit-validated == the scalar loop on M1 Ultra.
+///
+/// Layout: p0 = A (M×K, row-major, stride K), p1 = B (K×N, stride N),
+/// p2 = C (M×N, stride N). Dispatch: grid = (ceil(N/8), ceil(M/8)) threadgroups × 32 threads.
+/// K must be a multiple of 8 (the simdgroup tile size); **M and N may be unaligned** —
+/// the masked-tail store (below) writes only valid rows/cols, so no OOB past M/N.
+///
+/// Store: `simdgroup_store` writes the full 8×8 tile, so writing straight to a partial
+/// tail tile in global memory would overflow C past M/N (an H3 buffer overflow, Phase 4
+/// ledger #1). Instead we store to a threadgroup 8×8 scratch (always safe) and copy only
+/// the in-bounds cells to global with a guard. Phase 8: safe for any M, 0% overhead
+/// (the scratch round-trip overlaps the matmul's memory latency), 0 OOB writes.
+fn emit_matmul_f16_simdgroup_msl(out: &mut String) {
+    writeln!(out, "    uint m0 = tgpig.y * 8u;   // output tile row").unwrap();
+    writeln!(out, "    uint n0 = tgpig.x * 8u;   // output tile col").unwrap();
+    writeln!(out, "    if (m0 >= M || n0 >= N) return;").unwrap();
+    writeln!(out, "    simdgroup_half8x8 acc = simdgroup_half8x8(0.0h);").unwrap();
+    writeln!(out, "    for (uint k0 = 0u; k0 < K; k0 += 8u) {{").unwrap();
+    writeln!(out, "        simdgroup_half8x8 a, b;").unwrap();
+    writeln!(out, "        simdgroup_load(a, p0 + m0 * K + k0, K);   // A[m0:+8, k0:+8]").unwrap();
+    writeln!(out, "        simdgroup_load(b, p1 + k0 * N + n0, N);   // B[k0:+8, n0:+8]").unwrap();
+    writeln!(out, "        simdgroup_multiply_accumulate(acc, a, b, acc);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    // Masked-tail store: to threadgroup scratch (safe), then guarded copy to global.
+    writeln!(out, "    threadgroup half mm_scratch[64];   // 8x8 tile").unwrap();
+    writeln!(out, "    simdgroup_store(acc, mm_scratch, 8);").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    for (uint idx = tid; idx < 64u; idx += 32u) {{").unwrap();
+    writeln!(out, "        uint r = idx / 8u, c = idx % 8u;").unwrap();
+    writeln!(out, "        if (m0 + r < M && n0 + c < N) p2[(m0 + r) * N + (n0 + c)] = mm_scratch[r * 8u + c];").unwrap();
     writeln!(out, "    }}").unwrap();
 }
 
@@ -8519,7 +8813,8 @@ fn emit_mul_mm_msl(out: &mut String, src_kind: MmSrcKind) {
     writeln!(out, "    }}").unwrap();
 }
 
-///          p2=dst (float), p3=ids (int32, one i02 per (iid1, idx) slot).
+/// Buffers: p0=src0 (q8_0), p1=src1 (float), p2=dst (float),
+/// p3=ids (int32, one i02 per (iid1, idx) slot).
 /// Params: ne00, ne01, ne0, ne1, ne11, nei0, nbi1, nb01, nb02, nb11, nb12.
 /// Grid: tgpig.x = i01_tile, tgpig.y = 0 (unused), tgpig.z = idx + iid1*nei0.
 /// Inner: reads i02 = ids[iid1*nbi1/4 + idx], offsets src0 by i02*nb02,
@@ -9406,6 +9701,424 @@ fn emit_mul_mv_id_iq2_xxs_pair_swiglu_f32_msl(out: &mut String) {
 /// Combines M130's paired q4_K inner with M129's SwiGLU finalize: produces
 /// raw gate/up + mid = silu(clamp(gate, c)) * clamp(up, -c, c) * route_weight.
 /// 14 uniforms (M130's 11 + mid_row_stride/weight_stride/clamp_value).
+fn emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl(out: &mut String) {
+    // F2: F1 (dense gate/up+SwiGLU q4_K) with the preceding RMS-norm folded into
+    // the prologue. Cooperatively computes rms scale over x[D], stages the
+    // normalized activation xs[k] = x[k]*scale*norm_w[k] into threadgroup memory,
+    // then the F1 paired-q4_K inner reads xs instead of device x. The normalized
+    // activation never round-trips DRAM. M=1 decode.
+    // Bufs: p0=gate_w, p1=up_w, p2=norm_w [D] f32, p3=x [D] f32, p4=dst_mid [INTER].
+    // Uniforms: ne00 (=D), ne0 (=INTER out rows), nb01 (weight row stride), eps.
+    writeln!(out, "    constexpr short NW   = 32;").unwrap();
+    writeln!(out, "    constexpr short NSG  = 2;").unwrap();
+    writeln!(out, "    constexpr short NR0  = 2;          // N_R0_Q4_K").unwrap();
+    writeln!(out, "    constexpr int   QK_K = 256;").unwrap();
+    writeln!(out, "    constexpr uint  Q4K_BLOCK_BYTES = 144u;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK1 = 0x3f3f;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK2 = 0x0f0f;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK3 = 0xc0c0;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const ushort tiisg = (ushort)simd_lane;").unwrap();
+    writeln!(out, "    const ushort sgitg = (ushort)simd_id;").unwrap();
+    writeln!(out, "    const uint   tcount = (uint)(NW * NSG);").unwrap();
+    writeln!(out).unwrap();
+    // ---- RMS prologue: cooperative reduction of sum(x^2), then stage normalized x ----
+    writeln!(out, "    // RMS prologue. 64 threads reduce sum(x^2) over D, then stage").unwrap();
+    writeln!(out, "    // xs[k] = x[k]*scale*norm_w[k] into threadgroup memory for the inner dot.").unwrap();
+    writeln!(out, "    threadgroup float xs[4096];   // D<=4096 (Qwen3-4B D=2560)").unwrap();
+    writeln!(out, "    threadgroup float rsum[NSG];").unwrap();
+    writeln!(out, "    device const float * xin  = (device const float *)p3;").unwrap();
+    writeln!(out, "    device const float * nw   = (device const float *)p2;").unwrap();
+    writeln!(out, "    const uint D = (uint)ne00;").unwrap();
+    writeln!(out, "    float ss = 0.0f;").unwrap();
+    writeln!(out, "    for (uint k = (uint)tid; k < D; k += tcount) {{ const float v = xin[k]; ss += v * v; }}").unwrap();
+    writeln!(out, "    ss = simd_sum(ss);").unwrap();
+    writeln!(out, "    if (tiisg == 0) rsum[sgitg] = ss;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    float tot = 0.0f; for (short s = 0; s < NSG; ++s) tot += rsum[s];").unwrap();
+    writeln!(out, "    const float scale = rsqrt(tot / (float)D + eps);").unwrap();
+    writeln!(out, "    for (uint k = (uint)tid; k < D; k += tcount) {{ xs[k] = xin[k] * scale * nw[k]; }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // gate_w=p0, up_w=p1; normalized activation is threadgroup xs.").unwrap();
+    writeln!(out, "    device const char  * xg_base_0 = p0;").unwrap();
+    writeln!(out, "    device const char  * xu_base_0 = p1;").unwrap();
+    writeln!(out, "    threadgroup const float * y    = xs;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const int nb = (int)ne00 / QK_K;").unwrap();
+    writeln!(out, "    const int r0 = (int)tgpig.x;").unwrap();
+    writeln!(out, "    const int first_row = (r0 * NSG + (int)sgitg) * NR0;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    device const char  * xg_base = xg_base_0 + (uint64_t)first_row * (uint64_t)nb01;").unwrap();
+    writeln!(out, "    device const char  * xu_base = xu_base_0 + (uint64_t)first_row * (uint64_t)nb01;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const short ix = (short)(tiisg / 8);").unwrap();
+    writeln!(out, "    const short it = (short)(tiisg % 8);").unwrap();
+    writeln!(out, "    const short iq = (short)(it / 4);").unwrap();
+    writeln!(out, "    const short ir = (short)(it % 4);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    threadgroup const float * y4 = y + (int)ix * QK_K + 64 * (int)iq + 8 * (int)ir;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float yl[16];").unwrap();
+    writeln!(out, "    float yh[16];").unwrap();
+    writeln!(out, "    float sumg[NR0] = {{ 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "    float sumu[NR0] = {{ 0.0f, 0.0f }};").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint16_t sc16g[4];").unwrap();
+    writeln!(out, "    uint16_t sc16u[4];").unwrap();
+    writeln!(out, "    thread const uchar * sc8g = (thread const uchar *)sc16g;").unwrap();
+    writeln!(out, "    thread const uchar * sc8u = (thread const uchar *)sc16u;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (int ib = (int)ix; ib < nb; ib += 4) {{").unwrap();
+    writeln!(out, "        float4 sumy = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "        for (short i = 0; i < 8; ++i) {{").unwrap();
+    writeln!(out, "            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];").unwrap();
+    writeln!(out, "            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];").unwrap();
+    writeln!(out, "            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];").unwrap();
+    writeln!(out, "            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        device const uint16_t * scg = (device const uint16_t *)(xg_base + (uint)ib * Q4K_BLOCK_BYTES +  4u) + (uint)iq;").unwrap();
+    writeln!(out, "        device const uint16_t * q1g = (device const uint16_t *)(xg_base + (uint)ib * Q4K_BLOCK_BYTES + 16u) + (uint)(16 * iq + 4 * ir);").unwrap();
+    writeln!(out, "        device const half     * dhg = (device const half     *)(xg_base + (uint)ib * Q4K_BLOCK_BYTES +  0u);").unwrap();
+    writeln!(out, "        device const uint16_t * scu = (device const uint16_t *)(xu_base + (uint)ib * Q4K_BLOCK_BYTES +  4u) + (uint)iq;").unwrap();
+    writeln!(out, "        device const uint16_t * q1u = (device const uint16_t *)(xu_base + (uint)ib * Q4K_BLOCK_BYTES + 16u) + (uint)(16 * iq + 4 * ir);").unwrap();
+    writeln!(out, "        device const half     * dhu = (device const half     *)(xu_base + (uint)ib * Q4K_BLOCK_BYTES +  0u);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        for (short row = 0; row < NR0; ++row) {{").unwrap();
+    writeln!(out, "            sc16g[0] = scg[0] & KMASK1;").unwrap();
+    writeln!(out, "            sc16g[1] = scg[2] & KMASK1;").unwrap();
+    writeln!(out, "            sc16g[2] = ((scg[4] >> 0) & KMASK2) | ((scg[0] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16g[3] = ((scg[4] >> 4) & KMASK2) | ((scg[2] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16u[0] = scu[0] & KMASK1;").unwrap();
+    writeln!(out, "            sc16u[1] = scu[2] & KMASK1;").unwrap();
+    writeln!(out, "            sc16u[2] = ((scu[4] >> 0) & KMASK2) | ((scu[0] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16u[3] = ((scu[4] >> 4) & KMASK2) | ((scu[2] & KMASK3) >> 2);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            device const uint16_t * q2g = q1g + 32;").unwrap();
+    writeln!(out, "            device const uint16_t * q2u = q1u + 32;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            float4 accg1 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 accg2 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 accu1 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 accu2 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            for (short i = 0; i < 4; ++i) {{").unwrap();
+    writeln!(out, "                accg1[0] += yl[2 * i + 0] * (float)(q1g[i] & 0x000F);").unwrap();
+    writeln!(out, "                accg1[1] += yl[2 * i + 1] * (float)(q1g[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accg1[2] += yl[2 * i + 8] * (float)(q1g[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accg1[3] += yl[2 * i + 9] * (float)(q1g[i] & 0xF000);").unwrap();
+    writeln!(out, "                accg2[0] += yh[2 * i + 0] * (float)(q2g[i] & 0x000F);").unwrap();
+    writeln!(out, "                accg2[1] += yh[2 * i + 1] * (float)(q2g[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accg2[2] += yh[2 * i + 8] * (float)(q2g[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accg2[3] += yh[2 * i + 9] * (float)(q2g[i] & 0xF000);").unwrap();
+    writeln!(out, "                accu1[0] += yl[2 * i + 0] * (float)(q1u[i] & 0x000F);").unwrap();
+    writeln!(out, "                accu1[1] += yl[2 * i + 1] * (float)(q1u[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accu1[2] += yl[2 * i + 8] * (float)(q1u[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accu1[3] += yl[2 * i + 9] * (float)(q1u[i] & 0xF000);").unwrap();
+    writeln!(out, "                accu2[0] += yh[2 * i + 0] * (float)(q2u[i] & 0x000F);").unwrap();
+    writeln!(out, "                accu2[1] += yh[2 * i + 1] * (float)(q2u[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accu2[2] += yh[2 * i + 8] * (float)(q2u[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accu2[3] += yh[2 * i + 9] * (float)(q2u[i] & 0xF000);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            sumg[row] += (float)dhg[0] * ((accg1[0] + (1.0f/256.0f) * accg1[1]) * (float)sc8g[0] +").unwrap();
+    writeln!(out, "                                          (accg1[2] + (1.0f/256.0f) * accg1[3]) * (float)sc8g[1] * (1.0f/16.0f) +").unwrap();
+    writeln!(out, "                                          (accg2[0] + (1.0f/256.0f) * accg2[1]) * (float)sc8g[4] +").unwrap();
+    writeln!(out, "                                          (accg2[2] + (1.0f/256.0f) * accg2[3]) * (float)sc8g[5] * (1.0f/16.0f)) -").unwrap();
+    writeln!(out, "                         (float)dhg[1] * ((float)sumy[0] * (float)sc8g[2] + (float)sumy[1] * (float)sc8g[3] +").unwrap();
+    writeln!(out, "                                          (float)sumy[2] * (float)sc8g[6] + (float)sumy[3] * (float)sc8g[7]);").unwrap();
+    writeln!(out, "            sumu[row] += (float)dhu[0] * ((accu1[0] + (1.0f/256.0f) * accu1[1]) * (float)sc8u[0] +").unwrap();
+    writeln!(out, "                                          (accu1[2] + (1.0f/256.0f) * accu1[3]) * (float)sc8u[1] * (1.0f/16.0f) +").unwrap();
+    writeln!(out, "                                          (accu2[0] + (1.0f/256.0f) * accu2[1]) * (float)sc8u[4] +").unwrap();
+    writeln!(out, "                                          (accu2[2] + (1.0f/256.0f) * accu2[3]) * (float)sc8u[5] * (1.0f/16.0f)) -").unwrap();
+    writeln!(out, "                         (float)dhu[1] * ((float)sumy[0] * (float)sc8u[2] + (float)sumy[1] * (float)sc8u[3] +").unwrap();
+    writeln!(out, "                                          (float)sumy[2] * (float)sc8u[6] + (float)sumy[3] * (float)sc8u[7]);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            q1g = (device const uint16_t *)((device const char *)q1g + (uint)nb01);").unwrap();
+    writeln!(out, "            scg = (device const uint16_t *)((device const char *)scg + (uint)nb01);").unwrap();
+    writeln!(out, "            dhg = (device const half     *)((device const char *)dhg + (uint)nb01);").unwrap();
+    writeln!(out, "            q1u = (device const uint16_t *)((device const char *)q1u + (uint)nb01);").unwrap();
+    writeln!(out, "            scu = (device const uint16_t *)((device const char *)scu + (uint)nb01);").unwrap();
+    writeln!(out, "            dhu = (device const half     *)((device const char *)dhu + (uint)nb01);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        y4 += 4 * QK_K;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Dense SwiGLU finalize: consume gate/up in register, write only dst_mid (p4).").unwrap();
+    writeln!(out, "    device float * dst_mid_f32 = (device float *)p4;").unwrap();
+    writeln!(out, "    for (short row = 0; row < NR0 && first_row + (int)row < (int)ne0; ++row) {{").unwrap();
+    writeln!(out, "        const float sum_gate = simd_sum(sumg[row]);").unwrap();
+    writeln!(out, "        const float sum_up   = simd_sum(sumu[row]);").unwrap();
+    writeln!(out, "        if (tiisg == 0) {{").unwrap();
+    writeln!(out, "            const int out_row = first_row + (int)row;").unwrap();
+    writeln!(out, "            const float g = sum_gate;").unwrap();
+    writeln!(out, "            const float u = sum_up;").unwrap();
+    writeln!(out, "            const float silu = g / (1.0f + exp(-g));").unwrap();
+    writeln!(out, "            dst_mid_f32[out_row] = silu * u;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    (void)tid;").unwrap();
+}
+
+fn emit_mul_mv_qkv_q4_K_f32_msl(out: &mut String) {
+    // F3: fused Q/K/V q4_K matvec. Three independent matvecs on the same normalized
+    // input xin[D] with distinct outputs (q, k, v), sharing the x-load to raise GPU
+    // occupancy (the Phase-10 occupancy lever, same as F1). Q4_K inner byte-identical
+    // to F1/M131. NOT a fused epilogue — three separate outputs, no SwiGLU.
+    // Grid covers the concatenated row space [0, n_q + 2*n_kv); each threadgroup's
+    // 4-row group falls entirely within one matrix (n_q, n_kv both %4==0).
+    // Bufs: p0=q_w, p1=k_w, p2=v_w, p3=xin[D] f32, p4=q_out, p5=k_out, p6=v_out.
+    // Uniforms: ne00 (=D), n_q (Q rows), n_kv (K=V rows), nb01 (q4_K row stride).
+    writeln!(out, "    constexpr short NW   = 32;").unwrap();
+    writeln!(out, "    constexpr short NSG  = 2;").unwrap();
+    writeln!(out, "    constexpr short NR0  = 2;          // N_R0_Q4_K").unwrap();
+    writeln!(out, "    constexpr int   QK_K = 256;").unwrap();
+    writeln!(out, "    constexpr uint  Q4K_BLOCK_BYTES = 144u;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK1 = 0x3f3f;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK2 = 0x0f0f;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK3 = 0xc0c0;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const ushort tiisg = (ushort)simd_lane;").unwrap();
+    writeln!(out, "    const ushort sgitg = (ushort)simd_id;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const int r0 = (int)tgpig.x;").unwrap();
+    writeln!(out, "    const int first_row = (r0 * NSG + (int)sgitg) * NR0;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Map first_row -> (matrix weights, output buffer, local out row).").unwrap();
+    writeln!(out, "    const int NQ  = (int)n_q;").unwrap();
+    writeln!(out, "    const int NKV = (int)n_kv;").unwrap();
+    writeln!(out, "    device const char * w_base_0;").unwrap();
+    writeln!(out, "    device float * dst_f32;").unwrap();
+    writeln!(out, "    int out_base;   // first_row - matrix offset").unwrap();
+    writeln!(out, "    int n_rows;     // rows in this matrix").unwrap();
+    writeln!(out, "    if (first_row < NQ) {{").unwrap();
+    writeln!(out, "        w_base_0 = p0; dst_f32 = (device float *)p4; out_base = 0;          n_rows = NQ;").unwrap();
+    writeln!(out, "    }} else if (first_row < NQ + NKV) {{").unwrap();
+    writeln!(out, "        w_base_0 = p1; dst_f32 = (device float *)p5; out_base = NQ;         n_rows = NKV;").unwrap();
+    writeln!(out, "    }} else {{").unwrap();
+    writeln!(out, "        w_base_0 = p2; dst_f32 = (device float *)p6; out_base = NQ + NKV;    n_rows = NKV;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    const int local_first = first_row - out_base;").unwrap();
+    writeln!(out, "    if (local_first >= n_rows) return;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    device const float * y = (device const float *)p3;").unwrap();
+    writeln!(out, "    const int nb = (int)ne00 / QK_K;").unwrap();
+    writeln!(out, "    device const char * x_base = w_base_0 + (uint64_t)local_first * (uint64_t)nb01;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const short ix = (short)(tiisg / 8);").unwrap();
+    writeln!(out, "    const short it = (short)(tiisg % 8);").unwrap();
+    writeln!(out, "    const short iq = (short)(it / 4);").unwrap();
+    writeln!(out, "    const short ir = (short)(it % 4);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    device const float * y4 = y + (int)ix * QK_K + 64 * (int)iq + 8 * (int)ir;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float yl[16];").unwrap();
+    writeln!(out, "    float yh[16];").unwrap();
+    writeln!(out, "    float sumf[NR0];").unwrap();
+    writeln!(out, "    for (short _i = 0; _i < NR0; ++_i) sumf[_i] = 0.0f;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint16_t sc16[4];").unwrap();
+    writeln!(out, "    thread const uchar * sc8 = (thread const uchar *)sc16;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (int ib = (int)ix; ib < nb; ib += 4) {{").unwrap();
+    writeln!(out, "        float4 sumy = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "        for (short i = 0; i < 8; ++i) {{").unwrap();
+    writeln!(out, "            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];").unwrap();
+    writeln!(out, "            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];").unwrap();
+    writeln!(out, "            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];").unwrap();
+    writeln!(out, "            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        device const uint16_t * sc = (device const uint16_t *)(x_base + (uint)ib * Q4K_BLOCK_BYTES +  4u) + (uint)iq;").unwrap();
+    writeln!(out, "        device const uint16_t * q1 = (device const uint16_t *)(x_base + (uint)ib * Q4K_BLOCK_BYTES + 16u) + (uint)(16 * iq + 4 * ir);").unwrap();
+    writeln!(out, "        device const half     * dh = (device const half     *)(x_base + (uint)ib * Q4K_BLOCK_BYTES +  0u);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        for (short row = 0; row < NR0; ++row) {{").unwrap();
+    writeln!(out, "            sc16[0] = sc[0] & KMASK1;").unwrap();
+    writeln!(out, "            sc16[1] = sc[2] & KMASK1;").unwrap();
+    writeln!(out, "            sc16[2] = ((sc[4] >> 0) & KMASK2) | ((sc[0] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16[3] = ((sc[4] >> 4) & KMASK2) | ((sc[2] & KMASK3) >> 2);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            device const uint16_t * q2 = q1 + 32;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            float4 acc1 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 acc2 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            for (short i = 0; i < 4; ++i) {{").unwrap();
+    writeln!(out, "                acc1[0] += yl[2 * i + 0] * (float)(q1[i] & 0x000F);").unwrap();
+    writeln!(out, "                acc1[1] += yl[2 * i + 1] * (float)(q1[i] & 0x0F00);").unwrap();
+    writeln!(out, "                acc1[2] += yl[2 * i + 8] * (float)(q1[i] & 0x00F0);").unwrap();
+    writeln!(out, "                acc1[3] += yl[2 * i + 9] * (float)(q1[i] & 0xF000);").unwrap();
+    writeln!(out, "                acc2[0] += yh[2 * i + 0] * (float)(q2[i] & 0x000F);").unwrap();
+    writeln!(out, "                acc2[1] += yh[2 * i + 1] * (float)(q2[i] & 0x0F00);").unwrap();
+    writeln!(out, "                acc2[2] += yh[2 * i + 8] * (float)(q2[i] & 0x00F0);").unwrap();
+    writeln!(out, "                acc2[3] += yh[2 * i + 9] * (float)(q2[i] & 0xF000);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            sumf[row] += (float)dh[0] * ((acc1[0] + (1.0f/256.0f) * acc1[1]) * (float)sc8[0] +").unwrap();
+    writeln!(out, "                                         (acc1[2] + (1.0f/256.0f) * acc1[3]) * (float)sc8[1] * (1.0f/16.0f) +").unwrap();
+    writeln!(out, "                                         (acc2[0] + (1.0f/256.0f) * acc2[1]) * (float)sc8[4] +").unwrap();
+    writeln!(out, "                                         (acc2[2] + (1.0f/256.0f) * acc2[3]) * (float)sc8[5] * (1.0f/16.0f)) -").unwrap();
+    writeln!(out, "                        (float)dh[1] * ((float)sumy[0] * (float)sc8[2] + (float)sumy[1] * (float)sc8[3] +").unwrap();
+    writeln!(out, "                                         (float)sumy[2] * (float)sc8[6] + (float)sumy[3] * (float)sc8[7]);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            q1 = (device const uint16_t *)((device const char *)q1 + (uint)nb01);").unwrap();
+    writeln!(out, "            sc = (device const uint16_t *)((device const char *)sc + (uint)nb01);").unwrap();
+    writeln!(out, "            dh = (device const half     *)((device const char *)dh + (uint)nb01);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        y4 += 4 * QK_K;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (short row = 0; row < NR0 && local_first + (int)row < n_rows; ++row) {{").unwrap();
+    writeln!(out, "        const float r = simd_sum(sumf[row]);").unwrap();
+    writeln!(out, "        if (tiisg == 0) {{").unwrap();
+    writeln!(out, "            dst_f32[local_first + (int)row] = r;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    (void)tid;").unwrap();
+}
+
+fn emit_mul_mv_gate_up_swiglu_q4_K_f32_msl(out: &mut String) {
+    // F1 dense: gate/up q4_K matvec fused with SwiGLU. Paired inner is byte-identical
+    // to emit_mul_mv_id_q4_K_pair_swiglu_f32_msl (M131); the MoE ids/route-weight/clamp
+    // and the dst_gate/dst_up tri-output are stripped. gate and up are consumed in
+    // register and only dst_mid = silu(gate)*up is written. M=1 decode (single token).
+    // Bufs: p0=gate_w, p1=up_w, p2=x [D] f32, p3=dst_mid [INTER] f32.
+    // Uniforms: ne00 (=D), ne0 (=INTER out rows), nb01 (weight row stride).
+    writeln!(out, "    constexpr short NW   = 32;").unwrap();
+    writeln!(out, "    constexpr short NSG  = 2;").unwrap();
+    writeln!(out, "    constexpr short NR0  = 2;          // N_R0_Q4_K").unwrap();
+    writeln!(out, "    constexpr int   QK_K = 256;").unwrap();
+    writeln!(out, "    constexpr uint  Q4K_BLOCK_BYTES = 144u;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK1 = 0x3f3f;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK2 = 0x0f0f;").unwrap();
+    writeln!(out, "    constexpr uint16_t KMASK3 = 0xc0c0;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const ushort tiisg = (ushort)simd_lane;").unwrap();
+    writeln!(out, "    const ushort sgitg = (ushort)simd_id;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Dense: no ids/token demux. gate_w=p0, up_w=p1, x=p2 (contiguous [D]).").unwrap();
+    writeln!(out, "    device const char  * xg_base_0 = p0;").unwrap();
+    writeln!(out, "    device const char  * xu_base_0 = p1;").unwrap();
+    writeln!(out, "    device const float * y         = (device const float *)p2;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const int nb = (int)ne00 / QK_K;").unwrap();
+    writeln!(out, "    const int r0 = (int)tgpig.x;").unwrap();
+    writeln!(out, "    const int first_row = (r0 * NSG + (int)sgitg) * NR0;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    device const char  * xg_base = xg_base_0 + (uint64_t)first_row * (uint64_t)nb01;").unwrap();
+    writeln!(out, "    device const char  * xu_base = xu_base_0 + (uint64_t)first_row * (uint64_t)nb01;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    const short ix = (short)(tiisg / 8);").unwrap();
+    writeln!(out, "    const short it = (short)(tiisg % 8);").unwrap();
+    writeln!(out, "    const short iq = (short)(it / 4);").unwrap();
+    writeln!(out, "    const short ir = (short)(it % 4);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    device const float * y4 = y + (int)ix * QK_K + 64 * (int)iq + 8 * (int)ir;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float yl[16];").unwrap();
+    writeln!(out, "    float yh[16];").unwrap();
+    writeln!(out, "    float sumg[NR0]; float sumu[NR0];").unwrap();
+    writeln!(out, "    for (short _i = 0; _i < NR0; ++_i) {{ sumg[_i] = 0.0f; sumu[_i] = 0.0f; }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint16_t sc16g[4];").unwrap();
+    writeln!(out, "    uint16_t sc16u[4];").unwrap();
+    writeln!(out, "    thread const uchar * sc8g = (thread const uchar *)sc16g;").unwrap();
+    writeln!(out, "    thread const uchar * sc8u = (thread const uchar *)sc16u;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (int ib = (int)ix; ib < nb; ib += 4) {{").unwrap();
+    writeln!(out, "        float4 sumy = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "        for (short i = 0; i < 8; ++i) {{").unwrap();
+    writeln!(out, "            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];").unwrap();
+    writeln!(out, "            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];").unwrap();
+    writeln!(out, "            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];").unwrap();
+    writeln!(out, "            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        device const uint16_t * scg = (device const uint16_t *)(xg_base + (uint)ib * Q4K_BLOCK_BYTES +  4u) + (uint)iq;").unwrap();
+    writeln!(out, "        device const uint16_t * q1g = (device const uint16_t *)(xg_base + (uint)ib * Q4K_BLOCK_BYTES + 16u) + (uint)(16 * iq + 4 * ir);").unwrap();
+    writeln!(out, "        device const half     * dhg = (device const half     *)(xg_base + (uint)ib * Q4K_BLOCK_BYTES +  0u);").unwrap();
+    writeln!(out, "        device const uint16_t * scu = (device const uint16_t *)(xu_base + (uint)ib * Q4K_BLOCK_BYTES +  4u) + (uint)iq;").unwrap();
+    writeln!(out, "        device const uint16_t * q1u = (device const uint16_t *)(xu_base + (uint)ib * Q4K_BLOCK_BYTES + 16u) + (uint)(16 * iq + 4 * ir);").unwrap();
+    writeln!(out, "        device const half     * dhu = (device const half     *)(xu_base + (uint)ib * Q4K_BLOCK_BYTES +  0u);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        for (short row = 0; row < NR0; ++row) {{").unwrap();
+    writeln!(out, "            sc16g[0] = scg[0] & KMASK1;").unwrap();
+    writeln!(out, "            sc16g[1] = scg[2] & KMASK1;").unwrap();
+    writeln!(out, "            sc16g[2] = ((scg[4] >> 0) & KMASK2) | ((scg[0] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16g[3] = ((scg[4] >> 4) & KMASK2) | ((scg[2] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16u[0] = scu[0] & KMASK1;").unwrap();
+    writeln!(out, "            sc16u[1] = scu[2] & KMASK1;").unwrap();
+    writeln!(out, "            sc16u[2] = ((scu[4] >> 0) & KMASK2) | ((scu[0] & KMASK3) >> 2);").unwrap();
+    writeln!(out, "            sc16u[3] = ((scu[4] >> 4) & KMASK2) | ((scu[2] & KMASK3) >> 2);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            device const uint16_t * q2g = q1g + 32;").unwrap();
+    writeln!(out, "            device const uint16_t * q2u = q1u + 32;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            float4 accg1 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 accg2 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 accu1 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            float4 accu2 = {{ 0.0f, 0.0f, 0.0f, 0.0f }};").unwrap();
+    writeln!(out, "            for (short i = 0; i < 4; ++i) {{").unwrap();
+    writeln!(out, "                accg1[0] += yl[2 * i + 0] * (float)(q1g[i] & 0x000F);").unwrap();
+    writeln!(out, "                accg1[1] += yl[2 * i + 1] * (float)(q1g[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accg1[2] += yl[2 * i + 8] * (float)(q1g[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accg1[3] += yl[2 * i + 9] * (float)(q1g[i] & 0xF000);").unwrap();
+    writeln!(out, "                accg2[0] += yh[2 * i + 0] * (float)(q2g[i] & 0x000F);").unwrap();
+    writeln!(out, "                accg2[1] += yh[2 * i + 1] * (float)(q2g[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accg2[2] += yh[2 * i + 8] * (float)(q2g[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accg2[3] += yh[2 * i + 9] * (float)(q2g[i] & 0xF000);").unwrap();
+    writeln!(out, "                accu1[0] += yl[2 * i + 0] * (float)(q1u[i] & 0x000F);").unwrap();
+    writeln!(out, "                accu1[1] += yl[2 * i + 1] * (float)(q1u[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accu1[2] += yl[2 * i + 8] * (float)(q1u[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accu1[3] += yl[2 * i + 9] * (float)(q1u[i] & 0xF000);").unwrap();
+    writeln!(out, "                accu2[0] += yh[2 * i + 0] * (float)(q2u[i] & 0x000F);").unwrap();
+    writeln!(out, "                accu2[1] += yh[2 * i + 1] * (float)(q2u[i] & 0x0F00);").unwrap();
+    writeln!(out, "                accu2[2] += yh[2 * i + 8] * (float)(q2u[i] & 0x00F0);").unwrap();
+    writeln!(out, "                accu2[3] += yh[2 * i + 9] * (float)(q2u[i] & 0xF000);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            sumg[row] += (float)dhg[0] * ((accg1[0] + (1.0f/256.0f) * accg1[1]) * (float)sc8g[0] +").unwrap();
+    writeln!(out, "                                          (accg1[2] + (1.0f/256.0f) * accg1[3]) * (float)sc8g[1] * (1.0f/16.0f) +").unwrap();
+    writeln!(out, "                                          (accg2[0] + (1.0f/256.0f) * accg2[1]) * (float)sc8g[4] +").unwrap();
+    writeln!(out, "                                          (accg2[2] + (1.0f/256.0f) * accg2[3]) * (float)sc8g[5] * (1.0f/16.0f)) -").unwrap();
+    writeln!(out, "                         (float)dhg[1] * ((float)sumy[0] * (float)sc8g[2] + (float)sumy[1] * (float)sc8g[3] +").unwrap();
+    writeln!(out, "                                          (float)sumy[2] * (float)sc8g[6] + (float)sumy[3] * (float)sc8g[7]);").unwrap();
+    writeln!(out, "            sumu[row] += (float)dhu[0] * ((accu1[0] + (1.0f/256.0f) * accu1[1]) * (float)sc8u[0] +").unwrap();
+    writeln!(out, "                                          (accu1[2] + (1.0f/256.0f) * accu1[3]) * (float)sc8u[1] * (1.0f/16.0f) +").unwrap();
+    writeln!(out, "                                          (accu2[0] + (1.0f/256.0f) * accu2[1]) * (float)sc8u[4] +").unwrap();
+    writeln!(out, "                                          (accu2[2] + (1.0f/256.0f) * accu2[3]) * (float)sc8u[5] * (1.0f/16.0f)) -").unwrap();
+    writeln!(out, "                         (float)dhu[1] * ((float)sumy[0] * (float)sc8u[2] + (float)sumy[1] * (float)sc8u[3] +").unwrap();
+    writeln!(out, "                                          (float)sumy[2] * (float)sc8u[6] + (float)sumy[3] * (float)sc8u[7]);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "            q1g = (device const uint16_t *)((device const char *)q1g + (uint)nb01);").unwrap();
+    writeln!(out, "            scg = (device const uint16_t *)((device const char *)scg + (uint)nb01);").unwrap();
+    writeln!(out, "            dhg = (device const half     *)((device const char *)dhg + (uint)nb01);").unwrap();
+    writeln!(out, "            q1u = (device const uint16_t *)((device const char *)q1u + (uint)nb01);").unwrap();
+    writeln!(out, "            scu = (device const uint16_t *)((device const char *)scu + (uint)nb01);").unwrap();
+    writeln!(out, "            dhu = (device const half     *)((device const char *)dhu + (uint)nb01);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        y4 += 4 * QK_K;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Dense SwiGLU finalize: consume gate/up in register, write only dst_mid.").unwrap();
+    writeln!(out, "    device float * dst_mid_f32 = (device float *)p3;").unwrap();
+    writeln!(out, "    for (short row = 0; row < NR0 && first_row + (int)row < (int)ne0; ++row) {{").unwrap();
+    writeln!(out, "        const float sum_gate = simd_sum(sumg[row]);").unwrap();
+    writeln!(out, "        const float sum_up   = simd_sum(sumu[row]);").unwrap();
+    writeln!(out, "        if (tiisg == 0) {{").unwrap();
+    writeln!(out, "            const int out_row = first_row + (int)row;").unwrap();
+    writeln!(out, "            const float g = sum_gate;").unwrap();
+    writeln!(out, "            const float u = sum_up;").unwrap();
+    writeln!(out, "            const float silu = g / (1.0f + exp(-g));").unwrap();
+    writeln!(out, "            dst_mid_f32[out_row] = silu * u;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    (void)tid;").unwrap();
+}
+
 fn emit_mul_mv_id_q4_K_pair_swiglu_f32_msl(out: &mut String) {
     writeln!(out, "    constexpr short NW   = 32;").unwrap();
     writeln!(out, "    constexpr short NSG  = 2;").unwrap();
@@ -10676,6 +11389,505 @@ fn emit_matvec_f16_msl(out: &mut String) {
     writeln!(out, "    }}").unwrap();
 }
 
+/// Vectorized int8-weight matvec: out[n] = (A · Wt[n]) * scale[n].
+/// p0=activation(float*, K), p1=weight(char*, N×K int8), p2=output(float*),
+/// p3=scale(half*, per-row). Uses float4/char4 vectorized loads (K must be a
+/// multiple of 4) plus cooperative simd_sum + cross-simdgroup shared reduction.
+fn emit_matvec_i8_v4_msl(out: &mut String) {
+    writeln!(out, "    uint row = gid;").unwrap();
+    writeln!(out, "    if (row >= N) return;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint K4 = K >> 2;").unwrap();
+    writeln!(out, "    float sum = 0.0f;").unwrap();
+    writeln!(out, "    device const float4* a4 = (device const float4*) p0;").unwrap();
+    writeln!(out, "    device const char4*  w4 = (device const char4*) (p1 + row * K);").unwrap();
+    writeln!(out, "    for (uint i = tid; i < K4; i += tpg) {{").unwrap();
+    writeln!(out, "        sum += dot(a4[i], float4(w4[i]));").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    sum = simd_sum(sum);").unwrap();
+    writeln!(out, "    uint num_simd_groups = tpg / 32;").unwrap();
+    writeln!(out, "    if (simd_lane == 0) shared[simd_id] = sum;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (tid == 0) {{").unwrap();
+    writeln!(out, "        float total = 0.0f;").unwrap();
+    writeln!(out, "        for (uint s = 0; s < num_simd_groups; s++) total += shared[s];").unwrap();
+    writeln!(out, "        p2[row] = total * float(p3[row]);").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Batched (M=8) int8 matvec: M-partition of emit_matvec_i8_v4_msl. Each output row
+/// reads the int8 weight vector ONCE and reuses it across 8 activation streams.
+/// p0=activation(float, M×K), p1=weight(char, N×K), p2=output(float, M×N), p3=scale(half, per-row).
+/// Uses a local `shared_m[32*8]` threadgroup array for the per-stream simd reduction (the
+/// emitter's auto-declared `shared[32]` is only 32 elements, so it is left unused here).
+fn emit_matvec_i8_v4_batched_msl(out: &mut String) {
+    writeln!(out, "    const uint M = 8u;").unwrap();
+    writeln!(out, "    uint n = gid;").unwrap();
+    writeln!(out, "    if (n >= N) return;").unwrap();
+    writeln!(out, "    threadgroup float shared_m[32*8];").unwrap();
+    writeln!(out, "    uint K4 = K >> 2;").unwrap();
+    writeln!(out, "    float acc[8] = {{0,0,0,0,0,0,0,0}};").unwrap();
+    writeln!(out, "    device const char4* B4 = (device const char4*)(p1 + n*K);").unwrap();
+    writeln!(out, "    for (uint i = tid; i < K4; i += tpg) {{").unwrap();
+    writeln!(out, "        float4 wv = float4(B4[i]);").unwrap();
+    writeln!(out, "        for (uint m = 0; m < M; m++) {{").unwrap();
+    writeln!(out, "            device const float4* A4 = (device const float4*)(p0 + m*K);").unwrap();
+    writeln!(out, "            acc[m] += dot(A4[i], wv);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    uint ng = tpg / 32u;").unwrap();
+    writeln!(out, "    float sc = float(p3[n]);").unwrap();
+    writeln!(out, "    for (uint m = 0; m < M; m++) {{ float a = simd_sum(acc[m]); if (simd_lane == 0) shared_m[m*32u + simd_id] = a; }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (tid == 0) {{ for (uint m = 0; m < M; m++) {{ float t = 0; for (uint s = 0; s < ng; s++) t += shared_m[m*32u + s]; p2[m*N + n] = t*sc; }} }}").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Batched (M=8) non-matmul kernels. Each emits the COMPLETE kernel verbatim
+// (signature + body) from bench_cutile/phase9_e2e/e2e_batch.swift, because the
+// generic signature emitter cannot produce their exotic thread-position attrs
+// (uint3/uint2 grid, in-place buffers, many params). generate_func_msl routes
+// these KernelTypes here and returns early, so no generic wrapper is added.
+// ---------------------------------------------------------------------------
+
+/// rms_norm * w, batched: M-partition of rms_norm_mul. 2D grid (row, stream);
+/// stream = gpig.y selects the activation column. simd reduction + threadgroup sh[32].
+fn emit_rms_norm_mul_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void rms_norm_mul_batched(device const float* x[[buffer(0)]],device const half* w[[buffer(1)]],device float* y[[buffer(2)]],").unwrap();
+    writeln!(out, " constant uint&n[[buffer(3)]],constant uint&row_stride[[buffer(4)]],constant float&eps[[buffer(5)]],constant uint&stream_stride[[buffer(6)]],").unwrap();
+    writeln!(out, " uint3 gpig[[threadgroup_position_in_grid]],uint tid[[thread_index_in_threadgroup]],uint3 tcv[[threads_per_threadgroup]],").unwrap();
+    writeln!(out, " uint sl[[thread_index_in_simdgroup]],uint si[[simdgroup_index_in_threadgroup]]){{").unwrap();
+    writeln!(out, " uint tc=tcv.x; uint row=gpig.x; uint stream=gpig.y;").unwrap();
+    writeln!(out, " device const float* xs=x+stream*stream_stride; device float* ys=y+stream*stream_stride;").unwrap();
+    writeln!(out, " threadgroup float sh[32]; uint b=row*row_stride; float s=0;").unwrap();
+    writeln!(out, " for(uint i=tid;i<n;i+=tc){{float v=xs[b+i]; s+=v*v;}}").unwrap();
+    writeln!(out, " s=simd_sum(s); if(sl==0)sh[si]=s; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " uint ng=(tc+31)/32; if(tid==0){{float t=0;for(uint j=0;j<ng;j++)t+=sh[j];sh[0]=t;}}").unwrap();
+    writeln!(out, " threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float scale=rsqrt(sh[0]/float(n)+eps);").unwrap();
+    writeln!(out, " for(uint i=tid;i<n;i+=tc) ys[b+i]=(xs[b+i]*scale)*float(w[i]);}}").unwrap();
+}
+
+/// rms_norm * w, batched, float4-vectorized. Same grid/signature as the scalar
+/// variant; n4 = n>>2 float4 loads, per-lane w multiply.
+fn emit_rms_norm_mul_v4_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void rms_norm_mul_v4_batched(device const float* x[[buffer(0)]],device const half* w[[buffer(1)]],device float* y[[buffer(2)]],").unwrap();
+    writeln!(out, " constant uint&n[[buffer(3)]],constant uint&row_stride[[buffer(4)]],constant float&eps[[buffer(5)]],constant uint&stream_stride[[buffer(6)]],").unwrap();
+    writeln!(out, " uint3 gpig[[threadgroup_position_in_grid]],uint tid[[thread_index_in_threadgroup]],uint3 tcv[[threads_per_threadgroup]],").unwrap();
+    writeln!(out, " uint sl[[thread_index_in_simdgroup]],uint si[[simdgroup_index_in_threadgroup]]){{").unwrap();
+    writeln!(out, " uint tc=tcv.x; uint row=gpig.x; uint stream=gpig.y;").unwrap();
+    writeln!(out, " device const float* xs=x+stream*stream_stride; device float* ys=y+stream*stream_stride;").unwrap();
+    writeln!(out, " threadgroup float sh[32]; uint n4=n>>2;").unwrap();
+    writeln!(out, " device const float4* x4=(device const float4*)(xs+row*row_stride);").unwrap();
+    writeln!(out, " device const half* wv=w; device float4* y4=(device float4*)(ys+row*row_stride);").unwrap();
+    writeln!(out, " float s=0; for(uint i=tid;i<n4;i+=tc){{ float4 v=x4[i]; s+=dot(v,v); }}").unwrap();
+    writeln!(out, " s=simd_sum(s); if(sl==0)sh[si]=s; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " uint ng=(tc+31)/32; if(tid==0){{float t=0;for(uint j=0;j<ng;j++)t+=sh[j];sh[0]=t;}}").unwrap();
+    writeln!(out, " threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float scale=rsqrt(sh[0]/float(n)+eps);").unwrap();
+    writeln!(out, " for(uint i=tid;i<n4;i+=tc){{ float4 v=x4[i]*scale; uint b=i<<2;").unwrap();
+    writeln!(out, "   y4[i]=float4(v.x*float(wv[b]),v.y*float(wv[b+1]),v.z*float(wv[b+2]),v.w*float(wv[b+3])); }}}}").unwrap();
+}
+
+/// split-half (NeoX/HF) RoPE, in-place, batched. 2D grid (row, stream);
+/// stream = tgpig.y selects the activation. No simd/shared. p0 is in-place.
+fn emit_rope_split_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void rope_split_batched(device float* p0[[buffer(0)]],constant uint&num_heads[[buffer(1)]],constant uint&head_dim[[buffer(2)]],").unwrap();
+    writeln!(out, " constant uint&position[[buffer(3)]],constant float&theta[[buffer(4)]],constant uint&stream_stride[[buffer(5)]],").unwrap();
+    writeln!(out, " uint3 tgpig[[threadgroup_position_in_grid]],uint3 tidv[[thread_position_in_threadgroup]],uint3 tcv[[threads_per_threadgroup]]){{").unwrap();
+    writeln!(out, " uint tid=tidv.x; uint tcount=tcv.x; uint row=tgpig.x; uint stream=tgpig.y; device float* ps=p0+stream*stream_stride;").unwrap();
+    writeln!(out, " uint gid=row*tcount+tid; uint half_dim=head_dim/2; uint total=num_heads*half_dim; if(gid>=total)return;").unwrap();
+    writeln!(out, " uint head=gid/half_dim; uint i=gid%half_dim;").unwrap();
+    writeln!(out, " float freq=1.0f/pow(theta,2.0f*float(i)/float(head_dim)); float angle=float(position)*freq;").unwrap();
+    writeln!(out, " float ca=cos(angle),sa=sin(angle); uint base=head*head_dim;").unwrap();
+    writeln!(out, " float x0=ps[base+i],x1=ps[base+half_dim+i];").unwrap();
+    writeln!(out, " ps[base+i]=x0*ca-x1*sa; ps[base+half_dim+i]=x1*ca+x0*sa;}}").unwrap();
+}
+
+/// decode attention, batched. 2D grid (head, stream); stream = gpig.y selects
+/// Q/O (q_stride) and Kc/Vc (kv_stride). simd reduction + shared[32] + scores[256].
+fn emit_attn_decode_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void attn_decode_batched(device const float* Q[[buffer(0)]],device const float* Kc[[buffer(1)]],device const float* Vc[[buffer(2)]],").unwrap();
+    writeln!(out, " device float* O[[buffer(3)]],constant uint&kv_len[[buffer(4)]],constant uint&head_dim[[buffer(5)]],").unwrap();
+    writeln!(out, " constant uint&num_heads[[buffer(6)]],constant uint&num_kv[[buffer(7)]],constant uint&max_seq[[buffer(8)]],").unwrap();
+    writeln!(out, " constant uint&q_stride[[buffer(9)]],constant uint&kv_stride[[buffer(10)]],").unwrap();
+    writeln!(out, " uint3 gpig[[threadgroup_position_in_grid]],uint tid[[thread_index_in_threadgroup]],uint3 tpgv[[threads_per_threadgroup]],").unwrap();
+    writeln!(out, " uint sl[[thread_index_in_simdgroup]],uint si[[simdgroup_index_in_threadgroup]]){{").unwrap();
+    writeln!(out, " uint tpg=tpgv.x; uint head=gpig.x; uint stream=gpig.y; if(head>=num_heads)return;").unwrap();
+    writeln!(out, " device const float* Qs=Q+stream*q_stride; device const float* Kcs=Kc+stream*kv_stride;").unwrap();
+    writeln!(out, " device const float* Vcs=Vc+stream*kv_stride; device float* Os=O+stream*q_stride;").unwrap();
+    writeln!(out, " threadgroup float shared[32]; threadgroup float scores[256];").unwrap();
+    writeln!(out, " float scale=rsqrt(float(head_dim)); uint gsz=num_heads/num_kv; uint kvh=head/gsz;").unwrap();
+    writeln!(out, " uint qoff=head*head_dim; uint kvoff=kvh*max_seq*head_dim;").unwrap();
+    writeln!(out, " for(uint pos=tid;pos<kv_len;pos+=tpg){{float dot=0; for(uint d=0;d<head_dim;d++) dot+=Qs[qoff+d]*Kcs[kvoff+pos*head_dim+d]; scores[pos]=dot*scale;}}").unwrap();
+    writeln!(out, " threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float lm=-MAXFLOAT; for(uint pos=tid;pos<kv_len;pos+=tpg) lm=max(lm,scores[pos]); lm=simd_max(lm);").unwrap();
+    writeln!(out, " uint ns=(tpg+31)/32; if(sl==0)shared[si]=lm; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " if(tid==0){{float m=shared[0];for(uint i=1;i<ns;i++)m=max(m,shared[i]);shared[0]=m;}} threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float gm=shared[0]; float ls=0;").unwrap();
+    writeln!(out, " for(uint pos=tid;pos<kv_len;pos+=tpg){{float e=exp(scores[pos]-gm);scores[pos]=e;ls+=e;}} ls=simd_sum(ls);").unwrap();
+    writeln!(out, " if(sl==0)shared[si]=ls; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " if(tid==0){{float s=0;for(uint i=0;i<ns;i++)s+=shared[i];shared[0]=s;}} threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float inv=1.0f/shared[0]; for(uint pos=tid;pos<kv_len;pos+=tpg)scores[pos]*=inv; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " uint ooff=head*head_dim;").unwrap();
+    writeln!(out, " for(uint d=tid;d<head_dim;d+=tpg){{float acc=0; for(uint pos=0;pos<kv_len;pos++)acc+=scores[pos]*Vcs[kvoff+pos*head_dim+d]; Os[ooff+d]=acc;}}}}").unwrap();
+}
+
+/// decode attention, batched, float4 Q.K dot (hd4 = head_dim>>2). Same grid/signature.
+fn emit_attn_decode_v4_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void attn_decode_v4_batched(device const float* Q[[buffer(0)]],device const float* Kc[[buffer(1)]],device const float* Vc[[buffer(2)]],").unwrap();
+    writeln!(out, " device float* O[[buffer(3)]],constant uint&kv_len[[buffer(4)]],constant uint&head_dim[[buffer(5)]],").unwrap();
+    writeln!(out, " constant uint&num_heads[[buffer(6)]],constant uint&num_kv[[buffer(7)]],constant uint&max_seq[[buffer(8)]],").unwrap();
+    writeln!(out, " constant uint&q_stride[[buffer(9)]],constant uint&kv_stride[[buffer(10)]],").unwrap();
+    writeln!(out, " uint3 gpig[[threadgroup_position_in_grid]],uint tid[[thread_index_in_threadgroup]],uint3 tpgv[[threads_per_threadgroup]],").unwrap();
+    writeln!(out, " uint sl[[thread_index_in_simdgroup]],uint si[[simdgroup_index_in_threadgroup]]){{").unwrap();
+    writeln!(out, " uint tpg=tpgv.x; uint head=gpig.x; uint stream=gpig.y; if(head>=num_heads)return;").unwrap();
+    writeln!(out, " device const float* Qs=Q+stream*q_stride; device const float* Kcs=Kc+stream*kv_stride;").unwrap();
+    writeln!(out, " device const float* Vcs=Vc+stream*kv_stride; device float* Os=O+stream*q_stride;").unwrap();
+    writeln!(out, " threadgroup float shared[32]; threadgroup float scores[256];").unwrap();
+    writeln!(out, " float scale=rsqrt(float(head_dim)); uint gsz=num_heads/num_kv; uint kvh=head/gsz; uint hd4=head_dim>>2;").unwrap();
+    writeln!(out, " uint qoff=head*head_dim; uint kvoff=kvh*max_seq*head_dim;").unwrap();
+    writeln!(out, " device const float4* Q4=(device const float4*)(Qs+qoff);").unwrap();
+    writeln!(out, " for(uint pos=tid;pos<kv_len;pos+=tpg){{ device const float4* K4=(device const float4*)(Kcs+kvoff+pos*head_dim);").unwrap();
+    writeln!(out, "   float acc=0; for(uint d=0;d<hd4;d++) acc+=dot(Q4[d],K4[d]); scores[pos]=acc*scale;}}").unwrap();
+    writeln!(out, " threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float lm=-MAXFLOAT; for(uint pos=tid;pos<kv_len;pos+=tpg) lm=max(lm,scores[pos]); lm=simd_max(lm);").unwrap();
+    writeln!(out, " uint ns=(tpg+31)/32; if(sl==0)shared[si]=lm; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " if(tid==0){{float m=shared[0];for(uint i=1;i<ns;i++)m=max(m,shared[i]);shared[0]=m;}} threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float gm=shared[0]; float ls=0;").unwrap();
+    writeln!(out, " for(uint pos=tid;pos<kv_len;pos+=tpg){{float e=exp(scores[pos]-gm);scores[pos]=e;ls+=e;}} ls=simd_sum(ls);").unwrap();
+    writeln!(out, " if(sl==0)shared[si]=ls; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " if(tid==0){{float s=0;for(uint i=0;i<ns;i++)s+=shared[i];shared[0]=s;}} threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " float inv=1.0f/shared[0]; for(uint pos=tid;pos<kv_len;pos+=tpg)scores[pos]*=inv; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, " uint ooff=head*head_dim;").unwrap();
+    writeln!(out, " for(uint d=tid;d<head_dim;d+=tpg){{float acc=0; for(uint pos=0;pos<kv_len;pos++)acc+=scores[pos]*Vcs[kvoff+pos*head_dim+d]; Os[ooff+d]=acc;}}}}").unwrap();
+}
+
+/// split-K decode attention: per-split flash partial. 2D grid (head_group, split).
+/// Each thread e owns head-dim lane e; acc/m/l live in registers, red[256] is sized to
+/// the dh threads (NOT kv_len) — there is no [kv_len] threadgroup array (the H3 fix).
+fn emit_attn_decode_splitk_msl(out: &mut String) {
+    writeln!(out, "kernel void attn_decode_splitk(device const float* q[[buffer(0)]],device const float* kc[[buffer(1)]],device const float* vc[[buffer(2)]],").unwrap();
+    writeln!(out, " device float* pacc[[buffer(3)]],device float* pm[[buffer(4)]],device float* pl[[buffer(5)]],").unwrap();
+    writeln!(out, " constant uint& dh[[buffer(6)]],constant uint& kv_row[[buffer(7)]],constant uint& group[[buffer(8)]],").unwrap();
+    writeln!(out, " constant uint& seq[[buffer(9)]],constant float& scale[[buffer(10)]],constant uint& nsplit[[buffer(11)]],").unwrap();
+    writeln!(out, " uint3 gid[[threadgroup_position_in_grid]],uint3 tpos[[thread_position_in_threadgroup]],uint3 tsz[[threads_per_threadgroup]]){{").unwrap();
+    writeln!(out, "    const uint e = tpos.x; const uint tcnt = tsz.x; const uint hg = gid.x; const uint sp = gid.y; const uint kvh = hg / group;").unwrap();
+    writeln!(out, "    const uint chunk = (seq + nsplit - 1u) / nsplit; const uint tbeg = sp * chunk; const uint tend = min(tbeg + chunk, seq);").unwrap();
+    writeln!(out, "    const uint po = (hg * nsplit + sp);").unwrap();
+    writeln!(out, "    if (tbeg >= tend) {{ pacc[po*dh+e] = 0.0f; if (e == 0u) {{ pm[po] = -INFINITY; pl[po] = 0.0f; }} return; }}").unwrap();
+    writeln!(out, "    const float qe = q[hg*dh+e]; threadgroup float red[256]; threadgroup float s_sh;").unwrap();
+    writeln!(out, "    float acc = 0.0f; float m = -INFINITY; float l = 0.0f;").unwrap();
+    writeln!(out, "    for (uint t = tbeg; t < tend; t++) {{ const ulong base = (ulong)t*kv_row + (ulong)kvh*dh;").unwrap();
+    writeln!(out, "        red[e] = qe * kc[base+e]; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "        for (uint sr = tcnt/2u; sr > 0u; sr >>= 1u) {{ if (e < sr) red[e] += red[e+sr]; threadgroup_barrier(mem_flags::mem_threadgroup); }}").unwrap();
+    writeln!(out, "        if (e == 0u) s_sh = red[0]*scale; threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "        const float sv = s_sh; const float m_new = max(m, sv); const float corr = exp(m - m_new); const float pv = exp(sv - m_new);").unwrap();
+    writeln!(out, "        l = l*corr + pv; acc = acc*corr + pv*vc[base+e]; m = m_new; threadgroup_barrier(mem_flags::mem_threadgroup); }}").unwrap();
+    writeln!(out, "    pacc[po*dh+e] = acc; if (e == 0u) {{ pm[po] = m; pl[po] = l; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// split-K decode attention, v2: one simdgroup (32 lanes) per head, each lane owns 4
+/// head-dims as float4/half4. simd_sum reduces the Q·K dot — NO threadgroup barrier,
+/// NO red[] array. K/V are f16 (half4 loads). head_dim hardcoded 128. 3.9–4.5× faster
+/// than the barrier-tree AttnDecodeSplitK; beats llama.cpp flash-attn-vec at long context.
+/// Partial layout (pacc/pm/pl) is identical to v1, so AttnDecodeCombine merges it unchanged.
+fn emit_attn_decode_splitk_v2_msl(out: &mut String) {
+    writeln!(out, "kernel void attn_decode_splitk_v2(device const float* q[[buffer(0)]],device const half* kc[[buffer(1)]],device const half* vc[[buffer(2)]],").unwrap();
+    writeln!(out, " device float* pacc[[buffer(3)]],device float* pm[[buffer(4)]],device float* pl[[buffer(5)]],").unwrap();
+    writeln!(out, " constant uint& kv_row[[buffer(6)]],constant uint& group[[buffer(7)]],").unwrap();
+    writeln!(out, " constant uint& seq[[buffer(8)]],constant float& scale[[buffer(9)]],constant uint& nsplit[[buffer(10)]],").unwrap();
+    writeln!(out, " uint3 gid[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]]){{").unwrap();
+    writeln!(out, "    const uint hg = gid.x; const uint sp = gid.y; const uint kvh = hg / group;").unwrap();
+    writeln!(out, "    const uint chunk = (seq + nsplit - 1u) / nsplit; const uint tbeg = sp*chunk; const uint tend = min(tbeg+chunk, seq);").unwrap();
+    writeln!(out, "    const uint po = hg*nsplit + sp;").unwrap();
+    writeln!(out, "    device const float4* q4 = (device const float4*)(q + hg*128);").unwrap();
+    writeln!(out, "    float4 qv = q4[tiisg];").unwrap();
+    writeln!(out, "    if (tbeg >= tend) {{ for (short d=0; d<4; ++d) pacc[po*128 + tiisg*4 + d] = 0.0f; if (tiisg==0){{pm[po]=-INFINITY; pl[po]=0.0f;}} return; }}").unwrap();
+    writeln!(out, "    float4 acc = 0.0f; float m = -INFINITY; float l = 0.0f;").unwrap();
+    writeln!(out, "    for (uint t = tbeg; t < tend; t++) {{").unwrap();
+    writeln!(out, "        const ulong base = (ulong)t*kv_row + (ulong)kvh*128;").unwrap();
+    writeln!(out, "        device const half4* k4 = (device const half4*)(kc + base);").unwrap();
+    writeln!(out, "        float sv = dot(qv, (float4)k4[tiisg]);").unwrap();
+    writeln!(out, "        sv = simd_sum(sv) * scale;").unwrap();
+    writeln!(out, "        const float m_new = max(m, sv); const float corr = exp(m-m_new); const float pv = exp(sv-m_new);").unwrap();
+    writeln!(out, "        l = l*corr + pv;").unwrap();
+    writeln!(out, "        device const half4* v4 = (device const half4*)(vc + base);").unwrap();
+    writeln!(out, "        acc = acc*corr + pv*(float4)v4[tiisg];").unwrap();
+    writeln!(out, "        m = m_new;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    for (short d=0; d<4; ++d) pacc[po*128 + tiisg*4 + d] = acc[d];").unwrap();
+    writeln!(out, "    if (tiisg==0){{ pm[po]=m; pl[po]=l; }}").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// flash-merge of split-K partials: 1D grid (head_group), thread e owns head-dim lane e.
+/// Rescales each split by exp(m_i - m_global), sums, and normalizes by the merged denom.
+fn emit_attn_decode_combine_msl(out: &mut String) {
+    writeln!(out, "kernel void attn_decode_combine(device const float* pacc[[buffer(0)]],device const float* pm[[buffer(1)]],device const float* pl[[buffer(2)]],").unwrap();
+    writeln!(out, " device float* out[[buffer(3)]],constant uint& dh[[buffer(4)]],constant uint& nsplit[[buffer(5)]],").unwrap();
+    writeln!(out, " uint hg[[threadgroup_position_in_grid]],uint e[[thread_position_in_threadgroup]]){{").unwrap();
+    writeln!(out, "    float m = -INFINITY; for (uint s = 0u; s < nsplit; s++) m = max(m, pm[hg*nsplit+s]);").unwrap();
+    writeln!(out, "    if (m == -INFINITY) {{ out[hg*dh+e] = 0.0f; return; }}").unwrap();
+    writeln!(out, "    float l = 0.0f; float acc = 0.0f;").unwrap();
+    writeln!(out, "    for (uint s = 0u; s < nsplit; s++) {{ const uint po = hg*nsplit+s; const float mi = pm[po]; if (mi == -INFINITY) continue;").unwrap();
+    writeln!(out, "        const float w = exp(mi - m); l += pl[po]*w; acc += pacc[po*dh+e]*w; }}").unwrap();
+    writeln!(out, "    out[hg*dh+e] = (l > 0.0f) ? (acc/l) : 0.0f;").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// silu(g)*u, batched. uint2 grid via dispatchThreads; off = gid.y*stream_stride + gid.x.
+/// No simd/shared, no threadgroup arrays.
+fn emit_silu_mul_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void silu_mul_batched(device const float* g[[buffer(0)]],device const float* u[[buffer(1)]],device float* o[[buffer(2)]],").unwrap();
+    writeln!(out, " constant uint&n[[buffer(3)]],constant uint&stream_stride[[buffer(4)]],").unwrap();
+    writeln!(out, " uint2 gid[[thread_position_in_grid]]){{").unwrap();
+    writeln!(out, " if(gid.x>=n)return; uint off=gid.y*stream_stride+gid.x; float x=g[off]; o[off]=(x/(1.0f+exp(-x)))*u[off];}}").unwrap();
+}
+
+/// a += b, batched. uint2 grid; off = gid.y*stream_stride + gid.x. In-place a.
+fn emit_add_inplace_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void add_inplace_batched(device float* a[[buffer(0)]],device const float* b[[buffer(1)]],constant uint&n[[buffer(2)]],").unwrap();
+    writeln!(out, " constant uint&stream_stride[[buffer(3)]],uint2 gid[[thread_position_in_grid]]){{").unwrap();
+    writeln!(out, " if(gid.x>=n)return; uint off=gid.y*stream_stride+gid.x; a[off]+=b[off];}}").unwrap();
+}
+
+/// KV-cache write, batched. uint2 grid; src offset gid.y*src_stride, cache offset
+/// gid.y*cache_stride. No simd/shared.
+fn emit_kv_write_batched_msl(out: &mut String) {
+    writeln!(out, "kernel void kv_write_batched(device const float* src[[buffer(0)]],device float* cache[[buffer(1)]],").unwrap();
+    writeln!(out, " constant uint&num_kv[[buffer(2)]],constant uint&head_dim[[buffer(3)]],constant uint&max_seq[[buffer(4)]],constant uint&pos[[buffer(5)]],").unwrap();
+    writeln!(out, " constant uint&src_stride[[buffer(6)]],constant uint&cache_stride[[buffer(7)]],").unwrap();
+    writeln!(out, " uint2 gid[[thread_position_in_grid]]){{").unwrap();
+    writeln!(out, " uint total=num_kv*head_dim; if(gid.x>=total)return;").unwrap();
+    writeln!(out, " device const float* srcs=src+gid.y*src_stride; device float* caches=cache+gid.y*cache_stride;").unwrap();
+    writeln!(out, " uint h=gid.x/head_dim,d=gid.x%head_dim;").unwrap();
+    writeln!(out, " caches[h*max_seq*head_dim+pos*head_dim+d]=srcs[h*head_dim+d];}}").unwrap();
+}
+
+/// Q4_K quantized-domain matvec: decode llama.cpp block_q4_K super-blocks
+/// (144 bytes / 256 weights) in-kernel.
+/// p0=weight(uchar*, packed blocks), p1=activation(float*), p2=output(float*).
+/// Params: d_in (input dim, multiple of 256), d_out (output rows).
+/// Quant-matvec kernel selection by weight format, implementing the measured bits-per-weight
+/// rule (kernel audit, 2026-07): the decode-ALU intensity per weight byte decides the shape.
+///
+/// - `<= 6`-bit k-quants (`q4_k`, `q5_k`, `q6_k`, `q2_k`): sub-byte unpack + 6-bit sub-scales are
+///   ALU-heavy, so the matvec is decode-bound. A register-blocked SCALAR kernel wins; vectorizing
+///   the dot cannot help (the dot isn't the bottleneck) and vectorizing the unpack adds
+///   `float4(uchar4)` widening + an affine that no longer folds into one FMA. → `MatvecQ4KReg`.
+/// - `>= 8`-bit (`q8_0`, `i8`): dequant is a single multiply, so the matvec stays
+///   bandwidth-bound. A vectorized per-row kernel (float4 activation × charN weight, per-row scale
+///   hoisted out of the loop) wins; register-blocking REGRESSES it 3.7–10× by trading threadgroup
+///   parallelism for ALU reuse that does not exist. → `MatvecI8V4`.
+///
+/// Unknown formats fall back to the safe scalar packed-block decode (`MatvecQ4K`).
+fn quant_matvec_kernel_for(fmt: &str) -> KernelType {
+    match fmt {
+        // 8-bit and int8: bandwidth-bound → vectorized per-row.
+        "q8_0" | "i8" | "int8" => KernelType::MatvecI8V4,
+        // Q4_K: the cooperative single-read kernel (llama.cpp mul_mv shape) reads each 144B block
+        // ONCE across 8 lanes (coalesced) — 1.46× the register-blocked kernel (402 vs 275 GB/s),
+        // the fastest safe Q4_K decode matvec measured (llama-parity weight bandwidth).
+        "q4_k" => KernelType::MatvecQ4KCoop,
+        // other <= 6-bit k-quants: ALU-bound decode → register-blocked scalar (coop not yet ported).
+        "q5_k" | "q6_k" | "q2_k" => KernelType::MatvecQ4KReg,
+        // Unknown: safe scalar packed-block matvec.
+        _ => KernelType::MatvecQ4K,
+    }
+}
+
+fn emit_matvec_q4k_msl(out: &mut String) {
+    // Tuned: threads stride over (block,sub-block) items (32 weights each), decode sc/mn once,
+    // vectorized uchar4/float4 nibble dot, simd_sum + shared reduction. Occupancy-tuned host
+    // dispatches ~96 threads (n_sub is 80-128 for these shapes); the kernel is width-agnostic.
+    writeln!(out, "    uint row = gid;").unwrap();
+    writeln!(out, "    if (row >= d_out) return;").unwrap();
+    writeln!(out, "    uint n_blk = d_in / 256u;").unwrap();
+    writeln!(out, "    uint n_sub = n_blk * 8u;").unwrap();
+    writeln!(out, "    device const uchar *wr = p0 + (ulong)row * (ulong)n_blk * 144ul;").unwrap();
+    writeln!(out, "    float acc = 0.0f;").unwrap();
+    writeln!(out, "    for (uint s = tid; s < n_sub; s += tpg) {{").unwrap();
+    writeln!(out, "        uint b = s >> 3, isb = s & 7u;").unwrap();
+    writeln!(out, "        device const uchar *blk = wr + (ulong)b * 144ul;").unwrap();
+    writeln!(out, "        ushort db = (ushort)((ushort)blk[0] | ((ushort)blk[1] << 8));").unwrap();
+    writeln!(out, "        ushort mb = (ushort)((ushort)blk[2] | ((ushort)blk[3] << 8));").unwrap();
+    writeln!(out, "        float d = (float)as_type<half>(db);").unwrap();
+    writeln!(out, "        float dmin = (float)as_type<half>(mb);").unwrap();
+    writeln!(out, "        device const uchar *scales = blk + 4;").unwrap();
+    writeln!(out, "        uchar sc, mn;").unwrap();
+    writeln!(out, "        if (isb < 4u) {{ sc = scales[isb] & 63u; mn = scales[isb + 4u] & 63u; }}").unwrap();
+    writeln!(out, "        else {{").unwrap();
+    writeln!(out, "            sc = (scales[isb + 4u] & 0xFu) | ((scales[isb - 4u] >> 6) << 4);").unwrap();
+    writeln!(out, "            mn = (scales[isb + 4u] >> 4) | ((scales[isb] >> 6) << 4);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        float dl = d * (float)sc, ml = dmin * (float)mn;").unwrap();
+    writeln!(out, "        device const uchar4 *q4 = (device const uchar4*)(blk + 16 + (isb / 2u) * 32u);").unwrap();
+    writeln!(out, "        uint hi = isb & 1u;").unwrap();
+    writeln!(out, "        device const float4 *x4 = (device const float4*)(p1 + b * 256u + isb * 32u);").unwrap();
+    writeln!(out, "        float part = 0.0f;").unwrap();
+    writeln!(out, "        for (uint j = 0u; j < 8u; j++) {{").unwrap();
+    writeln!(out, "            uchar4 pk = q4[j];").unwrap();
+    writeln!(out, "            float4 nib = (hi == 0u) ? float4(pk & (uchar4)0xF) : float4(pk >> (uchar4)4);").unwrap();
+    writeln!(out, "            float4 wv = dl * nib - ml;").unwrap();
+    writeln!(out, "            part += dot(wv, x4[j]);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        acc += part;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    acc = simd_sum(acc);").unwrap();
+    writeln!(out, "    uint num_simd_groups = (tpg + 31u) / 32u;").unwrap();
+    writeln!(out, "    if (simd_lane == 0) shared[simd_id] = acc;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (tid == 0) {{ float t = 0.0f; for (uint i = 0u; i < num_simd_groups; i++) t += shared[i]; p2[row] = t; }}").unwrap();
+}
+
+/// Register-blocked scalar Q4_K matvec (llama.cpp `mul_mv_q` design), emitted verbatim.
+/// Exotic signature (uint3 tgpig / ushort tiisg / ushort sgitg) that the generic
+/// wrapper cannot produce, so generate_func_msl routes this KernelType here and
+/// returns early. NSG=2, N_R0=4 inlined: each simdgroup owns 4 output rows; 32 lanes
+/// stride the (block, sub-block) space, accumulate 4 row partials in registers, then
+/// simd_sum per row. SAFE variant of MatvecQ4K: same element-typed uchar reads +
+/// as_type<half> super-scale decode (no unsafe, no reinterpret), just register-blocked
+/// + scalar nibble FMA instead of the vectorized uchar4/float4 dot.
+/// Buffers: w@0(uchar), x@1(float), out@2(float), d_in@3, d_out@4.
+fn emit_matvec_q4k_reg_msl(out: &mut String) {
+    writeln!(out, "kernel void matvec_q4k_reg(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],").unwrap();
+    writeln!(out, " device float *out [[buffer(2)]], constant uint &d_in [[buffer(3)]], constant uint &d_out [[buffer(4)]],").unwrap();
+    writeln!(out, " uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {{").unwrap();
+    writeln!(out, "    const uint n_blk = d_in / 256u;").unwrap();
+    writeln!(out, "    const uint nb32 = n_blk * 8u;").unwrap();
+    writeln!(out, "    const int first_row = ((int)tgpig.x * 2 + (int)sgitg) * 4;").unwrap();
+    writeln!(out, "    float yl[32];").unwrap();
+    writeln!(out, "    float sumf[4] = {{0.f}};").unwrap();
+    writeln!(out, "    const uint ix = tiisg;").unwrap();
+    writeln!(out, "    for (uint ib32 = ix; ib32 < nb32; ib32 += 32u) {{").unwrap();
+    writeln!(out, "        const uint b = ib32 >> 3;").unwrap();
+    writeln!(out, "        const uint isb = ib32 & 7u;").unwrap();
+    writeln!(out, "        const uint base = b * 256u + isb * 32u;").unwrap();
+    writeln!(out, "        for (short i = 0; i < 32; i++) yl[i] = x[base + i];").unwrap();
+    writeln!(out, "        const uint hi = isb & 1u;").unwrap();
+    writeln!(out, "        const uint qoff = (isb / 2u) * 32u;").unwrap();
+    writeln!(out, "        for (short row = 0; row < 4; row++) {{").unwrap();
+    writeln!(out, "            if (first_row + row >= (int)d_out) break;").unwrap();
+    writeln!(out, "            device const uchar *blk = w + (ulong)(first_row + row) * (ulong)n_blk * 144ul + (ulong)b * 144ul;").unwrap();
+    writeln!(out, "            const float d = (float)as_type<half>((ushort)((ushort)blk[0] | ((ushort)blk[1] << 8)));").unwrap();
+    writeln!(out, "            const float dmin = (float)as_type<half>((ushort)((ushort)blk[2] | ((ushort)blk[3] << 8)));").unwrap();
+    writeln!(out, "            device const uchar *scales = blk + 4;").unwrap();
+    writeln!(out, "            device const uchar *qs = blk + 16;").unwrap();
+    writeln!(out, "            uchar sc, mn;").unwrap();
+    writeln!(out, "            if (isb < 4u) {{ sc = scales[isb] & 63u; mn = scales[isb + 4u] & 63u; }}").unwrap();
+    writeln!(out, "            else {{").unwrap();
+    writeln!(out, "                sc = (scales[isb + 4u] & 0xFu) | ((scales[isb - 4u] >> 6) << 4);").unwrap();
+    writeln!(out, "                mn = (scales[isb + 4u] >> 4) | ((scales[isb] >> 6) << 4);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            const float dl = d * (float)sc;").unwrap();
+    writeln!(out, "            const float ml = dmin * (float)mn;").unwrap();
+    writeln!(out, "            device const uchar *q = qs + qoff;").unwrap();
+    writeln!(out, "            float s = 0.f;").unwrap();
+    writeln!(out, "            for (short k = 0; k < 32; k++) {{").unwrap();
+    writeln!(out, "                const uint nib = (hi == 0u) ? (uint)(q[k] & 0xFu) : (uint)(q[k] >> 4);").unwrap();
+    writeln!(out, "                s += (dl * (float)nib - ml) * yl[k];").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            sumf[row] += s;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    for (int row = 0; row < 4 && first_row + row < (int)d_out; row++) {{").unwrap();
+    writeln!(out, "        const float r = simd_sum(sumf[row]);").unwrap();
+    writeln!(out, "        if (tiisg == 0) out[first_row + row] = r;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// Cooperative-read Q4_K matvec (llama.cpp `kernel_mul_mv_q4_K_f32` single-read design):
+/// one lane per 32-weight sub-block (`tiisg/8`, `tiisg%8`), masked-unshifted nibble unpack with a
+/// deferred `1.f/256.f` scale so the packed 16-bit `qs` is read once. 2 rows/simdgroup, NSG=2.
+/// Validated on-device at 402 GB/s on M1 Ultra (1.46× the register-blocked kernel), correctness
+/// checked vs a CPU Q4_K reference. Emitted verbatim (block_q4_K struct typedef first).
+fn emit_matvec_q4k_coop_msl(out: &mut String) {
+    writeln!(out, "typedef struct {{ half d; half dmin; uchar scales[12]; uchar qs[128]; }} block_q4_K;").unwrap();
+    writeln!(out, "kernel void matvec_q4k_coop(").unwrap();
+    writeln!(out, "    device const char *src0 [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const char *src1 [[buffer(1)]],").unwrap();
+    writeln!(out, "    device       char *dst  [[buffer(2)]],").unwrap();
+    writeln!(out, "    constant uint &d_in   [[buffer(3)]],").unwrap();
+    writeln!(out, "    constant uint &d_out  [[buffer(4)]],").unwrap();
+    writeln!(out, "    constant uint &stride01 [[buffer(5)]],").unwrap();
+    writeln!(out, "    uint3  tgpig [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    ushort tiisg [[thread_index_in_simdgroup]],").unwrap();
+    writeln!(out, "    ushort sgitg [[simdgroup_index_in_threadgroup]]) {{").unwrap();
+    writeln!(out, "    const short NSG = 2;").unwrap();
+    writeln!(out, "    const short nr0 = 2;").unwrap();
+    writeln!(out, "    constexpr uint16_t kmask1 = 0x3f3f;").unwrap();
+    writeln!(out, "    constexpr uint16_t kmask2 = 0x0f0f;").unwrap();
+    writeln!(out, "    constexpr uint16_t kmask3 = 0xc0c0;").unwrap();
+    writeln!(out, "    const short ix = tiisg/8;").unwrap();
+    writeln!(out, "    const short it = tiisg%8;").unwrap();
+    writeln!(out, "    const short iq = it/4;").unwrap();
+    writeln!(out, "    const short ir = it%4;").unwrap();
+    writeln!(out, "    const int nb = (int)d_in/256;").unwrap();
+    writeln!(out, "    const int r0 = tgpig.x;").unwrap();
+    writeln!(out, "    const int first_row = (r0 * NSG + sgitg) * nr0;").unwrap();
+    writeln!(out, "    const uint64_t offset0 = (uint64_t)first_row*stride01;").unwrap();
+    writeln!(out, "    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);").unwrap();
+    writeln!(out, "    device const float      * y = (device const float      *) (src1);").unwrap();
+    writeln!(out, "    float yl[16];").unwrap();
+    writeln!(out, "    float yh[16];").unwrap();
+    writeln!(out, "    float sumf[nr0]={{0.f}};").unwrap();
+    writeln!(out, "    device const float * y4 = y + ix * 256 + 64 * iq + 8 * ir;").unwrap();
+    writeln!(out, "    uint16_t sc16[4];").unwrap();
+    writeln!(out, "    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;").unwrap();
+    writeln!(out, "    for (int ib = ix; ib < nb; ib += 4) {{").unwrap();
+    writeln!(out, "        float4 sumy = {{0.f, 0.f, 0.f, 0.f}};").unwrap();
+    writeln!(out, "        for (short i = 0; i < 8; ++i) {{").unwrap();
+    writeln!(out, "            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];").unwrap();
+    writeln!(out, "            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];").unwrap();
+    writeln!(out, "            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];").unwrap();
+    writeln!(out, "            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;").unwrap();
+    writeln!(out, "        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;").unwrap();
+    writeln!(out, "        device const half     * dh = &x[ib].d;").unwrap();
+    writeln!(out, "        for (short row = 0; row < nr0; row++) {{").unwrap();
+    writeln!(out, "            sc16[0] = sc[0] & kmask1;").unwrap();
+    writeln!(out, "            sc16[1] = sc[2] & kmask1;").unwrap();
+    writeln!(out, "            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);").unwrap();
+    writeln!(out, "            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);").unwrap();
+    writeln!(out, "            device const uint16_t * q2 = q1 + 32;").unwrap();
+    writeln!(out, "            float4 acc1 = {{0.f, 0.f, 0.f, 0.f}};").unwrap();
+    writeln!(out, "            float4 acc2 = {{0.f, 0.f, 0.f, 0.f}};").unwrap();
+    writeln!(out, "            for (short i = 0; i < 4; ++i) {{").unwrap();
+    writeln!(out, "                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);").unwrap();
+    writeln!(out, "                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);").unwrap();
+    writeln!(out, "                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);").unwrap();
+    writeln!(out, "                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);").unwrap();
+    writeln!(out, "                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);").unwrap();
+    writeln!(out, "                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);").unwrap();
+    writeln!(out, "                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);").unwrap();
+    writeln!(out, "                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +").unwrap();
+    writeln!(out, "                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +").unwrap();
+    writeln!(out, "                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +").unwrap();
+    writeln!(out, "                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -").unwrap();
+    writeln!(out, "                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);").unwrap();
+    writeln!(out, "            q1 += stride01/2;").unwrap();
+    writeln!(out, "            sc += stride01/2;").unwrap();
+    writeln!(out, "            dh += stride01/2;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        y4 += 4 * 256;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    device float * dst_f32 = (device float *) dst;").unwrap();
+    writeln!(out, "    for (int row = 0; row < nr0 && first_row + row < (int)d_out; ++row) {{").unwrap();
+    writeln!(out, "        float sum_all = simd_sum(sumf[row]);").unwrap();
+    writeln!(out, "        if (tiisg == 0) {{").unwrap();
+    writeln!(out, "            dst_f32[first_row + row] = sum_all;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
 /// Same as matvec_f16 but with bias addition.
 /// p0=activation(float*), p1=weight(half*, N×K), p2=output(float*), p3=bias(float*).
 fn emit_matvec_f16_bias_msl(out: &mut String) {
@@ -10722,6 +11934,31 @@ fn emit_rope_inplace_msl(out: &mut String) {
     writeln!(out, "    float x1 = p0[idx + 1];").unwrap();
     writeln!(out, "    p0[idx]     = x0 * cos_a - x1 * sin_a;").unwrap();
     writeln!(out, "    p0[idx + 1] = x0 * sin_a + x1 * cos_a;").unwrap();
+}
+
+/// Split-half (NeoX / HF Qwen2) in-place RoPE: rotate the first half of each head
+/// against the second half — `x[i]`, `x[i+d/2]` for i in [0, d/2). This is the
+/// convention HF safetensors weights expect; the interleaved variant above is
+/// GPT-J style and gives wrong output on HF weights. Same freq schedule.
+fn emit_rope_inplace_split_msl(out: &mut String) {
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
+    writeln!(out, "    uint half_dim = head_dim / 2;").unwrap();
+    writeln!(out, "    uint total_pairs = num_heads * half_dim;").unwrap();
+    writeln!(out, "    if (gid >= total_pairs) return;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint head = gid / half_dim;").unwrap();
+    writeln!(out, "    uint i = gid % half_dim;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float freq = 1.0f / pow(theta, 2.0f * float(i) / float(head_dim));").unwrap();
+    writeln!(out, "    float angle = float(position) * freq;").unwrap();
+    writeln!(out, "    float cos_a = cos(angle);").unwrap();
+    writeln!(out, "    float sin_a = sin(angle);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint base = head * head_dim;").unwrap();
+    writeln!(out, "    float x0 = p0[base + i];").unwrap();
+    writeln!(out, "    float x1 = p0[base + half_dim + i];").unwrap();
+    writeln!(out, "    p0[base + i]            = x0 * cos_a - x1 * sin_a;").unwrap();
+    writeln!(out, "    p0[base + half_dim + i] = x1 * cos_a + x0 * sin_a;").unwrap();
 }
 
 /// KV cache update: copy a single vector into the KV cache at a given position.

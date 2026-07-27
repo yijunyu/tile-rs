@@ -187,6 +187,12 @@ fn generate_func_pto(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     // Collect tile information by scanning body first
     let mut ctx = PtoContext::new();
     let body_ops = analyze_body(&func.body_lines, func, &mut ctx)?;
+    // NPU tile trait bounds: surface any tile-shape/UB-budget violation as a
+    // codegen error (C1-C5), so an Ascend-invalid layer fails to EMIT rather
+    // than launching and faulting on device.
+    if let Some(e) = ctx.tile_error.take() {
+        return Err(e);
+    }
 
     // Emit func.func header with !pto.ptr<T> args
     write!(out, "  func.func @{}(", func.name).unwrap();
@@ -406,6 +412,167 @@ impl TileInfo {
     fn tile_buf_type_str(&self) -> String {
         self.tb_type.clone()
     }
+
+    fn ptv_type_str(&self) -> String {
+        ptv_type(self.rows, self.cols, &self.dtype)
+    }
+}
+
+
+// ============================================================================
+// NPU tile trait bounds — make an Ascend-invalid tile UNREPRESENTABLE at emit.
+//
+// The Ascend Unified Buffer (UB) imposes shape/capacity/alignment constraints
+// that were previously runtime PTO_ASSERTs (faulting as 507057 on device). We
+// lift them to codegen: every tile is validated for its target arch (C2-C4) and
+// placed under a linear UB budget (C1) at a bank-aligned offset (C5). A layer
+// whose working set exceeds UB_SIZE, or whose tile shape violates alignment, is
+// an Err(String) codegen diagnostic — never a launched-then-crashing kernel.
+// This is the accelerator-resource analogue of the memory-hazard freedom the
+// lambda_tile calculus proves for Metal; the resource is UB SPACE and the linear
+// discipline is UbAllocator.
+// ============================================================================
+
+/// Target Ascend architecture — the constraints are arch-parametric (C6).
+trait AscendArch {
+    const UB_SIZE: usize;        // total Unified Buffer capacity (bytes)
+    const FRACTAL_BYTES: usize;  // column/bank alignment granularity (bytes)
+    const BLOCK_BYTES: usize;    // footprint block alignment (bytes)
+    const REQUIRES_ROW16: bool;  // NZ/cube tiles need rows % 16 == 0
+    const NAME: &'static str;
+}
+
+/// 910B2 / a2a3 (the 910c test box).
+struct A2A3;
+impl AscendArch for A2A3 {
+    const UB_SIZE: usize = 262144;   // 256 KB (pto/npu/a5 UB_SIZE)
+    const FRACTAL_BYTES: usize = 512;
+    const BLOCK_BYTES: usize = 32;
+    const REQUIRES_ROW16: bool = false;
+    const NAME: &'static str = "a2a3";
+}
+
+#[allow(dead_code)]
+struct A5;
+#[allow(dead_code)]
+impl AscendArch for A5 {
+    const UB_SIZE: usize = 262144;
+    const FRACTAL_BYTES: usize = 512;
+    const BLOCK_BYTES: usize = 32;
+    const REQUIRES_ROW16: bool = true;
+    const NAME: &'static str = "a5";
+}
+
+fn dtype_bytes_pto(dtype: &str) -> usize {
+    match dtype { "f16" | "bf16" => 2, "i8" => 1, _ => 4 }
+}
+
+/// Shape validation (C2-C4) for a tile on arch `A`. Returns Err with a precise
+/// diagnostic on any violation.
+fn parse_tb_dim(tb_ty: &str, key: &str) -> Option<u32> {
+    // parse `key=NN` (e.g. rows=8, cols=256) from the tile_buf type string.
+    let pat = format!("{}=", key);
+    let i = tb_ty.find(&pat)? + pat.len();
+    let rest = &tb_ty[i..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn validate_tile_shape<A: AscendArch>(logical_rows: u32, logical_cols: u32, dtype: &str, tb_ty: &str) -> Result<(), String> {
+    let b = dtype_bytes_pto(dtype);
+    // Validate the ACTUAL emitted (possibly padded) shape from tb_ty, which is
+    // what reaches hardware — not the logical args (rowreduce pads rows).
+    let rows = parse_tb_dim(tb_ty, "rows").unwrap_or(logical_rows);
+    let cols = parse_tb_dim(tb_ty, "cols").unwrap_or(logical_cols);
+    // A row-REDUCTION tile is col_major with slayout=none_box (tile_buf_type_rowreduce).
+    // `blayout=col_major` alone also matches CBUF matrix staging tiles (loc=mat,
+    // slayout=row_major, the ND->NZ path), which the C3-reduce rule does not govern --
+    // testing on blayout alone rejected a valid 4-row attention staging tile.
+    let col_major = tb_ty.contains("blayout=col_major") && tb_ty.contains("slayout=none_box");
+    if col_major {
+        // col_major reduction tiles (trowsum/trowmax outputs, cols=1): the CANN
+        // constraint is `rows * sizeof(dtype) % 32 == 0`, NOT the 512B col align.
+        // The emitter already pads rows to satisfy this (tile_buf_type_rowreduce);
+        // we VALIDATE it holds (defence-in-depth), so a mis-emitted reduction tile
+        // is caught at codegen.
+        if (rows as usize * b) % 32 != 0 {
+            return Err(format!(
+                "NPU tile bound (arch {}): col_major reduction tile rows={} * {}B = {}B not 32B-aligned (C3-reduce)",
+                A::NAME, rows, b, rows as usize * b));
+        }
+        return Ok(());
+    }
+    // row_major DATA tiles (loaded/stored to GM): the fractal/512B column stride
+    // and NZ/footprint constraints apply.
+    // C2: multi-fractal column stride must be FRACTAL_BYTES-aligned. A tile whose
+    // row spans MORE than one fractal (cols*b > FRACTAL_BYTES) must tile on the
+    // fractal boundary. Sub-fractal tiles (cols*b <= FRACTAL_BYTES) fit in one
+    // fractal bank — no inter-fractal stride, so the alignment does not apply
+    // (these are the internal reduction/broadcast scratch tiles like 1x8).
+    let col_bytes = cols as usize * b;
+    if col_bytes > A::FRACTAL_BYTES && col_bytes % A::FRACTAL_BYTES != 0 {
+        return Err(format!(
+            "NPU tile bound (arch {}): row_major data tile cols={} * {}B = {}B spans multiple {}B \
+             fractals with bad stride (C2); pad cols so cols*sizeof(dtype) % {} == 0",
+            A::NAME, cols, b, col_bytes, A::FRACTAL_BYTES, A::FRACTAL_BYTES));
+    }
+    // C3: row alignment for NZ/cube tiles on archs that require it.
+    if A::REQUIRES_ROW16 && rows % 16 != 0 {
+        return Err(format!(
+            "NPU tile bound (arch {}): rows={} not 16-aligned (C3 FRACTAL_NZ_ROW)",
+            A::NAME, rows));
+    }
+    // C4: footprint BLOCK_BYTES-aligned.
+    //
+    // Same exemption as C2, and for the same reason: a tile whose whole footprint fits
+    // inside one fractal bank has no inter-block stride, so block alignment does not apply
+    // to it. These are the internal reduction/broadcast scratch tiles (1x1, 4x1, 1x8 ...)
+    // that argmax / quantize / top-p / attention reductions materialise. Without this,
+    // C4 rejects a 4B scratch tile as "not 32B-block-aligned", which is a constraint the
+    // hardware does not impose on a sub-fractal tile -- and it made 8 real kernels
+    // un-emittable.
+    let footprint = rows as usize * cols as usize * b;
+    if footprint > A::FRACTAL_BYTES && footprint % A::BLOCK_BYTES != 0 {
+        return Err(format!(
+            "NPU tile bound (arch {}): footprint {}x{}x{}B = {}B not {}B-block-aligned (C4)",
+            A::NAME, rows, cols, b, footprint, A::BLOCK_BYTES));
+    }
+    Ok(())
+}
+
+/// Linear UB budget (C1 + C5): bump-allocates bank-aligned tile offsets and
+/// rejects allocations that would exceed UB_SIZE. This is the space analogue of
+/// the Pnd/Rdy typestate — allocation consumes budget, `free` returns it.
+struct UbAllocator {
+    cursor: usize,
+    ub_size: usize,
+    fractal: usize,
+    arch: &'static str,
+    /// Peak live bytes (for diagnostics / a future budget report).
+    peak: usize,
+}
+
+impl UbAllocator {
+    fn new<A: AscendArch>() -> Self {
+        UbAllocator { cursor: 0, ub_size: A::UB_SIZE, fractal: A::FRACTAL_BYTES, arch: A::NAME, peak: 0 }
+    }
+    /// Place a tile of `bytes`: bank-align the base, error if it overflows UB.
+    /// Returns the (in-bounds, aligned) UB byte offset.
+    fn place(&mut self, bytes: usize) -> Result<u64, String> {
+        let base = (self.cursor + self.fractal - 1) / self.fractal * self.fractal; // align_up (C5)
+        let end = base + bytes;
+        if end > self.ub_size {
+            return Err(format!(
+                "NPU UB budget (arch {}): tile of {}B at offset {}B would use {}B > UB_SIZE {}B (C1); \
+                 the live tile working set exceeds the Unified Buffer — reduce tile shapes or free earlier",
+                self.arch, bytes, base, end, self.ub_size));
+        }
+        self.cursor = end;
+        if end > self.peak { self.peak = end; }
+        Ok(base as u64)
+    }
+    #[allow(dead_code)]
+    fn free(&mut self, bytes: usize) { self.cursor = self.cursor.saturating_sub(bytes); }
 }
 
 struct PtoContext {
@@ -413,6 +580,10 @@ struct PtoContext {
     tiles: HashMap<String, TileInfo>,
     /// Allocation counter for generating unique SSA names
     next_ssa: u32,
+    /// NPU tile UB budget allocator (C1 capacity + C5 bank-align).
+    ub: UbAllocator,
+    /// First NPU tile-bound violation seen during analyze_body (C2-C5).
+    tile_error: Option<String>,
     /// Map from GM pointer arg name → (tensor_view_ssa, rows, cols, dtype)
     tv_map: HashMap<String, (String, u32, u32, String)>,
     /// Ordered list of sizes we need `arith.constant` for
@@ -603,6 +774,8 @@ impl PtoContext {
         PtoContext {
             tiles: HashMap::new(),
             next_ssa: 0,
+            ub: UbAllocator::new::<A2A3>(),
+            tile_error: None,
             tv_map: HashMap::new(),
             sizes_used: Vec::new(),
             ptr_aliases: HashMap::new(),
@@ -765,6 +938,35 @@ impl PtoContext {
         ssa
     }
 
+    /// Create a partition_view at an explicit (row, col) offset.
+    ///
+    /// `make_pv` takes a FLAT element offset and divides by the tile width to recover a row,
+    /// which is only correct when the tile spans the whole row.  A partition cell generally
+    /// does not, so its offsets are supplied directly here.
+    fn make_pv_at(
+        &mut self,
+        tv_ssa: &str,
+        rows: u32,
+        cols: u32,
+        dtype: &str,
+        row_off: u32,
+        col_off: u32,
+        ops: &mut Vec<String>,
+    ) -> String {
+        self.use_size(row_off);
+        self.use_size(col_off);
+        self.use_size(rows);
+        self.use_size(cols);
+        let ssa = self.fresh_ssa();
+        let tv_ty = tv_type(rows, cols, dtype);
+        let ptv_ty = ptv_type(rows, cols, dtype);
+        ops.push(format!(
+            "{} = pto.partition_view {}, offsets = [%c{}, %c{}], sizes = [%c{}, %c{}] : {} -> {}",
+            ssa, tv_ssa, row_off, col_off, rows, cols, tv_ty, ptv_ty
+        ));
+        ssa
+    }
+
     /// Create a partition_view from a tensor_view SSA.
     ///
     /// `elem_offset` is the flat element offset into the GM buffer (from GEP analysis).
@@ -831,6 +1033,16 @@ impl PtoContext {
         tb_ty: &str,
         ops: &mut Vec<String>,
     ) -> String {
+        // NPU tile trait bounds: validate shape (C2-C4) and reserve UB budget
+        // (C1+C5) at the point of allocation. Record the first violation; the
+        // caller (generate_func_pto) turns it into an Err(String) diagnostic.
+        if self.tile_error.is_none() {
+            if let Err(e) = validate_tile_shape::<A2A3>(rows, cols, dtype, tb_ty) {
+                self.tile_error = Some(e);
+            } else if let Err(e) = self.ub.place(rows as usize * cols as usize * dtype_bytes_pto(dtype)) {
+                self.tile_error = Some(e);
+            }
+        }
         let ssa = self.fresh_ssa();
         ops.push(format!("{} = pto.alloc_tile : {}", ssa, tb_ty));
         self.tiles.insert(
@@ -1285,6 +1497,24 @@ fn analyze_body(
             continue;
         }
         // tile.slice f32 — extract sub-tile via partition_view with offset
+        // tile.partition_cell f32 — cuTile's `partition(shape).load([i,j])`.
+        // Lowers to PTO's own partition_view, which is the native counterpart: it takes
+        // explicit offsets and sizes, so the cell's footprint is expressed directly rather
+        // than emulated. Disjointness of distinct (i,j) is thm:partdisj, established before
+        // codegen, so no runtime aliasing check is emitted.
+        if line.contains("__tile_partition_cell_f32") {
+            translate_partition_cell(line, "f32", ctx, &mut ops)?;
+            continue;
+        }
+        // The _mut form is a store DESTINATION, not a load source: it writes a tile INTO
+        // cell (i,j). Routing it through the read path emitted a tload and silently dropped
+        // the write. partition_disjoint is what makes several such stores to distinct cells
+        // safe with no runtime aliasing check -- the obligation cuTile discharges with
+        // `unsafe` at all 26 of its sites.
+        if line.contains("__tile_partition_cell_mut_f32") {
+            translate_partition_cell_store(line, "f32", ctx, &mut ops)?;
+            continue;
+        }
         if line.contains("__tile_slice_f32") {
             translate_slice(line, "f32", ctx, func, &mut ops)?;
             continue;
@@ -4108,6 +4338,161 @@ fn translate_cast(
 /// Slice: `%res = llvm.call @__tile_slice_f32(%c0, %src, %row_off, %col_off, %src_r, %src_c, %dst_r, %dst_c)`
 ///
 /// Extracts a sub-tile from a larger tile. Emits tmov passthrough with reshaped output.
+/// PartitionCellStore: `%res = llvm.call @__tile_partition_cell_mut_f32(%src, %i, %j, %tr, %tc)`
+///
+/// Writes the tile `%src` INTO cell (i,j) of a Tr x Tc partition -- the inverse of
+/// translate_partition_cell, and the operation cuTile can only express behind `unsafe`.
+/// PTO expresses the destination natively: a `pto.partition_view` at the cell's offsets is
+/// exactly the footprint being written, so this is a `tstore` into that view rather than a
+/// copy. thm:partdisj's hypotheses are enforced first, as for the read form.
+fn translate_partition_cell_store(
+    line: &str,
+    dtype: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let args = extract_call_args(line)
+        .ok_or_else(|| format!("partition_cell_store: cannot parse args in: {}", line))?;
+    let src_ssa = args.first().ok_or("partition_cell_store: missing src tile")?.trim();
+    let ci = ctx.resolve_const(args.get(1).map(|s| s.as_str()).unwrap_or("0"));
+    let cj = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
+    let tr = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+    let tc = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
+
+    let tsrc = ctx
+        .get_tile(src_ssa)
+        .ok_or_else(|| format!("partition_cell_store: unknown tile {}", src_ssa))?
+        .clone();
+    // The enclosing view must COVER the cell being written: cell (i,j) occupies rows
+    // [i*Tr, (i+1)*Tr) and columns [j*Tc, (j+1)*Tc), so a view sized to the tile alone would
+    // put every cell past (0,0) out of bounds. Size it to the grid the index implies, taking
+    // the source tile's own extent as a floor.
+    let rows = tsrc.rows.max((ci + 1) * tr);
+    let cols = tsrc.cols.max((cj + 1) * tc);
+
+    if tr == 0 || tc == 0 {
+        return Err(format!(
+            "partition_cell_store: tile extent must be positive, got {}x{} (thm:partdisj \
+needs Tr>0, Tc>0)",
+            tr, tc
+        ));
+    }
+    if rows % tr != 0 || cols % tc != 0 {
+        return Err(format!(
+            "partition_cell_store: {}x{} does not divide {}x{} -- a ragged partition is \
+outside thm:partdisj, so pairwise disjointness is NOT established",
+            tr, tc, rows, cols
+        ));
+    }
+
+    let gm_name = tsrc.gm_name.clone().ok_or_else(|| {
+        format!("partition_cell_store: tile {} has no originating GM buffer", src_ssa)
+    })?;
+    let (row_off, col_off) = (ci * tr, cj * tc);
+    ops.push(format!(
+        "// --- partition cell STORE ({},{}), tile {}x{}, offsets [{},{}] ---",
+        ci, cj, tr, tc, row_off, col_off
+    ));
+    let tv = ctx.get_or_make_tv(&gm_name, rows, cols, dtype, ops);
+    let pv = ctx.make_pv_at(&tv, tr, tc, dtype, row_off, col_off, ops);
+    ops.push(format!(
+        "pto.tstore ins({} : {}) outs({} : {})",
+        tsrc.ssa,
+        tsrc.tile_buf_type_str(),
+        pv,
+        ptv_type(tr, tc, dtype)
+    ));
+    Ok(())
+}
+
+/// PartitionCell: `%res = llvm.call @__tile_partition_cell_f32(%src, %i, %j, %tr, %tc)`
+///
+/// Cell (i,j) of a Tr x Tc partition owns rows [i*Tr, i*Tr+Tr) and cols [j*Tc, j*Tc+Tc).
+/// Its flat element offset is `i*Tr*C + j*Tc` -- the same address the mechanization computes
+/// (`addr(C, i*Tr, j*Tc)`, `in_cell`). PTO expresses exactly this with `pto.partition_view`,
+/// whose `offsets`/`sizes` clause is the native form of a tile footprint, so this is a direct
+/// lowering rather than an emulation.
+///
+/// The grid hypotheses of thm:partdisj (Tr>0, Tc>0, Tr|R, Tc|C) are checked here: a ragged
+/// split is outside the theorem, so its disjointness is not established and it must not lower.
+fn translate_partition_cell(
+    line: &str,
+    dtype: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let result_ssa = extract_result_ssa(line)
+        .ok_or_else(|| format!("partition_cell: no result SSA in: {}", line))?;
+    let args = extract_call_args(line)
+        .ok_or_else(|| format!("partition_cell: cannot parse args in: {}", line))?;
+    let src_ssa = args.first().ok_or("partition_cell: missing src")?.trim();
+    let ci = ctx.resolve_const(args.get(1).map(|s| s.as_str()).unwrap_or("0"));
+    let cj = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
+    let tr = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+    let tc = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
+
+    let tsrc = ctx
+        .get_tile(src_ssa)
+        .ok_or_else(|| format!("partition_cell: unknown tile {}", src_ssa))?
+        .clone();
+    let (rows, cols) = (tsrc.rows, tsrc.cols);
+
+    // thm:partdisj's hypotheses, enforced rather than assumed.
+    if tr == 0 || tc == 0 {
+        return Err(format!(
+            "partition_cell: tile extent must be positive, got {}x{} (thm:partdisj needs \
+Tr>0, Tc>0)",
+            tr, tc
+        ));
+    }
+    if rows % tr != 0 || cols % tc != 0 {
+        return Err(format!(
+            "partition_cell: {}x{} does not divide {}x{} -- a ragged partition is outside \
+thm:partdisj (needs Tr|R and Tc|C), so pairwise disjointness is NOT established",
+            tr, tc, rows, cols
+        ));
+    }
+    let (gi, gj) = (rows / tr, cols / tc);
+    if ci >= gi || cj >= gj {
+        return Err(format!(
+            "partition_cell: cell ({}, {}) is outside the {}x{} grid; thm:partdisj is stated \
+for in-grid indices only",
+            ci, cj, gi, gj
+        ));
+    }
+
+    // Cell base as (row, col), which is what partition_view wants directly.  NOTE: do not
+    // route this through make_pv's flat-offset path -- that divides by the TILE width to
+    // recover a row, but the buffer's row stride is C, so a flat offset of i*Tr*C + j*Tc
+    // would decode to the wrong row whenever Tc != C.  (Caught by the round-trip test:
+    // cell (1,1) of a 32x64 partition of a 128-wide buffer decoded to row 65 instead of 32.)
+    let row_off = ci * tr;
+    let col_off = cj * tc;
+    let elem_offset = row_off * cols + col_off;
+    ops.push(format!(
+        "// --- partition cell ({},{}) of {}x{} grid, tile {}x{}, base offset {} ---",
+        ci, cj, gi, gj, tr, tc, elem_offset
+    ));
+
+    // The cell is a view over the SAME GM buffer the source tile came from; PTO's
+    // partition_view takes the offset directly, so no copy is introduced.
+    let gm_name = tsrc.gm_name.clone().ok_or_else(|| {
+        format!("partition_cell: tile {} has no originating GM buffer", src_ssa)
+    })?;
+    let tv = ctx.get_or_make_tv(&gm_name, rows, cols, dtype, ops);
+    let pv = ctx.make_pv_at(&tv, tr, tc, dtype, row_off, col_off, ops);
+    let _ = elem_offset; // kept for the diagnostic comment above
+    let out_ssa = ctx.alloc_tile(&result_ssa, tr, tc, dtype, ops);
+    ops.push(format!(
+        "pto.tload ins({} : {}) outs({} : {})",
+        pv,
+        ptv_type(tr, tc, dtype),
+        out_ssa,
+        tile_buf_type(tr, tc, dtype)
+    ));
+    Ok(())
+}
+
 fn translate_slice(
     line: &str,
     dtype: &str,
