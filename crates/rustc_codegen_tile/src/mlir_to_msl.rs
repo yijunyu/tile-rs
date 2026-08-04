@@ -51,9 +51,27 @@ use crate::mlir_to_pto::{
     FuncArg, MlirFunc, MlirModule,
 };
 
-/// Apple GPUs keep the receipted default (upstream MLX PR #3843 measured
-/// -12% kernel time at head_dim 128 with unroll-by-4 on this shape).
-const MATMUL_TRANSPOSED_K_UNROLL: usize = DEFAULT_K_UNROLL;
+/// Apple GPU override, measured on this kernel rather than inherited.
+///
+/// `DEFAULT_K_UNROLL` (4) comes from upstream MLX PR #3843, which measured it
+/// on the *steel attention* K-loop. Swept on this scalar `matmul_transposed`
+/// body at DeepSeek-R1-Distill-Qwen3-1.5B shapes (K=1536, N=1536 and 8960,
+/// M=512 and 2048) on an Apple GPU, the curve is:
+///
+/// ```text
+///   factor:   1      4      8      16     32     64
+///   speedup:  1.00x  3.6x   3.7x   5.1x   5.0x   4.3x
+/// ```
+///
+/// 16 wins on every shape, 32 ties it, and 64 regresses — the classic
+/// unroll curve, where instruction-level parallelism stops paying once
+/// register pressure and I-cache footprint dominate. Keeping the inherited 4
+/// would have left ~40% on the table, which is the whole reason this is a
+/// per-backend knob instead of one shared constant.
+///
+/// Bit-exactness is independent of the factor (see
+/// `emit_unrolled_k_accumulation`), so this is a pure scheduling choice.
+const MATMUL_TRANSPOSED_K_UNROLL: usize = 16;
 
 // Re-use kernel classification from the SPIR-V module so the two backends
 // stay in sync.  The types are identical — only the emitter differs.
@@ -13711,8 +13729,19 @@ module {
         assert!(msl.contains("gid = row * tcount + tid"), "must compute flat gid:\n{}", msl);
         assert!(msl.contains("gid / N"), "must derive row from flat gid:\n{}", msl);
         assert!(msl.contains("gid % N"), "must derive col from flat gid:\n{}", msl);
-        // 4x unroll
-        assert!(msl.contains("k + 3 < K; k += 4"), "must have 4x loop unroll:\n{}", msl);
+        // K-loop unrolled by the backend's declared knob, whatever it is set to.
+        // Asserting the knob is honoured (rather than a literal factor) keeps
+        // this test valid when the factor is retuned for a new target.
+        assert!(
+            msl.contains(&format!(
+                "k + {} < K; k += {}",
+                MATMUL_TRANSPOSED_K_UNROLL - 1, MATMUL_TRANSPOSED_K_UNROLL
+            )),
+            "K-loop must be unrolled by MATMUL_TRANSPOSED_K_UNROLL ({}):\n{}",
+            MATMUL_TRANSPOSED_K_UNROLL, msl
+        );
+        // ...and must still emit the scalar tail for a non-multiple K.
+        assert!(msl.contains("for (; k < K; k++) {"), "missing scalar tail:\n{}", msl);
     }
 
     /// P2 groundwork: a chain this emitter cannot fold must fail loudly.
@@ -15152,7 +15181,7 @@ module {
         // the same helper so all three are the helper's own output.
         let base = convert_mlir_to_msl(mlir).unwrap();
         std::fs::write(format!("{}/mmt_u4.metal", dir), &base).unwrap();
-        for f in [1usize, 8] {
+        for f in [1usize, 2, 8, 16, 32, 64] {
             let mut v = Vec::new();
             emit_unrolled_k_accumulation(&mut v, f, "acc", "k", "K", "uint", "    ",
                 |i| format!("p0[m * K + {}] * p1[n * K + {}]", i, i));
