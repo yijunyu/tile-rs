@@ -110,6 +110,7 @@ enum KernelType {
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
     AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
+    AttentionGqaPaired, // GQA with two query heads per threadgroup sharing K/V loads
     Rope,        // rotary position embeddings
     RopeDsv4,    // DS4 partial-RoPE: copy n_nope prefix, rotate tail with YaRN
     Dsv4Ratio4Shift, // DS4 KV ratio-4 recurrent-state shift: state[i]=state[4w+i] for two buffers
@@ -569,6 +570,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention  => 4,    // q, k, v, out
         KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
+        KernelType::AttentionGqaPaired => 4, // q, k, v, out
         KernelType::Rope       => 2,    // src, dst
         KernelType::RopeDsv4   => 4,    // src, pos(int), src2_freq(float, optional), dst
         KernelType::Dsv4Ratio4Shift => 2, // state_kv, state_score
@@ -1113,7 +1115,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
-        KernelType::AttentionGqa => {
+        KernelType::AttentionGqa | KernelType::AttentionGqaPaired => {
             writeln!(out, "    constant uint& seq_len      [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& head_dim     [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& num_heads    [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2212,6 +2214,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::Dsv4SharedDownHcExpand4Q8_0
             | KernelType::Embedding
             | KernelType::Attention | KernelType::AttentionGqa | KernelType::AttentionCausal
+            | KernelType::AttentionGqaPaired
             | KernelType::Dsv4Ratio4Shift
             | KernelType::TopkMaskScatter
             | KernelType::Dsv4RouterWeightsOne
@@ -2451,6 +2454,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention    => emit_attention_msl(out, msl_type),
         KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
+        KernelType::AttentionGqaPaired => emit_attention_gqa_paired_msl(out, msl_type),
         KernelType::Rope         => emit_rope_msl(out, msl_type),
         KernelType::RopeDsv4     => emit_rope_dsv4_msl(out),
         KernelType::Dsv4Ratio4Shift => emit_dsv4_ratio4_shift_msl(out),
@@ -2850,6 +2854,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_attention_f32"     => { ctx.kernel_type = KernelType::Attention; }
                 "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
+                "__tile_attention_gqa_paired_f32" => { ctx.kernel_type = KernelType::AttentionGqaPaired; }
                 "__tile_rope_f32"          => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Rope; } }
                 "__tile_rope_dsv4_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::RopeDsv4; } }
                 "__tile_dsv4_ratio4_shift_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Dsv4Ratio4Shift; } }
@@ -12469,6 +12474,102 @@ fn emit_attention_gqa_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    }}").unwrap();
 }
 
+/// Paired-head GQA: two query heads are computed by one threadgroup, and when
+/// they share a KV head each K and V element is read **once** and feeds both.
+///
+/// The plain `emit_attention_gqa_msl` gives every query head its own
+/// threadgroup, so each head in a group re-reads the same K/V rows —
+/// `group_size` times the necessary traffic. (Ported from a ranked receipt:
+/// MLXFast submission `adf12cb`, +2.2%, the largest single attention win on
+/// that board, which paired adjacent GQA query heads to share K/V loads.)
+///
+/// **Gated, not refused.** Sharing is only valid when both heads of a pair
+/// resolve to the same KV head — true for GQA with an even `group_size`, false
+/// for plain MHA (`group_size == 1`). Rather than reject those shapes, the
+/// kernel keeps the pairing (halving threadgroup count) and takes a second
+/// load only when the pair straddles KV heads. Every shape computes a correct
+/// result; the optimization engages where it applies. Backends and
+/// configurations that do not benefit can therefore still lower this op.
+///
+/// **Bit-exact in both modes.** Each output row's score loop walks `d` in
+/// increasing order into its own accumulator, and its softmax and V-weighted
+/// sum are unchanged. Only the *load* of a shared operand is hoisted — the
+/// same value reaches the same multiply in the same order.
+///
+/// **Dispatch contract (differs from the unpaired kernel):**
+/// `grid.x = ceil(num_heads / 2)` threadgroups. Threadgroup `row` owns query
+/// heads `2*row` and `2*row + 1`; an odd `num_heads` leaves the last
+/// threadgroup computing a single head.
+fn emit_attention_gqa_paired_msl(out: &mut String, msl_type: &str) {
+    writeln!(out, "    // Paired GQA: one threadgroup per head pair. When both heads").unwrap();
+    writeln!(out, "    // share a KV head, each K/V element is loaded once for both.").unwrap();
+    writeln!(out, "    uint head0 = 2u * row;").unwrap();
+    writeln!(out, "    if (head0 >= num_heads) return;").unwrap();
+    writeln!(out, "    uint head1 = head0 + 1u;").unwrap();
+    writeln!(out, "    bool has_second = head1 < num_heads;   // odd num_heads tail").unwrap();
+    writeln!(out, "    if (!has_second) head1 = head0;").unwrap();
+    writeln!(out, "    {} scale = ({}) rsqrt((float)head_dim);", msl_type, msl_type).unwrap();
+    writeln!(out, "    uint group_size = num_heads / num_kv_heads;").unwrap();
+    writeln!(out, "    uint kv_off0 = (head0 / group_size) * seq_len * head_dim;").unwrap();
+    writeln!(out, "    uint kv_off1 = (head1 / group_size) * seq_len * head_dim;").unwrap();
+    writeln!(out, "    // The gate: true for GQA pairs inside one group, false for MHA").unwrap();
+    writeln!(out, "    // or a pair straddling two KV heads. Correct either way.").unwrap();
+    writeln!(out, "    bool share_kv = (kv_off0 == kv_off1);").unwrap();
+    writeln!(out, "    uint q_off0 = head0 * seq_len * head_dim;").unwrap();
+    writeln!(out, "    uint q_off1 = head1 * seq_len * head_dim;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint q_row = tid; q_row < seq_len; q_row += tcount) {{").unwrap();
+    writeln!(out, "        {} scores0[256];", msl_type).unwrap();
+    writeln!(out, "        {} scores1[256];", msl_type).unwrap();
+    writeln!(out, "        {} max0 = ({}) -MAXFLOAT;", msl_type, msl_type).unwrap();
+    writeln!(out, "        {} max1 = ({}) -MAXFLOAT;", msl_type, msl_type).unwrap();
+    writeln!(out, "        uint eff_len = min(seq_len, 256u);").unwrap();
+    writeln!(out, "        for (uint k_col = 0; k_col < eff_len; k_col++) {{").unwrap();
+    writeln!(out, "            {} dot0 = ({}) 0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "            {} dot1 = ({}) 0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "            for (uint d = 0; d < head_dim; d++) {{").unwrap();
+    writeln!(out, "                {} kv0 = p1[kv_off0 + k_col * head_dim + d];", msl_type).unwrap();
+    writeln!(out, "                {} kv1 = share_kv ? kv0", msl_type).unwrap();
+    writeln!(out, "                    : p1[kv_off1 + k_col * head_dim + d];").unwrap();
+    writeln!(out, "                dot0 += p0[q_off0 + q_row * head_dim + d] * kv0;").unwrap();
+    writeln!(out, "                dot1 += p0[q_off1 + q_row * head_dim + d] * kv1;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            dot0 *= scale;").unwrap();
+    writeln!(out, "            dot1 *= scale;").unwrap();
+    writeln!(out, "            if (causal && k_col > q_row) {{").unwrap();
+    writeln!(out, "                dot0 = ({}) -MAXFLOAT;", msl_type).unwrap();
+    writeln!(out, "                dot1 = ({}) -MAXFLOAT;", msl_type).unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            scores0[k_col] = dot0; max0 = max(max0, dot0);").unwrap();
+    writeln!(out, "            scores1[k_col] = dot1; max1 = max(max1, dot1);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        {} sum0 = ({}) 0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "        {} sum1 = ({}) 0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "        for (uint k = 0; k < eff_len; k++) {{").unwrap();
+    writeln!(out, "            scores0[k] = exp(scores0[k] - max0); sum0 += scores0[k];").unwrap();
+    writeln!(out, "            scores1[k] = exp(scores1[k] - max1); sum1 += scores1[k];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        for (uint k = 0; k < eff_len; k++) {{").unwrap();
+    writeln!(out, "            scores0[k] /= sum0;").unwrap();
+    writeln!(out, "            scores1[k] /= sum1;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        for (uint d = 0; d < head_dim; d++) {{").unwrap();
+    writeln!(out, "            {} val0 = ({}) 0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "            {} val1 = ({}) 0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "            for (uint k = 0; k < eff_len; k++) {{").unwrap();
+    writeln!(out, "                {} vv0 = p2[kv_off0 + k * head_dim + d];", msl_type).unwrap();
+    writeln!(out, "                {} vv1 = share_kv ? vv0", msl_type).unwrap();
+    writeln!(out, "                    : p2[kv_off1 + k * head_dim + d];").unwrap();
+    writeln!(out, "                val0 += scores0[k] * vv0;").unwrap();
+    writeln!(out, "                val1 += scores1[k] * vv1;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            p3[q_off0 + q_row * head_dim + d] = val0;").unwrap();
+    writeln!(out, "            if (has_second)").unwrap();
+    writeln!(out, "                p3[q_off1 + q_row * head_dim + d] = val1;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -13359,6 +13460,46 @@ module {
         // The non-causal emitter must NOT bound the key loop — it is the
         // control arm for the causal elision test below.
         assert!(!msl.contains("k_end"), "plain attention must not emit a causal bound:\n{}", msl);
+    }
+
+    /// P3 (broadcast-axis reuse): the paired GQA kernel must load each K and
+    /// V element once and feed both heads' accumulators from that one value.
+    #[test]
+    fn test_msl_gqa_paired_shares_kv_loads() {
+        let mlir = r#"
+module {
+  llvm.func @gqa_paired(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %h  = llvm.mlir.constant(8 : i32) : i32
+    %hd = llvm.mlir.constant(32 : i32) : i32
+    %s  = llvm.mlir.constant(16 : i32) : i32
+    %kv = llvm.mlir.constant(4 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %s, %hd) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %s, %hd) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %s, %hd) : (!llvm.ptr<1>, i32, i32) -> i32
+    %r = llvm.call @__tile_attention_gqa_paired_f32(%q, %k, %v, %h, %hd, %s, %kv) : (i32, i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %r, %s, %hd) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let msl = convert_mlir_to_msl(mlir).unwrap();
+        // One K load, two accumulators fed from it.
+        // The shared load is gated on the pair resolving to one KV head.
+        assert!(msl.contains("bool share_kv = (kv_off0 == kv_off1);"),
+            "sharing must be gated, not assumed:\n{}", msl);
+        assert!(msl.contains("float kv1 = share_kv ? kv0"),
+            "K must be reused from one load when the gate holds:\n{}", msl);
+        assert!(msl.contains("float vv1 = share_kv ? vv0"),
+            "V must be reused from one load when the gate holds:\n{}", msl);
+        assert!(msl.contains("dot0 += p0[q_off0 + q_row * head_dim + d] * kv0;")
+             && msl.contains("dot1 += p0[q_off1 + q_row * head_dim + d] * kv1;"),
+            "each head must accumulate from its own K value:\n{}", msl);
+        // Shapes the gate does not fit must still compute, never no-op.
+        assert!(!msl.contains("if (group_size < 2u"),
+            "kernel must degrade to separate loads, not refuse:\n{}", msl);
+        assert!(msl.contains("bool has_second = head1 < num_heads;"),
+            "odd num_heads must be handled, not rejected:\n{}", msl);
     }
 
     /// P1 (monotone-predicate block elision) on Metal: the causal op must
@@ -15008,6 +15149,33 @@ module {
             alt.push_str(&base[end..]);
             std::fs::write(format!("{}/mmt_u{}.metal", dir, f), alt.replace("kernel void mmt(", &format!("kernel void mmt_u{}(", f))).unwrap();
         }
+    }
+
+    /// Dumps the paired and unpaired GQA kernels for the device A/B.
+    #[test]
+    fn dump_gqa_variants_for_ab() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let mk = |intrinsic: &str, name: &str| format!(r#"
+module {{
+  llvm.func @{}(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {{hacc.entry}} {{
+    ^bb0:
+    %h  = llvm.mlir.constant(8 : i32) : i32
+    %hd = llvm.mlir.constant(32 : i32) : i32
+    %s  = llvm.mlir.constant(24 : i32) : i32
+    %kv = llvm.mlir.constant(4 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %s, %hd) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %s, %hd) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %s, %hd) : (!llvm.ptr<1>, i32, i32) -> i32
+    %r = llvm.call @{}(%q, %k, %v, %h, %hd, %s, %kv) : (i32, i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %r, %s, %hd) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }}
+}}
+"#, name, intrinsic);
+        std::fs::write(format!("{}/gqa_plain.metal", dir),
+            convert_mlir_to_msl(&mk("__tile_attention_gqa_f32", "gqa_plain")).unwrap()).unwrap();
+        std::fs::write(format!("{}/gqa_paired.metal", dir),
+            convert_mlir_to_msl(&mk("__tile_attention_gqa_paired_f32", "gqa_paired")).unwrap()).unwrap();
     }
 
     /// Dumps the generated MSL for the causal op so the standalone Metal A/B

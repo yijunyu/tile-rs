@@ -223,6 +223,21 @@ extern "C" {
         seq_len: u32, head_dim: u32,
     ) -> u32;
 
+    /// Paired-head grouped-query attention: two query heads sharing a KV head
+    /// are computed together so each K/V element is read once and used for
+    /// both, halving K/V traffic versus one threadgroup per query head.
+    ///
+    /// Bit-identical to `__tile_attention_gqa_f32`: only the load of a shared
+    /// operand is hoisted; every output's accumulation order is unchanged.
+    ///
+    /// Requires an even `num_heads / num_kv_heads >= 2`, and a dispatch of
+    /// `num_kv_heads * (group_size / 2)` threadgroups. Backends that cannot
+    /// honour that contract must not lower this call.
+    pub fn __tile_attention_gqa_paired_f32(
+        dst: u32, q: u32, k: u32, v: u32,
+        num_heads: u32, head_dim: u32, seq_len: u32, num_kv_heads: u32,
+    ) -> u32;
+
     /// Causal fused attention: softmax(mask(Q @ K^T / sqrt(d))) @ V, where
     /// `mask` sets every entry above the diagonal to -inf.
     /// Q: (S × D), K: (S × D), V: (S × D) → out: (S × D)
