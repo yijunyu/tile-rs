@@ -2698,6 +2698,27 @@ fn translate_attention(
     // Step 2: move scores to VEC for softmax
     let vec_ty = tile_buf_type(s, s, "f32");
     let sv = ctx.alloc_tile_typed(&format!("{}__sv", result_ssa), s, s, "f32", &vec_ty, ops);
+    // NOTE (a2a3 blocker, diagnosed on hardware 2026-08-05): this Acc->Vec
+    // tmov is why attention is gated to a5 and cannot run on 910B2/910c.
+    // The a2a3 TMov (pto/npu/a2a3/TMov.hpp:160) static-asserts that a move is
+    // one of: Mat -> {Left,Right,Bias,Scaling}, Vec -> Vec, or Acc -> Mat.
+    // Acc -> Vec matches none, so it fails at compile time with
+    // "TMov: Invalid TileType".
+    //
+    // Ruled out as fixes: Mat is not a legal destination from Acc for our
+    // purpose (softmax needs Vec, and Mat -> Vec is also unsupported); and
+    // row-blocking the score matrix does not help, since every block still has
+    // to cross Acc -> Vec to be softmaxed.
+    //
+    // The one workable route is a global-memory round trip -- tstore the Acc
+    // tile, then tload it back into a Vec tile (both directions are supported).
+    // That needs an S x S GM scratch buffer, which this emitter cannot
+    // currently obtain: there is no scratch/workspace mechanism and no
+    // module-level GM global emission. Reusing the output buffer only works
+    // when S <= D, which is false for real attention shapes (S=seq >> D=head_dim).
+    // So the fix is an ABI change -- a scratch pointer argument on the
+    // attention intrinsic -- which touches tile_std and every backend that
+    // lowers __tile_attention_f32, and should be done as its own change.
     ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", scores, acc_ty, sv, vec_ty));
 
     // Step 3: softmax (5-step) — mirrors translate_softmax.
@@ -4242,6 +4263,9 @@ fn translate_attention_gqa(
     // Step 2: move scores to VEC for softmax
     let vec_ty = tile_buf_type(s, s, "f32");
     let sv = ctx.alloc_tile_typed(&format!("{}__gqa_sv", result_ssa), s, s, "f32", &vec_ty, ops);
+    // Same a2a3 Acc->Vec blocker as translate_attention; see the note there.
+    // The comment above about avoiding vec->mat / acc->vec covers only the Q/V
+    // LOADS -- this scores move is still Acc -> Vec and is a5-only.
     ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", scores, acc_ty, sv, vec_ty));
 
     // Step 3: softmax (5-step) — max/sum are row-reductions (rows×1 col_major).
