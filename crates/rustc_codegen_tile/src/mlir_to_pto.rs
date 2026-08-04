@@ -8112,3 +8112,52 @@ module {
         assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
     }
 }
+
+#[cfg(test)]
+mod pto_toolchain_dump {
+    use super::*;
+
+    /// Dumps generated PTO-MLIR so it can be assembled by the real `ptoas` on
+    /// a 910B box, checking that this emitter's output is still accepted by
+    /// the toolchain (codegen-string tests cannot catch that).
+    /// No-op unless TILERS_PTO_DUMP_DIR is set.
+    #[test]
+    fn dump_pto_for_toolchain_check() {
+        let Ok(dir) = std::env::var("TILERS_PTO_DUMP_DIR") else { return };
+        let mm = r#"
+module {
+  llvm.func @tile_matmul(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %m = llvm.mlir.constant(16 : i32) : i32
+    %k = llvm.mlir.constant(16 : i32) : i32
+    %n = llvm.mlir.constant(16 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32
+    %c = llvm.call @__tile_matmul_f32(%a, %a, %b, %m, %k, %n) : (i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %c, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        std::fs::write(format!("{}/matmul.pto", dir), convert_mlir_to_pto(mm).unwrap()).unwrap();
+
+        // Attention exercises the whole-tile pipeline (tmatmul -> softmax_5ops
+        // -> tmatmul) that the causal-rejection change sits next to.
+        let attn = r#"
+module {
+  llvm.func @tile_attn(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %s = llvm.mlir.constant(16 : i32) : i32
+    %d = llvm.mlir.constant(16 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %r = llvm.call @__tile_attention_f32(%q, %q, %k, %v, %s, %d) : (i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %r, %s, %d) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        std::fs::write(format!("{}/attention.pto", dir), convert_mlir_to_pto(attn).unwrap()).unwrap();
+    }
+}
