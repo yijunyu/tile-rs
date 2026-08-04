@@ -48,3 +48,25 @@ and compiling everything except the CompactMode references.
                 check (max_rel_err). Override shape with -DPTO_M/-DPTO_K/-DPTO_N
                 and kernel with -DPTO_KERNEL_HEADER=\"X.cpp\".
   matmul.pto / matmul.cpp, attention.pto
+
+## Attention needs a5 hardware — cannot run on these boxes
+
+`attn_run.cpp` is the attention counterpart of `pto_run.cpp`. It does NOT run
+on either available box, and the reason is structural, not a build problem:
+
+* `mlir_to_pto` marks any module containing attention with
+  `pto.target_arch = "a5"` (see `module_uses_a5_ops`). Matmul carries no such
+  attribute and runs fine.
+* `translate_attention` emits `pto.tmov` from an **Acc** tile to a **Vec** tile
+  (moving the S×S score matrix out of the accumulator for softmax). On the
+  a2a3 path that is rejected at compile time:
+  `pto/npu/a2a3/TMov.hpp: static assertion failed ... TMov: Invalid TileType`.
+  tile-rs's own comment in `translate_attention_gqa` says the same thing —
+  "we don't have working vec→mat / acc→vec tmov pairs on a2a3".
+* Both boxes are a2a3 generation (dav-c220 / Ascend910), so the kernel is
+  unrunnable here regardless of flags. Compiling for an a5 arch would produce
+  a binary this hardware cannot execute.
+
+Consequence for the causal-attention work (P1): it cannot be measured on
+Ascend today. Its prerequisite is not the causal elision itself but an
+a2a3-compatible attention lowering (avoiding acc→vec tmov), or a5 hardware.
