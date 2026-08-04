@@ -981,6 +981,14 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& code_dim     [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& num_codes    [[ buffer({}) ]],", params_idx + 2).unwrap();
         }
+        KernelType::Argmin => {
+            // Scans the codebook axis of an (N x num_codes) distance matrix, so
+            // it needs num_codes for both the row stride and the loop bound.
+            // Previously fell through to the catch-all, which declares only
+            // num_elements -- see emit_argmin_msl.
+            writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& num_codes    [[ buffer({}) ]],", params_idx + 1).unwrap();
+        }
         KernelType::ScatterAdd => {
             writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& code_dim     [[ buffer({}) ]],", params_idx + 1).unwrap();
@@ -3238,19 +3246,25 @@ fn emit_l2dist_msl(out: &mut String, msl_type: &str) {
 }
 
 /// Argmin along the last axis of a 2D matrix.
-/// Buffers: p0=distances (N×K), p1=indices (N,) output as float.
-/// Params: num_elements=N (rows), code_dim=K (cols to scan).
+/// Buffers: p0=distances (N×num_codes), p1=indices (N,) output as float.
+/// Params: num_elements=N (rows), num_codes=K (codebook axis, the axis scanned).
 /// Dispatch: (N, 1, 1) — one workgroup per row.
+///
+/// The scanned axis is `num_codes`, matching the (N × num_codes) distance
+/// matrix `KernelType::L2Dist` produces — not `code_dim`, which is the width
+/// of an encoder output / codebook entry and is a different quantity.
 fn emit_argmin_msl(out: &mut String, msl_type: &str) {
-    // Reduction width is `num_elements` (the argmin kernel's only shape param);
-    // one row per threadgroup, so row_base = row * num_elements.
+    // Reduction width is `num_codes` (the codebook axis); one row per
+    // threadgroup, so the row stride is num_codes, NOT num_elements -- the
+    // latter is the row COUNT and only coincided with the stride for square
+    // inputs.
     writeln!(out, "    uint n_row = row;").unwrap();
-    writeln!(out, "    uint row_base = n_row * num_elements;").unwrap();
+    writeln!(out, "    uint row_base = n_row * num_codes;").unwrap();
     writeln!(out).unwrap();
     // Each thread finds local min + argmin over its stripe
     writeln!(out, "    {} local_min = MAXFLOAT;", msl_type).unwrap();
     writeln!(out, "    uint local_idx = 0;").unwrap();
-    writeln!(out, "    for (uint k = tid; k < num_elements; k += tcount) {{").unwrap();
+    writeln!(out, "    for (uint k = tid; k < num_codes; k += tcount) {{").unwrap();
     writeln!(out, "        {} v = p0[row_base + k];", msl_type).unwrap();
     writeln!(out, "        if (v < local_min) {{ local_min = v; local_idx = k; }}").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -14332,7 +14346,7 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_argmin_msl() {
-        check(|o| emit_argmin_msl(o, "float"), "for (uint k = tid; k < code_dim; k += tcount) {", "emit_argmin_msl");
+        check(|o| emit_argmin_msl(o, "float"), "for (uint k = tid; k < num_codes; k += tcount) {", "emit_argmin_msl");
     }
     #[test]
     fn t_emit_argsort_f32_i32_desc_full_msl() {
@@ -14991,6 +15005,34 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_where_msl() {
         check(|o| emit_where_msl(o), "p3[gid] = (p0[gid] != 0.0f) ? p1[gid] : p2[gid];", "emit_where_msl");
+    }
+}
+
+#[cfg(test)]
+mod argmin_device_dump {
+    use super::*;
+
+    /// Dump a full argmin kernel so a device harness can check it against a CPU
+    /// reference on a NON-SQUARE matrix (N != num_codes) — the case the old
+    /// `num_elements` row stride silently got wrong. No-op unless
+    /// TILERS_MSL_DUMP_DIR is set.
+    #[test]
+    fn dump_argmin_msl() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let mlir = r#"
+module {
+  llvm.func @argmin_k(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %n = llvm.mlir.constant(12 : i32) : i32
+    %k = llvm.mlir.constant(40 : i32) : i32
+    %d = llvm.call @__tile_load_f32(%arg0, %n, %k) : (!llvm.ptr<1>, i32, i32) -> i32
+    %r = llvm.call @__tile_argmin_f32(%d, %n, %k) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %r, %n, %k) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        std::fs::write(format!("{}/argmin.metal", dir), convert_mlir_to_msl(mlir).unwrap()).unwrap();
     }
 }
 
