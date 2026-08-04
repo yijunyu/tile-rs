@@ -47,7 +47,7 @@ use std::fmt::Write;
 
 use crate::mlir_to_pto::{
     extract_call_args, extract_result_ssa, is_builtin_helper, parse_const_arg, parse_module,
-    FuncArg, MlirFunc,
+    FuncArg, MlirFunc, MlirModule,
 };
 
 // Re-use kernel classification from the SPIR-V module so the two backends
@@ -365,8 +365,85 @@ impl MslContext {
 
 /// Convert MLIR text into MSL source suitable for `xcrun metal -c` or
 /// `metal::Device::new_library_with_source()`.
+/// Intrinsics that do not select a kernel body: data movement, allocation and
+/// constant materialization. Any number of these may appear in one kernel.
+fn is_structural_intrinsic(name: &str) -> bool {
+    name.starts_with("__tile_load")
+        || name.starts_with("__tile_store")
+        || name.starts_with("__tile_buf_alloc")
+        || name.starts_with("__tile_pipe_barrier")
+        || name.starts_with("__tile_const")
+        || name.starts_with("__tile_view")
+}
+
+/// Ordered pairs of compute intrinsics this emitter folds into ONE kernel
+/// body. The second op is applied to the first op's result before it reaches
+/// memory — an epilogue fusion — so both intrinsics are accounted for even
+/// though a single `KernelType` is selected.
+///
+/// Adding a pair here is the supported way to lift a new epilogue fusion into
+/// this backend: implement the fused `KernelType`, promote it in the
+/// intrinsic match (see `KernelType::SiLUMul`), and declare the pair below so
+/// the multi-op guard admits it.
+const FUSED_COMPUTE_PAIRS: &[(&str, &str)] = &[
+    // KernelType::SiLUMul — gated MLP activation, out = silu(gate) * up.
+    ("__tile_silu_f32", "__tile_mul_f32"),
+];
+
+/// Reject kernels that chain compute intrinsics this emitter cannot fold.
+///
+/// This backend selects ONE `KernelType` per kernel and emits that op's body;
+/// an unrecognized second compute intrinsic is silently ignored. A kernel
+/// written as `matmul` then `silu` therefore emitted only one of the two and
+/// stored a result that was never computed — a silent miscompile with no
+/// diagnostic. Failing closed converts it into an error naming both ops.
+///
+/// Recognized epilogue fusions (`FUSED_COMPUTE_PAIRS`) are exempt: they are
+/// genuinely both emitted, into one body.
+///
+/// Note the asymmetry with the PTO backend, which composes freely — its
+/// `analyze_body` walks every line and emits ops in sequence. Lifting a
+/// general epilogue fusion here needs that composition model first; until
+/// then each fusion is an explicit, tested pair.
+fn reject_unfusable_compute_chains(module: &MlirModule) -> Result<(), String> {
+    for func in &module.functions {
+        if !func.is_entry {
+            continue;
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for line in &func.body_lines {
+            let Some(at) = line.find("@__tile_") else { continue };
+            let rest = &line[at + 1..];
+            let end = rest.find('(').unwrap_or(rest.len());
+            let name = &rest[..end];
+            if is_structural_intrinsic(name) {
+                continue;
+            }
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+        if seen.len() == 2 && FUSED_COMPUTE_PAIRS.contains(&(seen[0], seen[1])) {
+            continue;
+        }
+        if seen.len() > 1 {
+            return Err(format!(
+                "kernel @{} chains {} compute intrinsics ({}) that this emitter \
+                 cannot fold into one body; all but one would be silently \
+                 dropped. Use a fused tile_std op, split the kernel, or add the \
+                 pair to FUSED_COMPUTE_PAIRS with a fused KernelType.",
+                func.name,
+                seen.len(),
+                seen.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn convert_mlir_to_msl(mlir_text: &str) -> Result<String, String> {
     let module = parse_module(mlir_text)?;
+    reject_unfusable_compute_chains(&module)?;
     let mut out = String::with_capacity(4096);
     let mut count = 0;
 
@@ -13471,6 +13548,39 @@ module {
         assert!(msl.contains("gid % N"), "must derive col from flat gid:\n{}", msl);
         // 4x unroll
         assert!(msl.contains("k + 3 < K; k += 4"), "must have 4x loop unroll:\n{}", msl);
+    }
+
+    /// P2 groundwork: a chain this emitter cannot fold must fail loudly.
+    /// Before the guard, `matmul` then `silu` emitted only the silu and stored
+    /// a value the kernel never computed — a silent miscompile.
+    #[test]
+    fn test_msl_unfusable_compute_chain_is_rejected() {
+        let mlir = r#"
+module {
+  llvm.func @mm_silu(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %m = llvm.mlir.constant(32 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %m, %m) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %m, %m) : (!llvm.ptr<1>, i32, i32) -> i32
+    %c = llvm.call @__tile_matmul_f32(%a, %b, %m, %m, %m) : (i32, i32, i32, i32, i32) -> i32
+    %d = llvm.call @__tile_silu_f32(%c, %m, %m) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %d, %m, %m) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let err = convert_mlir_to_msl(mlir).expect_err("unfusable chain must not lower");
+        assert!(err.contains("__tile_matmul_f32") && err.contains("__tile_silu_f32"),
+            "error must name both ops:\n{}", err);
+        assert!(err.contains("silently"), "error must explain the hazard:\n{}", err);
+    }
+
+    /// The declared epilogue fusion still lowers: the guard must not regress
+    /// recognized pairs. This is the executable definition of "fusable".
+    #[test]
+    fn test_msl_declared_fusion_pair_still_lowers() {
+        assert!(FUSED_COMPUTE_PAIRS.contains(&("__tile_silu_f32", "__tile_mul_f32")),
+            "silu+mul must be a declared epilogue fusion");
     }
 
     #[test]
