@@ -1455,6 +1455,38 @@ fn analyze_body(
             translate_attention_gqa(line, ctx, &mut ops)?;
             continue;
         }
+        // tile.attention_causal f32 — REJECTED, deliberately and loudly.
+        //
+        // The causal op exists so a backend can skip above-diagonal work
+        // instead of computing and masking it (the "monotone-predicate block
+        // elision" pattern). Neither half of that is expressible in this
+        // emitter's current attention shape:
+        //
+        //   * `translate_attention` emits ONE `pto.tmatmul` covering the whole
+        //     S×S score matrix, so there are no per-block ops to drop. The
+        //     elision needs a *blocked* score pipeline (a tmatmul per (i,j)
+        //     block pair, emitted only for j <= i, with the softmax
+        //     row-statistics accumulated across the surviving blocks).
+        //   * There is no select/where primitive in the PTO op set
+        //     (tadd/tmul/trowmax/... only), so even the fallback of masking
+        //     after a dense matmul would need a materialized triangular -inf
+        //     bias tile — which is precisely the work this op exists to avoid.
+        //
+        // This MUST be an explicit error: unrecognized `llvm.call` lines fall
+        // through to the "emit as comment" arm at the bottom of this loop, so
+        // staying silent would produce a kernel that never computes attention
+        // at all and stores an undefined output tile.
+        if line.contains("__tile_attention_causal_f32") {
+            return Err(
+                "attention_causal: no PTO lowering. The causal elision needs a \
+                 blocked score pipeline (one tmatmul per (i,j) block, emitted \
+                 only for j <= i, with row max/sum accumulated across blocks); \
+                 translate_attention currently emits a single whole-S×S \
+                 tmatmul, and the PTO op set has no select primitive for a \
+                 masking fallback. Use __tile_attention_f32 for full attention."
+                    .to_string(),
+            );
+        }
         // tile.attention f32 — fused Q@K^T → scale → softmax → @V
         // Decomposed into: matmul + scale + softmax_5ops + matmul
         if line.contains("__tile_attention_f32") {
@@ -8035,6 +8067,42 @@ module {
         // attention_gqa arity: only 4 args -> args.len() < 8 guard.
         let gqa_arity = "%r = llvm.call @__tile_attention_gqa_f32(%c0, %undef, %undef2, %undef3) : (i32, i32, i32, i32) -> i32";
         assert!(convert_mlir_to_pto(&ghost_pto!(gqa_arity)).is_err());
+    }
+
+    /// P1 (monotone-predicate block elision) does NOT currently transfer to
+    /// PTO: `translate_attention` emits one whole-S×S `pto.tmatmul`, so there
+    /// are no per-block ops to elide, and the op set has no select primitive
+    /// for a masking fallback. Until a blocked attention path exists, the
+    /// causal op must be rejected loudly — never silently dropped into the
+    /// "unrecognized call → comment" arm, which would emit a kernel that
+    /// computes no attention at all.
+    #[test]
+    fn test_pto_attention_causal_rejected_until_blocked_path_exists() {
+        let call = "%r = llvm.call @__tile_attention_causal_f32(%c0, %q, %k, %v, %c16, %c64) : (i32, i32, i32, i32, i32, i32) -> i32";
+        let mlir = ghost_pto!(call);
+        let err = convert_mlir_to_pto(&mlir)
+            .expect_err("causal attention must not lower silently on PTO");
+        assert!(err.contains("attention_causal"),
+            "error must name the op:\n{}", err);
+        assert!(err.contains("blocked"),
+            "error must name the structural blocker (blocked score pipeline):\n{}", err);
+        // The failure must be an Err, not a kernel with the call commented out.
+        let out = convert_mlir_to_pto(&mlir).ok();
+        assert!(out.is_none(),
+            "causal attention must never emit a kernel body on PTO");
+    }
+
+    /// The plain (non-causal) attention op keeps lowering: the causal branch
+    /// must not shadow it. `__tile_attention_causal_f32` and
+    /// `__tile_attention_f32` are matched by `contains`, so this guards the
+    /// substring-collision hazard in that dispatch style.
+    #[test]
+    fn test_pto_attention_plain_still_lowers_after_causal_branch() {
+        let call = "%r = llvm.call @__tile_attention_f32(%c0, %undef, %undef2, %undef3, %c16, %c64) : (i32, i32, i32, i32, i32, i32) -> i32";
+        let err = convert_mlir_to_pto(&ghost_pto!(call))
+            .expect_err("undefined Q tile still errors");
+        assert!(!err.contains("attention_causal"),
+            "plain attention must not hit the causal rejection:\n{}", err);
     }
 
     #[test]
