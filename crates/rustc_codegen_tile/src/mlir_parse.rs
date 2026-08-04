@@ -1892,3 +1892,132 @@ module {
         assert_eq!(funcs[0].args.len(), 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// K-loop unroll (P6): a declared knob, not a hand-inlined constant
+// ---------------------------------------------------------------------------
+
+/// Default unroll factor for reduction (K) loops in matmul-family kernels.
+///
+/// Ported from a ranked receipt on Apple M5: upstream ml-explore/mlx PR #3843
+/// measured **-12% kernel time at head_dim 128** from unroll-by-4 on the steel
+/// attention K-loop, and the same pragma transplanted to the hottest decode
+/// matvec promoted independently on the MLXFast leaderboard (submissions
+/// `1077625`, `270ec98`, `a67cebb`, `89ad8a2`). Unrolling lets the compiler
+/// interleave the next K-tile's loads with the running multiply-accumulate
+/// chain instead of stalling on each load.
+///
+/// **The factor never changes results.** `emit_unrolled_k_accumulation`
+/// accumulates into a single accumulator in strictly increasing `k`, and the
+/// scalar tail continues that same order, so every factor produces the same
+/// summation sequence — only the loop boundary moves. Nothing is reassociated,
+/// which is what makes this safe under exact-output gates.
+///
+/// The optimum is target-specific (it trades I-cache and register pressure
+/// against load/ALU overlap), so backends may override it; 4 is the receipted
+/// default on Apple GPUs.
+pub const DEFAULT_K_UNROLL: usize = 4;
+
+/// Emit a fully-unrolled-by-`factor` reduction loop plus its scalar tail.
+///
+/// `term(k_expr)` renders one multiply-accumulate term given an index
+/// expression. `acc`/`k` name the accumulator and induction variables, `bound`
+/// is the loop limit expression, and `indent` prefixes every emitted line.
+///
+/// Emits, for factor 4:
+/// ```text
+/// int k = 0;
+/// for (; k + 3 < K; k += 4) { acc += t(k); acc += t(k+1); ... }
+/// for (; k < K; k++) { acc += t(k); }
+/// ```
+/// A factor of 0 or 1 degenerates to the plain scalar loop.
+pub fn emit_unrolled_k_accumulation<F>(
+    out: &mut Vec<String>,
+    factor: usize,
+    acc: &str,
+    k: &str,
+    bound: &str,
+    decl: &str,
+    indent: &str,
+    term: F,
+) where
+    F: Fn(String) -> String,
+{
+    let factor = factor.max(1);
+    out.push(format!("{}{} {} = 0;", indent, decl, k));
+    if factor > 1 {
+        out.push(format!(
+            "{}for (; {} + {} < {}; {} += {}) {{",
+            indent, k, factor - 1, bound, k, factor
+        ));
+        for u in 0..factor {
+            let idx = if u == 0 { k.to_string() } else { format!("{} + {}", k, u) };
+            out.push(format!("{}  {} += {};", indent, acc, term(idx)));
+        }
+        out.push(format!("{}}}", indent));
+    }
+    out.push(format!("{}for (; {} < {}; {}++) {{", indent, k, bound, k));
+    out.push(format!("{}  {} += {};", indent, acc, term(k.to_string())));
+    out.push(format!("{}}}", indent));
+}
+
+#[cfg(test)]
+mod k_unroll_tests {
+    use super::*;
+
+    fn render(factor: usize) -> String {
+        let mut v = Vec::new();
+        emit_unrolled_k_accumulation(&mut v, factor, "acc", "k", "K", "int", "", |i| {
+            format!("a[{}] * b[{}]", i, i)
+        });
+        v.join("\n")
+    }
+
+    /// The receipted default must reproduce the hand-written 4x shape the
+    /// emitters used before this helper existed.
+    #[test]
+    fn factor_four_matches_the_hand_written_shape() {
+        let s = render(DEFAULT_K_UNROLL);
+        assert!(s.contains("for (; k + 3 < K; k += 4) {"), "{}", s);
+        assert!(s.contains("acc += a[k] * b[k];"), "{}", s);
+        assert!(s.contains("acc += a[k + 3] * b[k + 3];"), "{}", s);
+        assert!(s.contains("for (; k < K; k++) {"), "{}", s);
+    }
+
+    /// Every factor must visit k in strictly increasing order with ONE
+    /// accumulator — that invariant, not the factor, is what keeps the
+    /// transform bit-exact.
+    #[test]
+    fn every_factor_preserves_accumulation_order() {
+        for f in [1usize, 2, 4, 8] {
+            let s = render(f);
+            let offsets: Vec<i32> = s
+                .lines()
+                .filter(|l| l.contains("acc +="))
+                .map(|l| {
+                    let inside = &l[l.find("a[").unwrap() + 2..];
+                    let idx = &inside[..inside.find(']').unwrap()];
+                    idx.split('+').nth(1).map(|o| o.trim().parse().unwrap()).unwrap_or(0)
+                })
+                .collect();
+            // main-body offsets ascend 0..f-1, then the tail re-emits offset 0
+            let body = &offsets[..offsets.len() - 1];
+            assert!(body.windows(2).all(|w| w[0] < w[1]),
+                "factor {} must accumulate in increasing k: {:?}", f, offsets);
+            assert_eq!(*offsets.last().unwrap(), 0, "tail must continue at k");
+            assert_eq!(s.matches("acc +=").count(), if f > 1 { f + 1 } else { 1 },
+                "factor {} term count", f);
+        }
+    }
+
+    /// Factor 1 (and 0) must degenerate to a plain scalar loop with no
+    /// unrolled body at all.
+    #[test]
+    fn factor_one_degenerates_to_scalar_loop() {
+        for f in [0usize, 1] {
+            let s = render(f);
+            assert!(!s.contains("k += "), "factor {} must not emit a strided loop:\n{}", f, s);
+            assert_eq!(s.matches("acc +=").count(), 1, "factor {}", f);
+        }
+    }
+}

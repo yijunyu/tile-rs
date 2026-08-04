@@ -45,10 +45,15 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::mlir_parse::{emit_unrolled_k_accumulation, DEFAULT_K_UNROLL};
 use crate::mlir_to_pto::{
     extract_call_args, extract_result_ssa, is_builtin_helper, parse_const_arg, parse_module,
     FuncArg, MlirFunc, MlirModule,
 };
+
+/// Apple GPUs keep the receipted default (upstream MLX PR #3843 measured
+/// -12% kernel time at head_dim 128 with unroll-by-4 on this shape).
+const MATMUL_TRANSPOSED_K_UNROLL: usize = DEFAULT_K_UNROLL;
 
 // Re-use kernel classification from the SPIR-V module so the two backends
 // stay in sync.  The types are identical — only the emitter differs.
@@ -12407,15 +12412,16 @@ fn emit_matmul_transposed_msl(out: &mut String) {
     writeln!(out, "    uint m = gid / N;").unwrap();
     writeln!(out, "    uint n = gid % N;").unwrap();
     writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    uint k = 0;").unwrap();
-    writeln!(out, "    for (; k + 3 < K; k += 4) {{").unwrap();
-    writeln!(out, "        acc += p0[m * K + k]     * p1[n * K + k];").unwrap();
-    writeln!(out, "        acc += p0[m * K + k + 1] * p1[n * K + k + 1];").unwrap();
-    writeln!(out, "        acc += p0[m * K + k + 2] * p1[n * K + k + 2];").unwrap();
-    writeln!(out, "        acc += p0[m * K + k + 3] * p1[n * K + k + 3];").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    for (; k < K; k++)").unwrap();
-    writeln!(out, "        acc += p0[m * K + k] * p1[n * K + k];").unwrap();
+    // K-loop unroll via the declared knob (see DEFAULT_K_UNROLL). Every
+    // factor emits the same accumulation order, so this is bit-exact.
+    let mut k_loop = Vec::new();
+    emit_unrolled_k_accumulation(
+        &mut k_loop, MATMUL_TRANSPOSED_K_UNROLL, "acc", "k", "K", "uint", "    ",
+        |i| format!("p0[m * K + {}] * p1[n * K + {}]", i, i),
+    );
+    for line in k_loop {
+        writeln!(out, "{}", line).unwrap();
+    }
     writeln!(out, "    p2[m * N + n] = acc;").unwrap();
 }
 
@@ -14962,6 +14968,47 @@ mod emit_tail_tests {
 #[cfg(test)]
 mod causal_ab_dump {
     use super::*;
+
+    /// Dumps matmul_transposed at several unroll factors, so the A/B harness
+    /// can prove on device that the factor never changes results.
+    #[test]
+    fn dump_unroll_variants_for_ab() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let mlir = r#"
+module {
+  llvm.func @mmt(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %m = llvm.mlir.constant(48 : i32) : i32
+    %k = llvm.mlir.constant(70 : i32) : i32
+    %n = llvm.mlir.constant(48 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %n, %k) : (!llvm.ptr<1>, i32, i32) -> i32
+    %c = llvm.call @__tile_matmul_transposed_f32(%a, %b, %m, %k, %n) : (i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %c, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        // factor 4 is what the emitter ships; render 1 and 8 by hand through
+        // the same helper so all three are the helper's own output.
+        let base = convert_mlir_to_msl(mlir).unwrap();
+        std::fs::write(format!("{}/mmt_u4.metal", dir), &base).unwrap();
+        for f in [1usize, 8] {
+            let mut v = Vec::new();
+            emit_unrolled_k_accumulation(&mut v, f, "acc", "k", "K", "uint", "    ",
+                |i| format!("p0[m * K + {}] * p1[n * K + {}]", i, i));
+            let body = v.join("\n");
+            // splice the alternate loop into the shipped kernel text
+            let start = base.find("    uint k = 0;").unwrap();
+            let end = base.find("    p2[m * N + n] = acc;").unwrap();
+            let mut alt = String::new();
+            alt.push_str(&base[..start]);
+            alt.push_str(&body);
+            alt.push('\n');
+            alt.push_str(&base[end..]);
+            std::fs::write(format!("{}/mmt_u{}.metal", dir, f), alt.replace("kernel void mmt(", &format!("kernel void mmt_u{}(", f))).unwrap();
+        }
+    }
 
     /// Dumps the generated MSL for the causal op so the standalone Metal A/B
     /// harness runs the *real* emitter output rather than a transcription.

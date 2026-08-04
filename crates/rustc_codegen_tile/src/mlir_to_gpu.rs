@@ -46,10 +46,14 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::mlir_parse::{emit_unrolled_k_accumulation, DEFAULT_K_UNROLL};
 use crate::mlir_to_pto::{
     extract_call_args, extract_result_ssa, infer_dtype_from_name, is_builtin_helper,
     parse_const_arg, parse_module, FuncArg, MlirFunc,
 };
+
+/// CUDA keeps the receipted default; the optimum is target-specific.
+const MATMUL_TRANSPOSED_K_UNROLL: usize = DEFAULT_K_UNROLL;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -1606,17 +1610,14 @@ pub(crate) fn emit_intrinsic_gpu(
             stmts.push(format!("int _mt_i = goff / {};", n));
             stmts.push(format!("int _mt_j = goff % {};", n));
             stmts.push("float _mt_acc = 0.0f;".to_string());
-            // 4x loop unroll
-            stmts.push(format!("int _mt_k = 0;"));
-            stmts.push(format!("for (; _mt_k + 3 < {}; _mt_k += 4) {{", k));
-            stmts.push(format!("  _mt_acc += {}[_mt_i * {} + _mt_k]     * {}[_mt_j * {} + _mt_k];", a_param, k, b_param, k));
-            stmts.push(format!("  _mt_acc += {}[_mt_i * {} + _mt_k + 1] * {}[_mt_j * {} + _mt_k + 1];", a_param, k, b_param, k));
-            stmts.push(format!("  _mt_acc += {}[_mt_i * {} + _mt_k + 2] * {}[_mt_j * {} + _mt_k + 2];", a_param, k, b_param, k));
-            stmts.push(format!("  _mt_acc += {}[_mt_i * {} + _mt_k + 3] * {}[_mt_j * {} + _mt_k + 3];", a_param, k, b_param, k));
-            stmts.push("}".to_string());
-            stmts.push(format!("for (; _mt_k < {}; _mt_k++) {{", k));
-            stmts.push(format!("  _mt_acc += {}[_mt_i * {} + _mt_k] * {}[_mt_j * {} + _mt_k];", a_param, k, b_param, k));
-            stmts.push("}".to_string());
+            // K-loop unroll: a declared knob (see DEFAULT_K_UNROLL), not an
+            // inlined constant. Any factor emits the same accumulation order.
+            emit_unrolled_k_accumulation(
+                &mut stmts, MATMUL_TRANSPOSED_K_UNROLL, "_mt_acc", "_mt_k",
+                &k.to_string(), "int", "",
+                |i| format!("{}[_mt_i * {} + {}] * {}[_mt_j * {} + {}]",
+                            a_param, k, i, b_param, k, i),
+            );
             stmts.push(format!("{} {} = ({})_mt_acc;", ctype, var, ctype));
             Ok(stmts)
         }
