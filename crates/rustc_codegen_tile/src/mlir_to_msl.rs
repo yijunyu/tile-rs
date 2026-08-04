@@ -12500,6 +12500,24 @@ fn emit_attention_gqa_msl(out: &mut String, msl_type: &str) {
 /// `grid.x = ceil(num_heads / 2)` threadgroups. Threadgroup `row` owns query
 /// heads `2*row` and `2*row + 1`; an odd `num_heads` leaves the last
 /// threadgroup computing a single head.
+///
+/// **MEASURED SLOWER ON APPLE GPU — opt-in only, do not make this the default.**
+/// At the DeepSeek-R1-Distill-Qwen3-1.5B shapes (12 heads, 2 KV heads,
+/// head_dim 128, group_size 6) this kernel is 0.52-0.56x the unpaired kernel's
+/// speed, and still 0.97x/0.92x/0.56x (seq 64/128/256) after raising the
+/// threadgroup size to keep TOTAL thread count equal — so the loss is not just
+/// the halved threadgroup count. Two causes: the score loop is compute-bound in
+/// the head_dim-wide dot product rather than K/V-load-bound, and pairing
+/// doubles per-thread score storage (two `scores[256]` arrays, ~2 KB/thread),
+/// which costs more occupancy than the elided loads save.
+///
+/// The source receipt (`adf12cb`) paired heads inside an SDPA **vector/decode**
+/// kernel — one query row, memory-latency-bound, with parallelism coming from
+/// other axes. This kernel is prefill-shaped with per-thread score arrays, and
+/// in that context the same transformation inverts sign. Kept, gated off by
+/// being a separate opt-in intrinsic, because a target with a different
+/// parallelism and register model (or a decode-shaped kernel matching the
+/// original receipt) may still benefit.
 fn emit_attention_gqa_paired_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    // Paired GQA: one threadgroup per head pair. When both heads").unwrap();
     writeln!(out, "    // share a KV head, each K/V element is loaded once for both.").unwrap();
