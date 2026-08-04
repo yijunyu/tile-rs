@@ -3094,6 +3094,34 @@ fn translate_silu(
 
 /// Block size constants used by the K/N-blocked matmul emission.
 /// See comment above `detect_blocked_matmul_loads` for the rationale.
+///
+/// **Measured on hardware (910c, Ascend910, CANN 9.0.0, 2026-08-05)** with a
+/// decode-shaped projection M=16 K=1536 N=1536 — the shape a 1.5B model's
+/// q/k/v/o projection actually runs at. All variants produced identical
+/// checksums and matched a CPU reference (max_rel_err 1.12e-06), so these are
+/// pure scheduling choices:
+///
+/// ```text
+///   Kb x Nb      product   median
+///   64  x 64       4096    173.4 us
+///   128 x 64       8192    148.2 us
+///   256 x 64      16384    134.7 us   <- shipped
+///   512 x 32      16384    134.0 us
+///   1024 x 16     16384    133.9 us
+///   128 x 128     16384    133.9 us
+/// ```
+///
+/// The invariant is the **product**, not either dimension: every pair whose
+/// `Kb * Nb` saturates L0B (16384 f32 = 64 KB) lands on the same ~134 us
+/// plateau within noise, while smaller products degrade proportionally. So
+/// the pair is really one knob — "fill L0B" — and 256x64 is already on the
+/// optimum. Unlike the Metal K-unroll default (which was leaving ~40% on the
+/// table until measured), there is nothing to reclaim here.
+///
+/// Note `Nb=128` did **not** reproduce the "aicore execution exception"
+/// recorded below for 910B2: at Kb=128 it ran correctly on this
+/// Ascend910/CANN 9.0.0 box. Treat that crash as box/CANN-specific rather
+/// than a universal cap.
 const PTO_MM_KB: u32 = 256;
 const PTO_MM_NB: u32 = 64;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
