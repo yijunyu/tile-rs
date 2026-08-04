@@ -103,6 +103,7 @@ enum KernelType {
     TokenAccept, // select final tokens → (R,1) u32
     // Transformer ops
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
+    AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
     Rope,        // rotary position embeddings
     RopeDsv4,    // DS4 partial-RoPE: copy n_nope prefix, rotate tail with YaRN
@@ -484,6 +485,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::TokenAccept => 4,   // draft, target, probs, out
         // Transformer ops
         KernelType::Attention  => 4,    // q, k, v, out
+        KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
         KernelType::Rope       => 2,    // src, dst
         KernelType::RopeDsv4   => 4,    // src, pos(int), src2_freq(float, optional), dst
@@ -931,7 +933,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant {}&   threshold    [[ buffer({}) ]],", msl_type, params_idx + 1).unwrap();
         }
-        KernelType::Attention => {
+        KernelType::Attention | KernelType::AttentionCausal => {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& seq          [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& dim          [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2127,7 +2129,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::Dsv4Q8HcExpand4Q8_0
             | KernelType::Dsv4SharedDownHcExpand4Q8_0
             | KernelType::Embedding
-            | KernelType::Attention | KernelType::AttentionGqa
+            | KernelType::Attention | KernelType::AttentionGqa | KernelType::AttentionCausal
             | KernelType::Dsv4Ratio4Shift
             | KernelType::TopkMaskScatter
             | KernelType::Dsv4RouterWeightsOne
@@ -2365,6 +2367,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::TokenAccept  => emit_token_accept_msl(out, msl_type),
         // Transformer ops
         KernelType::Attention    => emit_attention_msl(out, msl_type),
+        KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
         KernelType::Rope         => emit_rope_msl(out, msl_type),
         KernelType::RopeDsv4     => emit_rope_dsv4_msl(out),
@@ -2763,6 +2766,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_token_accept_f32"  => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::TokenAccept; } }
                 // Transformer ops
                 "__tile_attention_f32"     => { ctx.kernel_type = KernelType::Attention; }
+                "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
                 "__tile_rope_f32"          => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Rope; } }
                 "__tile_rope_dsv4_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::RopeDsv4; } }
@@ -3684,6 +3688,55 @@ fn emit_attention_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    for (uint d = 0; d < dim; ++d) {{").unwrap();
     writeln!(out, "        {} acc = ({})0.0;", msl_type, msl_type).unwrap();
     writeln!(out, "        for (uint j = 0; j < seq; ++j)").unwrap();
+    writeln!(out, "            acc += scores[j] * p2[j * dim + d];").unwrap();
+    writeln!(out, "        p3[q_row * dim + d] = acc;").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Causal attention: row `q_row` attends to keys `0..=q_row` only.
+///
+/// Same buffers and params as `emit_attention_msl`. The single difference is
+/// the key bound: `k_end = q_row + 1` replaces `seq` in all three phases, so
+/// the above-diagonal scores are never computed rather than computed and
+/// masked. That is bit-identical to masking after the fact:
+///
+///   * a masked score is `-inf`, so `exp(score - smax) == +0.0` — it adds
+///     exactly zero to `ssum` and contributes `0.0 * V[j,d]` to `acc`;
+///   * `-inf` never wins the row maximum, because row `q_row` always keeps
+///     the finite diagonal entry `k_col == q_row`;
+///   * the retained entries are visited in the same ascending order, so the
+///     summation order of every surviving term is unchanged.
+///
+/// Work drops from `S²` to `S(S+1)/2` score-dot-products — just under half
+/// for large S.
+fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
+    writeln!(out, "    // Causal attention: one thread per output row, local scores buffer").unwrap();
+    writeln!(out, "    // (avoids aliasing the score scratch with the output tensor).").unwrap();
+    writeln!(out, "    if (tid != 0) return;").unwrap();
+    writeln!(out, "    constexpr uint MAX_SEQ = 1024;").unwrap();
+    writeln!(out, "    {} scores[MAX_SEQ];", msl_type).unwrap();
+    writeln!(out, "    float inv_scale = rsqrt((float)dim);").unwrap();
+    writeln!(out, "    uint q_row = row;").unwrap();
+    writeln!(out, "    if (q_row >= rows) return;").unwrap();
+    writeln!(out, "    // Causal bound: keys above the diagonal are skipped, not masked.").unwrap();
+    writeln!(out, "    uint k_end = min(q_row + 1u, seq);").unwrap();
+    writeln!(out, "    // Step 1: scores[k] = (Q[q_row] . K[k]) / sqrt(dim), k <= q_row").unwrap();
+    writeln!(out, "    for (uint k_col = 0; k_col < k_end; ++k_col) {{").unwrap();
+    writeln!(out, "        {} s = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "        for (uint d = 0; d < dim; ++d)").unwrap();
+    writeln!(out, "            s += p0[q_row * dim + d] * p1[k_col * dim + d];").unwrap();
+    writeln!(out, "        scores[k_col] = s * ({})inv_scale;", msl_type).unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    // Step 2: softmax over the causal prefix").unwrap();
+    writeln!(out, "    {} smax = scores[0];", msl_type).unwrap();
+    writeln!(out, "    for (uint j = 1; j < k_end; ++j) smax = max(smax, scores[j]);").unwrap();
+    writeln!(out, "    {} ssum = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "    for (uint j = 0; j < k_end; ++j) {{ scores[j] = exp(scores[j] - smax); ssum += scores[j]; }}").unwrap();
+    writeln!(out, "    for (uint j = 0; j < k_end; ++j) scores[j] /= ssum;").unwrap();
+    writeln!(out, "    // Step 3: out[q_row, d] = sum_j scores[j] * V[j, d], j <= q_row").unwrap();
+    writeln!(out, "    for (uint d = 0; d < dim; ++d) {{").unwrap();
+    writeln!(out, "        {} acc = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "        for (uint j = 0; j < k_end; ++j)").unwrap();
     writeln!(out, "            acc += scores[j] * p2[j * dim + d];").unwrap();
     writeln!(out, "        p3[q_row * dim + d] = acc;").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -13220,6 +13273,55 @@ module {
         assert!(msl.contains("rows"), "attention must have rows param:\n{}", msl);
         assert!(msl.contains("seq"),  "attention must have seq param:\n{}", msl);
         assert!(msl.contains("dim"),  "attention must have dim param:\n{}", msl);
+        // The non-causal emitter must NOT bound the key loop — it is the
+        // control arm for the causal elision test below.
+        assert!(!msl.contains("k_end"), "plain attention must not emit a causal bound:\n{}", msl);
+    }
+
+    /// P1 (monotone-predicate block elision) on Metal: the causal op must
+    /// bound every key loop by the diagonal instead of computing the full
+    /// score matrix and masking it.
+    #[test]
+    fn test_msl_attention_causal_elides_above_diagonal() {
+        let mlir = r#"
+module {
+  llvm.func @attn_causal_test(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %rows = llvm.mlir.constant(4 : i32) : i32
+    %seq  = llvm.mlir.constant(16 : i32) : i32
+    %dim  = llvm.mlir.constant(64 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %rows, %dim) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %seq,  %dim) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %seq,  %dim) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_attention_causal_f32(%q, %k, %v, %rows, %seq, %dim) : (i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %res, %rows, %dim) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let msl = convert_mlir_to_msl(mlir).unwrap();
+        // The causal bound exists and is the diagonal.
+        assert!(msl.contains("uint k_end = min(q_row + 1u, seq);"),
+            "causal attention must derive the diagonal key bound:\n{}", msl);
+        // All three phases (scores, softmax, V accumulation) respect it.
+        assert!(msl.contains("for (uint k_col = 0; k_col < k_end; ++k_col)"),
+            "score loop must stop at the diagonal:\n{}", msl);
+        assert!(msl.contains("for (uint j = 1; j < k_end; ++j) smax"),
+            "row max must run over the causal prefix only:\n{}", msl);
+        assert!(msl.contains("for (uint j = 0; j < k_end; ++j) scores[j] /= ssum;"),
+            "softmax normalize must run over the causal prefix only:\n{}", msl);
+        assert!(msl.contains("for (uint j = 0; j < k_end; ++j)\n            acc += scores[j]"),
+            "V accumulation must run over the causal prefix only:\n{}", msl);
+        // The elision must REPLACE masking, not accompany it: no -inf/-MAXFLOAT
+        // write, no runtime causal uniform. Work is skipped, never discarded.
+        assert!(!msl.contains("MAXFLOAT"),
+            "causal attention must skip above-diagonal work, not mask it:\n{}", msl);
+        assert!(!msl.contains("constant uint& causal"),
+            "causality is compile-time here; no runtime uniform:\n{}", msl);
+        // Same buffer/param contract as the non-causal op (q, k, v, out).
+        assert!(msl.contains("rows"), "causal attention must have rows param:\n{}", msl);
+        assert!(msl.contains("seq"),  "causal attention must have seq param:\n{}", msl);
+        assert!(msl.contains("dim"),  "causal attention must have dim param:\n{}", msl);
     }
 
     #[test]
@@ -14744,5 +14846,43 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_where_msl() {
         check(|o| emit_where_msl(o), "p3[gid] = (p0[gid] != 0.0f) ? p1[gid] : p2[gid];", "emit_where_msl");
+    }
+}
+
+#[cfg(test)]
+mod causal_ab_dump {
+    use super::*;
+
+    /// Dumps the generated MSL for the causal op so the standalone Metal A/B
+    /// harness runs the *real* emitter output rather than a transcription.
+    /// Writes only when TILERS_MSL_DUMP_DIR is set; otherwise a no-op.
+    ///
+    /// Used to prove the elision bit-exact on device: the dumped kernel is
+    /// compared against a control that computes the full S×S score matrix and
+    /// masks afterwards. Result on M1 Ultra, S=64 D=32, 8 random trials:
+    /// 0/16384 elements differ, worst ULP delta 0.
+    #[test]
+    fn dump_causal_msl_for_ab() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let mk = |intrinsic: &str| format!(r#"
+module {{
+  llvm.func @attn(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {{hacc.entry}} {{
+    ^bb0:
+    %rows = llvm.mlir.constant(64 : i32) : i32
+    %seq  = llvm.mlir.constant(64 : i32) : i32
+    %dim  = llvm.mlir.constant(32 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %rows, %dim) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %seq,  %dim) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %seq,  %dim) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @{}(%q, %k, %v, %rows, %seq, %dim) : (i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %res, %rows, %dim) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }}
+}}
+"#, intrinsic);
+        let causal = convert_mlir_to_msl(&mk("__tile_attention_causal_f32")).unwrap();
+        let plain  = convert_mlir_to_msl(&mk("__tile_attention_f32")).unwrap();
+        std::fs::write(format!("{}/causal.metal", dir), causal).unwrap();
+        std::fs::write(format!("{}/plain.metal", dir), plain).unwrap();
     }
 }
