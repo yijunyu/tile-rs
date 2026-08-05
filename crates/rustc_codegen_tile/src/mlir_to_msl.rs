@@ -3954,7 +3954,7 @@ fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
 ///
 /// A consumer's dispatch grid MUST agree with this -- it is row TILES times
 /// columns, not one threadgroup per output element.
-pub const MUL_MV_ROWS_PER_TG: usize = 16;
+pub const MUL_MV_ROWS_PER_TG: usize = 4;
 
 /// `char4` units each lane consumes per step of the fused mat-vec.
 ///
