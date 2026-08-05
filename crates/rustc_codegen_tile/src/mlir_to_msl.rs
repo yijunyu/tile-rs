@@ -968,6 +968,11 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // Q8_0 quants are SIGNED bytes; reading them unsigned turns every
             // negative weight into a large positive one.
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
+            // Scales stay in the fp16 the checkpoint already stores them in.
+            // Widening the plane to f32 adds 3.7 MB of traffic to a 66 MB
+            // kernel that is purely bandwidth bound, to carry no more
+            // information than the source had.
+            else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 1 { "half" }
             // The i8 side of quantize/dequantize is stored as real signed bytes,
             // which is what a quantized checkpoint actually holds. Typing it as
             // float instead made the pair unable to address any weight buffer.
@@ -3977,18 +3982,29 @@ fn emit_mul_mv_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
     writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
     writeln!(out).unwrap();
+    // Row bases are NOT hoisted into arrays. Two pointer arrays of ROWS_PER_TG
+    // entries is 256 bytes of registers per thread, and the occupancy it costs
+    // outweighs the address arithmetic it saves -- measured 121 us hoisted
+    // against 106 recomputed. The row loop unrolls, so each unrolled body folds
+    // its own base anyway.
+    writeln!(out, "    uint row_stride = blocks_per_row * BLK;").unwrap();
+    writeln!(out).unwrap();
     // Consecutive lanes read consecutive vectors, so a simdgroup covers one
     // contiguous span on every operand it touches.
     writeln!(out, "    for (uint i = tid; i < n_vec; i += tcount) {{").unwrap();
     writeln!(out, "        float4 xv = x4[i];          // fetched once for all ROWS_PER_TG rows").unwrap();
     writeln!(out, "        uint   b  = i / VPB;").unwrap();
+    // The bound MUST stay a compile-time constant. Making it the runtime row
+    // count stops the compiler unrolling, and without unrolling acc[] and the
+    // pointer arrays are dynamically indexed, so they spill out of registers --
+    // which cost 3x here. Out-of-range rows are clamped instead and their
+    // results are simply not written back.
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
-    writeln!(out, "            device const char4* q4 = (device const char4*)(p0 + (ulong)n * blocks_per_row * BLK);").unwrap();
-    writeln!(out, "            device const float* s  = p1 + (ulong)n * blocks_per_row;").unwrap();
+    writeln!(out, "            device const char4* q4 = (device const char4*)(p0 + (ulong)n * row_stride);").unwrap();
     writeln!(out, "            float4 p = float4(q4[i]) * xv;").unwrap();
-    writeln!(out, "            acc[r] += s[b] * (p.x + p.y + p.z + p.w);").unwrap();
+    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * (p.x + p.y + p.z + p.w);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
@@ -15565,7 +15581,7 @@ module {
 
         // Four data buffers and three extents; the composed chain needed nine
         // slots and a second reduction pass to express the same thing.
-        for want in ["device const  char* p0", "device const  float* p1",
+        for want in ["device const  char* p0", "device const  half* p1",
                      "device const  float* p2", "device  float* p3",
                      "n_rows", "blocks_per_row", "n_cols"] {
             assert!(msl.contains(want), "missing {}:\n{}", want, msl);
@@ -15588,8 +15604,14 @@ module {
 
         // The scale is indexed by the vector's block, so a lane that reads
         // four weights still gets the scale of the block they came from.
-        assert!(msl.contains("uint   b  = i / VPB;") && msl.contains("acc[r] += s[b] *"),
+        assert!(msl.contains("uint   b  = i / VPB;") && msl.contains("acc[r] += (float)p1[(ulong)n * blocks_per_row + b] *"),
             "the scale must follow the vector's block:\n{}", msl);
+
+        // The row loop must be bounded by a compile-time constant so it
+        // unrolls; a runtime bound leaves acc[] dynamically indexed, which
+        // spills it out of registers and cost 3x when it regressed.
+        assert!(msl.contains("for (uint r = 0u; r < ROWS_PER_TG; ++r)"),
+            "the row loop bound must be constant:\n{}", msl);
 
         // Consecutive lanes must read consecutive vectors. Striding by BLOCK
         // instead puts neighbouring lanes 32 bytes apart inside one load,
