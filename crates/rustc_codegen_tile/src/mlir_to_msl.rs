@@ -4085,10 +4085,10 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
 /// kernel is barrier-bound rather than compute-bound -- measured 13x slower
 /// than ggml. A micro-tile raises the work per barrier by `RT*CT` while reading
 /// `RT + CT` values from the stage instead of `RT*CT`.
-pub const MUL_MM_TN: usize = 128;
-pub const MUL_MM_TM: usize = 32;
-pub const MUL_MM_RT: usize = 8;
-pub const MUL_MM_CT: usize = 4;
+pub const MUL_MM_TN: usize = 64;
+pub const MUL_MM_TM: usize = 128;
+pub const MUL_MM_RT: usize = 4;
+pub const MUL_MM_CT: usize = 2;
 
 /// K-blocks staged per synchronisation round.
 ///
@@ -4111,83 +4111,89 @@ pub const MUL_MM_KC: usize = 1;
 /// inner product is plain f32 and each weight is unpacked once per tile rather
 /// than once per output element.
 fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
-    writeln!(out, "    constexpr uint BLK = 32u;                  // weights per block").unwrap();
-    writeln!(out, "    constexpr uint TN  = {}u;                  // output rows per threadgroup", MUL_MM_TN).unwrap();
-    writeln!(out, "    constexpr uint TM  = {}u;                  // output cols per threadgroup", MUL_MM_TM).unwrap();
-    writeln!(out, "    constexpr uint RT  = {}u;                  // rows per thread", MUL_MM_RT).unwrap();
-    writeln!(out, "    constexpr uint CT  = {}u;                  // cols per thread", MUL_MM_CT).unwrap();
+    // Threadgroup memory is a hard device limit (32 KiB on Apple GPUs). Exceeding
+    // it does not degrade -- pipeline creation fails, the backend returns NULL
+    // and aborts. So it is a knob PRECONDITION, checked where the kernel is
+    // built rather than discovered at runtime.
+    const TG_LIMIT: usize = 32768;
+    let staged = (MUL_MM_TN + MUL_MM_TM) * MUL_MM_KC * (32 + 1) * 4;
+    assert!(
+        staged <= TG_LIMIT,
+        "GEMM stage needs {} B of threadgroup memory (TN={} TM={} KC={}), limit {}",
+        staged, MUL_MM_TN, MUL_MM_TM, MUL_MM_KC, TG_LIMIT
+    );
+
+    writeln!(out, "    constexpr uint BLK = 32u;              // weights per block").unwrap();
+    writeln!(out, "    constexpr uint PAD = BLK + 1u;         // pad: see bank-conflict note").unwrap();
+    writeln!(out, "    constexpr uint WQ  = BLK / 4u;         // char4 units per block row").unwrap();
+    writeln!(out, "    constexpr uint TN  = {}u;", MUL_MM_TN).unwrap();
+    writeln!(out, "    constexpr uint TM  = {}u;", MUL_MM_TM).unwrap();
+    writeln!(out, "    constexpr uint RT  = {}u;              // rows per thread", MUL_MM_RT).unwrap();
+    writeln!(out, "    constexpr uint CT  = {}u;              // cols per thread", MUL_MM_CT).unwrap();
+    writeln!(out, "    constexpr uint KC  = {}u;              // K-blocks per barrier round", MUL_MM_KC).unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint row_tiles = (n_rows + TN - 1u) / TN;").unwrap();
     writeln!(out, "    uint col_tiles = (n_cols + TM - 1u) / TM;").unwrap();
     writeln!(out, "    if (row >= row_tiles * col_tiles) return;").unwrap();
     writeln!(out, "    uint n0 = (row % row_tiles) * TN;").unwrap();
     writeln!(out, "    uint m0 = (row / row_tiles) * TM;").unwrap();
+    writeln!(out, "    uint ti = tid % (TN / RT);").unwrap();
+    writeln!(out, "    uint tj = tid / (TN / RT);").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    uint ti = tid % (TN / RT);             // my micro-tile, row direction").unwrap();
-    writeln!(out, "    uint tj = tid / (TN / RT);             // and column direction").unwrap();
-    writeln!(out).unwrap();
-    // PAD is not cosmetic. A row of exactly BLK floats puts every row on the
-    // same threadgroup-memory bank (BLK == 32 == the bank count), and the inner
-    // product has each thread read a DIFFERENT row at the same element -- a
-    // 32-way conflict on every access, invariant to the tile size. One float of
-    // padding stride-shifts each row into its own bank.
-    writeln!(out, "    constexpr uint PAD = BLK + 1u;").unwrap();
-    writeln!(out, "    threadgroup float tgW[TN][PAD];        // dequantized weights").unwrap();
-    writeln!(out, "    threadgroup float tgX[TM][PAD];        // activations").unwrap();
+    writeln!(out, "    threadgroup float tgW[TN][KC * PAD];").unwrap();
+    writeln!(out, "    threadgroup float tgX[TM][KC * PAD];").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint K = blocks_per_row * BLK;").unwrap();
     writeln!(out, "    float acc[RT][CT];").unwrap();
     writeln!(out, "    for (uint i = 0u; i < RT; ++i) for (uint j = 0u; j < CT; ++j) acc[i][j] = 0.0f;").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    for (uint kb = 0u; kb < blocks_per_row; ++kb) {{").unwrap();
-    // Both stages are strided by the whole threadgroup, so consecutive lanes
-    // read consecutive elements of the same row -- coalesced on both operands.
-    // Stage FOUR weights per lane, not one. p0 is a byte plane, so a lane that
-    // stages a single char makes a 32-lane simdgroup fetch 32 bytes where the
-    // memory system wants 128 -- ~25% efficiency, and invariant to every tile
-    // knob, which is why three sweeps over tile size, micro-tile and
-    // threadgroup-memory traffic all came back flat.
-    writeln!(out, "        constexpr uint WQ = BLK / 4u;              // char4 units per block row").unwrap();
-    writeln!(out, "        for (uint idx = tid; idx < TN * WQ; idx += tcount) {{").unwrap();
-    writeln!(out, "            uint r = idx / WQ, q = idx % WQ, e = q * 4u;").unwrap();
-    writeln!(out, "            uint n = n0 + r;").unwrap();
-    writeln!(out, "            if (n < n_rows) {{").unwrap();
-    // The scale is per (row, block), not per element -- reading it inside this
-    // loop fetches it BLK times per row.
+    // KC blocks per synchronisation round. Two barriers per round means the
+    // barrier count is 2*ceil(blocks_per_row/KC) rather than 2*blocks_per_row --
+    // the one quantity that no other knob here can change.
+    writeln!(out, "    for (uint kb0 = 0u; kb0 < blocks_per_row; kb0 += KC) {{").unwrap();
+    // Staging is flattened across KC so the work divides evenly over the
+    // threadgroup rather than per-block, which would leave lanes idle when
+    // TN*WQ is not a multiple of tcount.
+    writeln!(out, "        for (uint idx = tid; idx < TN * WQ * KC; idx += tcount) {{").unwrap();
+    writeln!(out, "            uint kk = idx / (TN * WQ);").unwrap();
+    writeln!(out, "            uint rem = idx % (TN * WQ);").unwrap();
+    writeln!(out, "            uint r = rem / WQ, q = rem % WQ;").unwrap();
+    writeln!(out, "            uint eo = kk * PAD + q * 4u;").unwrap();
+    writeln!(out, "            uint n = n0 + r, kb = kb0 + kk;").unwrap();
+    writeln!(out, "            float4 wv = float4(0.0f);").unwrap();
+    writeln!(out, "            if (n < n_rows && kb < blocks_per_row) {{").unwrap();
     writeln!(out, "                float s = (float)p1[(ulong)n * blocks_per_row + kb];").unwrap();
     writeln!(out, "                device const char4* w4 = (device const char4*)(p0 + (ulong)n * K + kb * BLK);").unwrap();
-    writeln!(out, "                float4 wv = float4(w4[q]) * s;").unwrap();
-    writeln!(out, "                tgW[r][e+0u] = wv.x; tgW[r][e+1u] = wv.y;").unwrap();
-    writeln!(out, "                tgW[r][e+2u] = wv.z; tgW[r][e+3u] = wv.w;").unwrap();
-    writeln!(out, "            }} else {{").unwrap();
-    writeln!(out, "                tgW[r][e+0u] = 0.0f; tgW[r][e+1u] = 0.0f;").unwrap();
-    writeln!(out, "                tgW[r][e+2u] = 0.0f; tgW[r][e+3u] = 0.0f;").unwrap();
+    writeln!(out, "                wv = float4(w4[q]) * s;").unwrap();
     writeln!(out, "            }}").unwrap();
+    writeln!(out, "            tgW[r][eo+0u] = wv.x; tgW[r][eo+1u] = wv.y;").unwrap();
+    writeln!(out, "            tgW[r][eo+2u] = wv.z; tgW[r][eo+3u] = wv.w;").unwrap();
     writeln!(out, "        }}").unwrap();
-    writeln!(out, "        for (uint idx = tid; idx < TM * WQ; idx += tcount) {{").unwrap();
-    writeln!(out, "            uint c = idx / WQ, q = idx % WQ, e = q * 4u;").unwrap();
-    writeln!(out, "            uint m = m0 + c;").unwrap();
+    writeln!(out, "        for (uint idx = tid; idx < TM * WQ * KC; idx += tcount) {{").unwrap();
+    writeln!(out, "            uint kk = idx / (TM * WQ);").unwrap();
+    writeln!(out, "            uint rem = idx % (TM * WQ);").unwrap();
+    writeln!(out, "            uint c = rem / WQ, q = rem % WQ;").unwrap();
+    writeln!(out, "            uint eo = kk * PAD + q * 4u;").unwrap();
+    writeln!(out, "            uint m = m0 + c, kb = kb0 + kk;").unwrap();
     writeln!(out, "            float4 xv = float4(0.0f);").unwrap();
-    writeln!(out, "            if (m < n_cols) {{").unwrap();
+    writeln!(out, "            if (m < n_cols && kb < blocks_per_row) {{").unwrap();
     writeln!(out, "                device const float4* a4 = (device const float4*)(p2 + (ulong)m * K + kb * BLK);").unwrap();
     writeln!(out, "                xv = a4[q];").unwrap();
     writeln!(out, "            }}").unwrap();
-    writeln!(out, "            tgX[c][e+0u] = xv.x; tgX[c][e+1u] = xv.y;").unwrap();
-    writeln!(out, "            tgX[c][e+2u] = xv.z; tgX[c][e+3u] = xv.w;").unwrap();
+    writeln!(out, "            tgX[c][eo+0u] = xv.x; tgX[c][eo+1u] = xv.y;").unwrap();
+    writeln!(out, "            tgX[c][eo+2u] = xv.z; tgX[c][eo+3u] = xv.w;").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    // RT + CT reads from the stage feed RT * CT multiply-adds. That ratio is
-    // the whole reason for the micro-tile.
-    writeln!(out, "        for (uint e = 0u; e < BLK; ++e) {{").unwrap();
-    writeln!(out, "            float wf[RT], xf[CT];").unwrap();
-    writeln!(out, "            for (uint i = 0u; i < RT; ++i) wf[i] = tgW[ti * RT + i][e];").unwrap();
-    writeln!(out, "            for (uint j = 0u; j < CT; ++j) xf[j] = tgX[tj * CT + j][e];").unwrap();
-    writeln!(out, "            for (uint i = 0u; i < RT; ++i)").unwrap();
-    writeln!(out, "                for (uint j = 0u; j < CT; ++j) acc[i][j] += wf[i] * xf[j];").unwrap();
+    writeln!(out, "        for (uint kk = 0u; kk < KC; ++kk) {{").unwrap();
+    writeln!(out, "            for (uint e = 0u; e < BLK; ++e) {{").unwrap();
+    writeln!(out, "                uint off = kk * PAD + e;").unwrap();
+    writeln!(out, "                float wf[RT], xf[CT];").unwrap();
+    writeln!(out, "                for (uint i = 0u; i < RT; ++i) wf[i] = tgW[ti * RT + i][off];").unwrap();
+    writeln!(out, "                for (uint j = 0u; j < CT; ++j) xf[j] = tgX[tj * CT + j][off];").unwrap();
+    writeln!(out, "                for (uint i = 0u; i < RT; ++i)").unwrap();
+    writeln!(out, "                    for (uint j = 0u; j < CT; ++j) acc[i][j] += wf[i] * xf[j];").unwrap();
+    writeln!(out, "            }}").unwrap();
     writeln!(out, "        }}").unwrap();
-    // The second barrier is not optional: without it a fast thread can begin
-    // overwriting the staging buffers for block kb+1 while a slow one is still
-    // reading block kb.
     writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
@@ -15953,24 +15959,28 @@ module {
         assert!(msl.contains("kernel void mulmm_q8_0_fused"), "{}", msl);
 
         // Both operands staged, so a weight load serves the whole tile.
-        assert!(msl.contains("threadgroup float tgW[TN][PAD]")
-             && msl.contains("threadgroup float tgX[TM][PAD]"),
+        assert!(msl.contains("threadgroup float tgW[TN][KC * PAD]")
+             && msl.contains("threadgroup float tgX[TM][KC * PAD]"),
             "both operands must be staged in threadgroup memory:\n{}", msl);
         // The pad is load-bearing: a row of exactly BLK floats puts every row
         // on the same bank, and the inner product reads a different row per
         // thread -- a 32-way conflict invariant to the tile size. Measured 2.5x
         // at n=8 purely from this one word.
-        assert!(msl.contains("uint PAD = BLK + 1u;"),
+        assert!(msl.contains("constexpr uint PAD = BLK + 1u;"),
             "the stage must be padded against bank conflicts:\n{}", msl);
 
         // TWO barriers per K-block. With only the first, a fast thread can
         // overwrite the staging buffers for the next block while a slow one is
         // still reading this one -- a race that shows up as rare wrong answers.
         assert_eq!(msl.matches("threadgroup_barrier").count(), 2,
-            "one barrier after staging and one after consuming:\n{}", msl);
+            "one barrier after staging and one after consuming, per ROUND:\n{}", msl);
+        // KC blocks per round: the barrier count is 2*ceil(bpr/KC), and KC is
+        // the only knob that changes it.
+        assert!(msl.contains("kb0 += KC") && msl.contains("for (uint kk = 0u; kk < KC; ++kk)"),
+            "the round must cover KC blocks:\n{}", msl);
 
         // Weights are dequantized once on the way in, not per output element.
-        assert!(msl.contains("float4 wv = float4(w4[q]) * s;"),
+        assert!(msl.contains("wv = float4(w4[q]) * s;"),
             "weights must be dequantized into the stage, four at a time:\n{}", msl);
         // One byte per lane makes a simdgroup fetch 32 B where the memory
         // system wants 128 -- and it is invariant to every tile knob.
