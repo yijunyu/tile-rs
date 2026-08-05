@@ -15195,7 +15195,44 @@ module {
         }
     }
 
-    /// Dump nibble-unpack for device verification.
+    /// A composed mat-vec chain does NOT lower to a single kernel here, and
+    /// this pins that limit so it cannot be rediscovered by accident.
+    ///
+    /// This is the central constraint on DSL-authored quant kernels: the
+    /// emitter selects ONE KernelType per kernel, so a tile_std program built
+    /// from several ops (load -> dequant -> broadcast -> mul -> reduce) has no
+    /// fused lowering. Running it would mean one dispatch and one round trip
+    /// through memory per op — correct, but nothing like ggml's single fused
+    /// mul_mv. Closing this needs either real fusion in the emitter or one
+    /// fused KernelType per complete kernel (which is what hand-written
+    /// emitters already do).
+    #[test]
+    fn test_msl_composed_matvec_chain_has_no_fused_lowering() {
+        let mlir = r#"
+module {
+  llvm.func @mulmv(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %n = llvm.mlir.constant(32 : i32) : i32
+    %w = llvm.call @__tile_load_i8(%arg0, %one, %n) : (!llvm.ptr<1>, i32, i32) -> i32
+    %d = llvm.call @__tile_dequantize_i8_f32(%w, %one, %n) : (i32, i32, i32) -> i32
+    %sc = llvm.call @__tile_load_f32(%arg1, %one, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %sb = llvm.call @__tile_broadcast_row_f32(%sc, %one, %n) : (i32, i32, i32) -> i32
+    %ws = llvm.call @__tile_mul_f32(%d, %sb, %one, %n) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %ws, %one, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let err = convert_mlir_to_msl(mlir)
+            .expect_err("a composed chain must be rejected, not silently truncated");
+        assert!(err.contains("chains 3 compute intrinsics"),
+            "must name how many ops could not be folded:\n{}", err);
+        assert!(err.contains("silently dropped"),
+            "must explain the hazard it is preventing:\n{}", err);
+    }
+
+    /// Dump nibble-unpack for device verification.    /// Dump nibble-unpack for device verification.
     #[test]
     fn dump_unpack_nibbles_msl() {
         let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
