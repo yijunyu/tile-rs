@@ -436,6 +436,11 @@ fn reject_unfusable_compute_chains(module: &MlirModule) -> Result<(), String> {
         if !func.is_entry {
             continue;
         }
+        // Count CALLS, not distinct names. The emitter folds a body down to one
+        // compute op, so two calls to the same intrinsic (`mul; mul`) drop one
+        // just as surely as two different ones — deduplicating first would let
+        // exactly that case through the guard that exists to catch it.
+        let mut calls: Vec<&str> = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for line in &func.body_lines {
             let Some(at) = line.find("@__tile_") else { continue };
@@ -445,22 +450,23 @@ fn reject_unfusable_compute_chains(module: &MlirModule) -> Result<(), String> {
             if is_structural_intrinsic(name) {
                 continue;
             }
+            calls.push(name);
             if !seen.contains(&name) {
                 seen.push(name);
             }
         }
-        if seen.len() == 2 && FUSED_COMPUTE_PAIRS.contains(&(seen[0], seen[1])) {
+        if calls.len() == 2 && seen.len() == 2 && FUSED_COMPUTE_PAIRS.contains(&(seen[0], seen[1])) {
             continue;
         }
-        if seen.len() > 1 {
+        if calls.len() > 1 {
             return Err(format!(
                 "kernel @{} chains {} compute intrinsics ({}) that this emitter \
                  cannot fold into one body; all but one would be silently \
                  dropped. Use a fused tile_std op, split the kernel, or add the \
                  pair to FUSED_COMPUTE_PAIRS with a fused KernelType.",
                 func.name,
-                seen.len(),
-                seen.join(", ")
+                calls.len(),
+                calls.join(", ")
             ));
         }
     }
@@ -543,7 +549,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         ctx.ptr_aliases.insert(arg.name.clone(), format!("p{}", i));
     }
 
-    classify_body(&func.body_lines, &mut ctx);
+    classify_body(&func.body_lines, &mut ctx)?;
 
     // Batched (M=8) non-matmul kernels have exotic signatures (2D/3D grid position
     // attributes, in-place buffers, many params) that the generic signature machinery
@@ -953,6 +959,11 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             else if is_matvec_q4k && i == 0 { "uchar" }
             // nibble unpack reads PACKED BYTES and writes f32 halves
             else if matches!(ctx.kernel_type, KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi) && i == 0 { "uchar" }
+            // The i8 side of quantize/dequantize is stored as real signed bytes,
+            // which is what a quantized checkpoint actually holds. Typing it as
+            // float instead made the pair unable to address any weight buffer.
+            else if ctx.kernel_type == KernelType::Dequantize && i == 0 { "char" }
+            else if ctx.kernel_type == KernelType::Quantize && i == 2 { "char" }
             else if is_int_ids_p1 && i == 1 { "int" }
             else if is_int_ids_p0 && i == 0 { "int" }
             else if is_all_int_bufs { "int" }
@@ -2730,7 +2741,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
 // Body classifier (identical logic to mlir_to_spirv — kept in sync)
 // ---------------------------------------------------------------------------
 
-fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
+fn classify_body(body_lines: &[String], ctx: &mut MslContext) -> Result<(), String> {
     let mut store_map: HashMap<String, String> = HashMap::new();
 
     for line in body_lines {
@@ -2879,6 +2890,9 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_div_f32"        | "__tile_div_f16"        => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Div; } }
                 "__tile_reduce_max_f32" | "__tile_reduce_max_f16" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::ReduceMax; } }
                 "__tile_sum_rows_f32"   => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::SumRows; } }
+                // tile_std's reduce-sum is a row sum: Tile<R,C> -> Tile<R,1>,
+                // the same contract SumRows already implements.
+                "__tile_reduce_sum_f32" | "__tile_reduce_sum_f16" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::SumRows; } }
                 "__tile_repeat_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Repeat; } }
                 "__tile_get_rows_f32"   => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::GetRows; } }
                 "__tile_set_rows_f32"   => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::SetRows; } }
@@ -3127,10 +3141,23 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_rope_prefill_f32"             => { ctx.kernel_type = KernelType::RopePrefill; }
                 "__tile_kv_cache_update_prefill_f32"  => { ctx.kernel_type = KernelType::KvCacheUpdatePrefill; }
                 "__tile_attention_prefill_f32"         => { ctx.kernel_type = KernelType::AttentionPrefill; }
-                _ => {}
+                // An intrinsic with no arm here would leave kernel_type at its
+                // Copy default and emit a kernel that copies its input — a
+                // wrong answer that compiles and runs. Refuse instead.
+                other => {
+                    if other.starts_with("__tile_") && !is_structural_intrinsic(other) {
+                        return Err(format!(
+                            "intrinsic {} has no MSL lowering; emitting it would \
+                             silently produce a copy kernel. Add a KernelType arm \
+                             for it, or lower the op on a backend that supports it.",
+                            other
+                        ));
+                    }
+                }
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3179,22 +3206,22 @@ fn emit_softmax_msl(out: &mut String, msl_type: &str) {
 /// Element-wise binary op: dispatched with one thread per element (gid-based).
 /// No batch dimension needed for pointwise ops.
 fn emit_binop_msl(out: &mut String, op: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) p2[gid] = p0[gid] {} p1[gid];", op).unwrap();
 }
 
 fn emit_unary_msl(out: &mut String, func_name: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) p1[gid] = {}(p0[gid]);", func_name).unwrap();
 }
 
 fn emit_scale_msl(out: &mut String, _msl_type: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) p1[gid] = p0[gid] * scale_val;").unwrap();
 }
 
 fn emit_copy_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) p1[gid] = p0[gid];").unwrap();
 }
 
@@ -3336,7 +3363,7 @@ fn emit_scatter_add_msl(out: &mut String) {
 /// Buffers: p0=condition (0/1 float), p1=true branch, p2=false branch, p3=output.
 /// Used for L1-smooth loss: `where(|diff| < 1.0, 0.5*diff², |diff| - 0.5)`.
 fn emit_where_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements)").unwrap();
     writeln!(out, "        p3[gid] = (p0[gid] != 0.0f) ? p1[gid] : p2[gid];").unwrap();
 }
@@ -3354,7 +3381,7 @@ fn emit_transpose_msl(out: &mut String) {
 
 /// Sigmoid: p1[i] = 1.0f / (1.0f + exp(-p0[i])).
 fn emit_sigmoid_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        p1[gid] = 1.0f / (1.0f + exp(-p0[gid]));").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -3362,7 +3389,7 @@ fn emit_sigmoid_msl(out: &mut String) {
 
 /// Softplus: log(1+exp(x)). For x>20 falls through to identity to avoid exp overflow.
 fn emit_softplus_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        float x = p0[gid];").unwrap();
     writeln!(out, "        p1[gid] = (x > 20.0f) ? x : log(1.0f + exp(x));").unwrap();
@@ -3371,14 +3398,14 @@ fn emit_softplus_msl(out: &mut String) {
 
 /// Clamp: p1[i] = clamp(p0[i], clamp_min, clamp_max).
 fn emit_clamp_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements)").unwrap();
     writeln!(out, "        p1[gid] = clamp(p0[gid], clamp_min, clamp_max);").unwrap();
 }
 
 /// Cast: p1[i] = target_type(p0[i]).
 fn emit_cast_msl(out: &mut String, target_type: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements)").unwrap();
     writeln!(out, "        p1[gid] = {}(p0[gid]);", target_type).unwrap();
 }
@@ -3473,7 +3500,7 @@ fn emit_set_rows_msl(out: &mut String) {
 /// Buffers: p0=first, p1=second, p2=output.
 /// Params: num_elements (total = len_a + len_b), len_a.
 fn emit_concat_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        if (gid < len_a)").unwrap();
     writeln!(out, "            p2[gid] = p0[gid];").unwrap();
@@ -3486,7 +3513,7 @@ fn emit_concat_msl(out: &mut String) {
 /// Buffers: p0=values, p1=indices (float->uint), p2=output.
 /// Params: num_elements, stride.
 fn emit_scatter_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        uint idx = (uint)p1[gid / stride];").unwrap();
     writeln!(out, "        uint col = gid % stride;").unwrap();
@@ -3498,7 +3525,7 @@ fn emit_scatter_msl(out: &mut String) {
 /// Buffers: p0=values, p1=indices (float->uint), p2=output.
 /// Params: num_elements, stride.
 fn emit_gather_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        uint idx = (uint)p1[gid / stride];").unwrap();
     writeln!(out, "        uint col = gid % stride;").unwrap();
@@ -3720,14 +3747,14 @@ fn emit_quantize_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    if (gid >= num_elements) return;").unwrap();
     writeln!(out, "    {} scale = p1[0];", msl_type).unwrap();
     writeln!(out, "    {} q = round(p0[gid] / scale);", msl_type).unwrap();
-    writeln!(out, "    p2[gid] = clamp(q, ({}) -128.0, ({}) 127.0);", msl_type, msl_type).unwrap();
+    writeln!(out, "    p2[gid] = (char)clamp(q, ({}) -128.0, ({}) 127.0);", msl_type, msl_type).unwrap();
 }
 
 fn emit_dequantize_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid >= num_elements) return;").unwrap();
     writeln!(out, "    {} scale = p1[0];", msl_type).unwrap();
-    writeln!(out, "    p2[gid] = p0[gid] * scale;").unwrap();
+    writeln!(out, "    p2[gid] = ({})p0[gid] * scale;", msl_type).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -11570,7 +11597,7 @@ fn emit_causal_mask_msl(out: &mut String, msl_type: &str) {
 /// SiLU activation: out[i] = x[i] / (1 + exp(-x[i]))
 /// Equivalent to x * sigmoid(x), used in gated MLP (Qwen2, LLaMA, etc.)
 fn emit_silu_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        float v = p0[gid];").unwrap();
     writeln!(out, "        p1[gid] = v / (1.0f + exp(-v));").unwrap();
@@ -11581,7 +11608,7 @@ fn emit_silu_msl(out: &mut String) {
 /// Combines SiLU activation with element-wise multiply for gated MLP.
 /// Saves one kernel dispatch and one intermediate buffer vs separate ops.
 fn emit_silu_mul_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        float v = p0[gid];").unwrap();
     writeln!(out, "        p2[gid] = (v / (1.0f + exp(-v))) * p1[gid];").unwrap();
@@ -12481,7 +12508,7 @@ fn emit_attention_prefill_msl(out: &mut String) {
 /// BF16→F32 cast: reinterpret bfloat16 (stored as uint16) as float32.
 /// bfloat16 has the same exponent bits as float32, just shift left 16.
 fn emit_cast_bf16_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(out, "        uint bits = uint(as_type<ushort>(p0[gid])) << 16;").unwrap();
     writeln!(out, "        p1[gid] = as_type<float>(bits);").unwrap();
@@ -13311,7 +13338,7 @@ module {
     ^bb0:
     %r = llvm.mlir.constant(1 : i32) : i32
     %c = llvm.mlir.constant(32 : i32) : i32
-    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %a = llvm.call @__tile_load_i8(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
     %s = llvm.call @__tile_load_f32(%arg1, %r, %r) : (!llvm.ptr<1>, i32, i32) -> i32
     %res = llvm.call @__tile_dequantize_i8_f32(%a, %a, %s, %r, %c) : (i32, i32, i32, i32, i32) -> i32
     llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
@@ -13321,6 +13348,10 @@ module {
 "#;
         let msl = convert_mlir_to_msl(mlir).unwrap();
         assert!(msl.contains("* scale"), "dequantize must multiply by scale:\n{}", msl);
+        // The quantized source must be addressable as bytes; typing it float
+        // made the kernel read four weight bytes per element and scale garbage.
+        assert!(msl.contains("device const  char* p0"),
+            "dequantize source must be a byte buffer:\n{}", msl);
     }
 
     // ── Phase 6 MTP tests ──────────────────────────────────────────────────
@@ -14500,7 +14531,7 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_binop_msl() {
-        check(|o| emit_binop_msl(o, "+"), "uint gid = base + tid;", "emit_binop_msl");
+        check(|o| emit_binop_msl(o, "+"), "uint gid = row * tcount + tid;", "emit_binop_msl");
     }
     #[test]
     fn t_emit_cast_bf16_msl() {
@@ -14508,7 +14539,7 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_cast_msl() {
-        check(|o| emit_cast_msl(o, "half"), "uint gid = base + tid;", "emit_cast_msl");
+        check(|o| emit_cast_msl(o, "half"), "uint gid = row * tcount + tid;", "emit_cast_msl");
     }
     #[test]
     fn t_emit_causal_mask_msl() {
@@ -14524,11 +14555,11 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_concat_msl() {
-        check(|o| emit_concat_msl(o), "uint gid = base + tid;", "emit_concat_msl");
+        check(|o| emit_concat_msl(o), "uint gid = row * tcount + tid;", "emit_concat_msl");
     }
     #[test]
     fn t_emit_copy_msl() {
-        check(|o| emit_copy_msl(o), "uint gid = base + tid;", "emit_copy_msl");
+        check(|o| emit_copy_msl(o), "uint gid = row * tcount + tid;", "emit_copy_msl");
     }
     #[test]
     fn t_emit_cpy_t_t_msl() {
@@ -15096,7 +15127,7 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_unary_msl() {
-        check(|o| emit_unary_msl(o, "exp"), "uint gid = base + tid;", "emit_unary_msl");
+        check(|o| emit_unary_msl(o, "exp"), "uint gid = row * tcount + tid;", "emit_unary_msl");
     }
     #[test]
     fn t_emit_unary_op_disp_4_msl() {
@@ -15195,6 +15226,259 @@ module {
         }
     }
 
+    /// The mat-vec chain that has no fused lowering must produce runnable
+    /// kernels once decomposed — this is the whole point of the tier.
+    #[test]
+    fn test_lower_composed_matvec_chain() {
+        let kernels = lower_composed_chain(MATVEC_CHAIN_MLIR)
+            .expect("chain must lower")
+            .expect("3 compute ops must produce 3 kernels");
+        assert_eq!(kernels.len(), 3, "one kernel per compute op");
+
+        for k in &kernels {
+            assert!(k.msl.contains("kernel void"),
+                "step {} produced no Metal entry point:\n{}", k.name, k.msl);
+            assert!(k.msl.contains(&k.name),
+                "entry point must carry the step name:\n{}", k.msl);
+        }
+
+        // The reduction collapses the scanned axis: 1x32 in, 1x1 out. Carrying
+        // the operand extent through as the result extent would make the caller
+        // read 32 floats where the chain only wrote one.
+        let red = kernels.last().unwrap();
+        assert_eq!((red.rows, red.cols), (1, 1),
+            "reduce must report a collapsed extent: {:?}", red);
+
+        // Binds are inputs-then-output, so the caller can set buffers in order.
+        assert_eq!(kernels[0].binds, vec![0, 1, 4], "dequant: both planes in, scratch out");
+        assert_eq!(kernels[1].binds, vec![4, 2, 5], "product consumes arg2");
+        assert_eq!(kernels[2].binds, vec![5, 3], "reduce writes arg3 directly");
+    }
+
+    /// Dump the decomposed chain for the device A/B against a ggml reference.
+    #[test]
+    fn dump_composed_matvec_chain_msl() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let kernels = lower_composed_chain(MATVEC_CHAIN_MLIR).unwrap().unwrap();
+        let mut manifest = String::new();
+        for k in &kernels {
+            std::fs::write(format!("{}/{}.metal", dir, k.name), &k.msl).unwrap();
+            manifest.push_str(&format!(
+                "{} {} {} {}\n",
+                k.name,
+                k.rows,
+                k.cols,
+                k.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+            ));
+        }
+        std::fs::write(format!("{}/chain.manifest", dir), manifest).unwrap();
+    }
+
+    /// The Q8_0 `mul_mv` chain over a whole row: R blocks of 32, in the planar
+    /// layout a repack buffer type provides.
+    ///
+    /// arg0 quants (R x 32 int8), arg1 a 1.0 scale so dequantize widens the
+    /// bytes without scaling, arg2 the per-block scales (R x 1), arg3 the
+    /// activations (R x 32), arg4 the per-block partial sums (R x 1).
+    ///
+    /// Per-block scales are why this needs broadcast_row: dequantize applies a
+    /// single scalar scale, which only covers one block. Five compute ops.
+    const MATVEC_ROW_CHAIN_MLIR: &str = r#"
+module {
+  llvm.func @mulmv_row(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %r = llvm.mlir.constant(8 : i32) : i32
+    %c = llvm.mlir.constant(32 : i32) : i32
+    %q = llvm.call @__tile_load_i8(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %o1 = llvm.call @__tile_load_f32(%arg1, %one, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %wf = llvm.call @__tile_dequantize_i8_f32(%q, %q, %o1, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+    %sc = llvm.call @__tile_load_f32(%arg2, %r, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %sb = llvm.call @__tile_broadcast_row_f32(%sc, %sc, %r, %c) : (i32, i32, i32, i32) -> i32
+    %ws = llvm.call @__tile_mul_f32(%wf, %wf, %sb, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+    %xb = llvm.call @__tile_load_f32(%arg3, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %pr = llvm.call @__tile_mul_f32(%ws, %ws, %xb, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+    %rs = llvm.call @__tile_reduce_sum_f32(%pr, %pr, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg4, %rs, %r, %one) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+
+    /// The row chain must decompose and lower, with each step's dispatch and
+    /// uniforms resolved so a caller can run the sequence without guessing.
+    #[test]
+    fn test_lower_composed_row_chain() {
+        let kernels = lower_composed_chain(MATVEC_ROW_CHAIN_MLIR)
+            .expect("row chain must lower")
+            .expect("5 compute ops must produce 5 kernels");
+        assert_eq!(kernels.len(), 5, "one kernel per compute op");
+
+        // Scratch slots start past the five arguments, and the last step writes
+        // the output argument directly.
+        assert_eq!(kernels[0].binds, vec![0, 1, 5], "widen: quants + 1.0 -> scratch");
+        assert_eq!(kernels[1].binds, vec![2, 6], "broadcast: scales -> scratch");
+        assert_eq!(kernels[2].binds, vec![5, 6, 7], "apply scales");
+        assert_eq!(kernels[3].binds, vec![7, 3, 8], "multiply by activations");
+        assert_eq!(kernels[4].binds, vec![8, 4], "reduce writes arg4");
+
+        // The reduction is per row: 8 threadgroups, each summing 32 columns.
+        // A flat dispatch here would sum all 256 elements into one output.
+        let red = kernels.last().unwrap();
+        assert_eq!(red.threadgroups, 8, "one threadgroup per block: {:?}", red);
+        assert_eq!(red.uniforms, vec!["num_elements"], "{:?}", red);
+        assert_eq!(red.uniform_values, vec![32],
+            "num_elements is the ROW WIDTH for a row-wise kernel: {:?}", red);
+
+        // The pointwise steps cover the flat 8x32 extent in one dispatch.
+        assert_eq!(kernels[2].uniform_values, vec![256],
+            "a pointwise step covers every element: {:?}", kernels[2]);
+        assert_eq!(
+            (kernels[2].threadgroups, kernels[2].threads_per_threadgroup),
+            (1, 256),
+            "256 elements fit one threadgroup: {:?}", kernels[2]
+        );
+        assert_eq!(red.threads_per_threadgroup, 32,
+            "a row-wise kernel spans its row width: {:?}", red);
+
+        // broadcast_row takes rows and cols separately, and its extent is the
+        // RESULT shape, not its one-column operand.
+        assert_eq!(kernels[1].uniforms, vec!["rows", "cols"], "{:?}", kernels[1]);
+        assert_eq!(kernels[1].uniform_values, vec![8, 32], "{:?}", kernels[1]);
+    }
+
+    /// Dump the row chain for the device A/B against a ggml Q8_0 reference.
+    #[test]
+    fn dump_composed_row_chain_msl() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let kernels = lower_composed_chain(MATVEC_ROW_CHAIN_MLIR).unwrap().unwrap();
+        let mut manifest = String::new();
+        for k in &kernels {
+            std::fs::write(format!("{}/{}.metal", dir, k.name), &k.msl).unwrap();
+            manifest.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                k.name,
+                k.binds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","),
+                k.uniform_values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                k.threadgroups,
+                k.threads_per_threadgroup,
+            ));
+        }
+        std::fs::write(format!("{}/row.manifest", dir), manifest).unwrap();
+    }
+
+    /// The Q8_0 `mul_mv` inner chain over one 32-element block, in the layout a
+    /// repack buffer type provides: a plane of `int8` quants (arg0) and a plane
+    /// of block scales (arg1), against activations (arg2).
+    ///
+    /// Dequantize both widens the bytes and applies the block scale, so no
+    /// separate broadcast is needed here — the scale is uniform within a block.
+    /// Three compute ops, which is already more than any single kernel folds.
+    const MATVEC_CHAIN_MLIR: &str = r#"
+module {
+  llvm.func @mulmv(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %n = llvm.mlir.constant(32 : i32) : i32
+    %q = llvm.call @__tile_load_i8(%arg0, %one, %n) : (!llvm.ptr<1>, i32, i32) -> i32
+    %sc = llvm.call @__tile_load_f32(%arg1, %one, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %ws = llvm.call @__tile_dequantize_i8_f32(%q, %q, %sc, %one, %n) : (i32, i32, i32, i32, i32) -> i32
+    %xb = llvm.call @__tile_load_f32(%arg2, %one, %n) : (!llvm.ptr<1>, i32, i32) -> i32
+    %pr = llvm.call @__tile_mul_f32(%ws, %ws, %xb, %one, %n) : (i32, i32, i32, i32, i32) -> i32
+    %rs = llvm.call @__tile_reduce_sum_f32(%pr, %pr, %one, %n) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %rs, %one, %one) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+
+    /// Two calls to the SAME compute intrinsic are still a chain the emitter
+    /// cannot fold. Counting distinct names instead of calls let this through
+    /// and silently dropped one of the multiplies.
+    #[test]
+    fn test_msl_repeated_compute_op_is_still_rejected() {
+        let mlir = r#"
+module {
+  llvm.func @twomul(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(32 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %m1 = llvm.call @__tile_mul_f32(%a, %a, %b, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+    %m2 = llvm.call @__tile_mul_f32(%m1, %m1, %b, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %m2, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let err = convert_mlir_to_msl(mlir)
+            .expect_err("two multiplies cannot fold into one body either");
+        assert!(err.contains("chains 2 compute intrinsics"),
+            "must count calls, not distinct names:\n{}", err);
+    }
+
+    /// Tier C: the mat-vec chain that has no fused lowering must still
+    /// decompose into ordered single-op steps, with intermediates threaded
+    /// through buffer slots so each step can run as its own kernel.
+    #[test]
+    fn test_plan_composed_matvec_chain() {
+        let mlir = MATVEC_CHAIN_MLIR;
+        let steps = plan_composed_chain(mlir)
+            .expect("chain must plan")
+            .expect("3 compute ops must decompose, not collapse");
+        let ops: Vec<&str> = steps.iter().map(|s| s.op.as_str()).collect();
+        assert_eq!(ops, vec![
+            "__tile_dequantize_i8_f32",
+            "__tile_mul_f32",
+            "__tile_reduce_sum_f32",
+        ], "one step per compute op, in source order");
+
+        // Arguments keep the slot the caller binds them at, so the quant plane
+        // (arg0) and the scale plane (arg1) resolve to slots 0 and 1.
+        assert_eq!(steps[0].inputs, vec![0, 1], "dequant reads both planes: {:?}", steps[0]);
+        assert_eq!(steps[1].inputs, vec![steps[0].output, 2],
+            "the product consumes the dequantized row and arg2: {:?}", steps);
+        assert_eq!(steps[2].inputs, vec![steps[1].output],
+            "reduce consumes the product: {:?}", steps);
+
+        // The final step writes straight into the output argument rather than a
+        // scratch slot the caller would then have to copy out of.
+        assert_eq!(steps[2].output, 3, "last step must target arg3: {:?}", steps);
+
+        // Operand 0 is the `dst` hint, so it must not be counted as an input,
+        // and rows/cols are the only non-buffer operands left.
+        assert_eq!(steps[0].shape, vec!["%one", "%n"],
+            "dequant carries only rows/cols as scalars: {:?}", steps[0]);
+
+        // every intermediate gets its own slot, so no step overwrites a live value
+        let outs: Vec<usize> = steps.iter().map(|s| s.output).collect();
+        let mut uniq = outs.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), outs.len(), "outputs must not alias: {:?}", outs);
+    }
+
+    /// A single-op kernel needs no decomposition and must say so.
+    #[test]
+    fn test_plan_composed_chain_declines_single_op() {
+        let mlir = r#"
+module {
+  llvm.func @one(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(4 : i32) : i32
+    %c = llvm.mlir.constant(16 : i32) : i32
+    %s = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %d = llvm.call @__tile_silu_f32(%s, %r, %c) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %d, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        assert_eq!(plan_composed_chain(mlir).unwrap(), None,
+            "one compute op already lowers directly");
+    }
+
     /// A composed mat-vec chain does NOT lower to a single kernel here, and
     /// this pins that limit so it cannot be rediscovered by accident.
     ///
@@ -15208,22 +15492,7 @@ module {
     /// emitters already do).
     #[test]
     fn test_msl_composed_matvec_chain_has_no_fused_lowering() {
-        let mlir = r#"
-module {
-  llvm.func @mulmv(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
-    ^bb0:
-    %one = llvm.mlir.constant(1 : i32) : i32
-    %n = llvm.mlir.constant(32 : i32) : i32
-    %w = llvm.call @__tile_load_i8(%arg0, %one, %n) : (!llvm.ptr<1>, i32, i32) -> i32
-    %d = llvm.call @__tile_dequantize_i8_f32(%w, %one, %n) : (i32, i32, i32) -> i32
-    %sc = llvm.call @__tile_load_f32(%arg1, %one, %one) : (!llvm.ptr<1>, i32, i32) -> i32
-    %sb = llvm.call @__tile_broadcast_row_f32(%sc, %one, %n) : (i32, i32, i32) -> i32
-    %ws = llvm.call @__tile_mul_f32(%d, %sb, %one, %n) : (i32, i32, i32, i32) -> i32
-    llvm.call @__tile_store_f32(%arg3, %ws, %one, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
-}
-"#;
+        let mlir = MATVEC_CHAIN_MLIR;
         let err = convert_mlir_to_msl(mlir)
             .expect_err("a composed chain must be rejected, not silently truncated");
         assert!(err.contains("chains 3 compute intrinsics"),
@@ -15232,7 +15501,7 @@ module {
             "must explain the hazard it is preventing:\n{}", err);
     }
 
-    /// Dump nibble-unpack for device verification.    /// Dump nibble-unpack for device verification.
+    /// Dump nibble-unpack for device verification.
     #[test]
     fn dump_unpack_nibbles_msl() {
         let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
@@ -15307,4 +15576,486 @@ module {{
         std::fs::write(format!("{}/causal.metal", dir), causal).unwrap();
         std::fs::write(format!("{}/plain.metal", dir), plain).unwrap();
     }
+}
+
+// =============================================================================
+// Tier C — composed chains as a KERNEL SEQUENCE
+// =============================================================================
+//
+// This emitter selects one KernelType per kernel, so a tile_std program built
+// from several ops has no fused lowering (see
+// `test_msl_composed_matvec_chain_has_no_fused_lowering`). Rather than leave
+// such programs unrunnable, decompose the chain into one single-op function
+// per compute intrinsic, each reading its inputs from global memory and
+// writing its result back, then lower each through the UNCHANGED emitter.
+//
+// The result is correct but unfused: one dispatch and one memory round trip
+// per op. Its value is not speed — it is that a composed template can RUN,
+// which makes it the differential-testing oracle for the fused tiers. A fused
+// kernel and its composed form come from the same source, so they can be
+// compared on the same hardware.
+
+/// One step of a decomposed chain: a self-contained single-op MLIR module and
+/// the buffer indices it reads and writes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainStep {
+    /// Intrinsic this step performs, e.g. `__tile_mul_f32`.
+    pub op: String,
+    /// Buffer slots read, in operand order. Slot 0.. are the kernel's own
+    /// arguments; later slots are intermediates.
+    pub inputs: Vec<usize>,
+    /// Buffer slot written.
+    pub output: usize,
+    /// Trailing shape arguments carried through from the original call.
+    pub shape: Vec<String>,
+    /// Every operand token of the original call, verbatim. Synthesis re-emits
+    /// the call from these rather than reconstructing a per-op ABI from the
+    /// intrinsic name — operand counts and the meaning of the leading `dst`
+    /// vary across intrinsics, and guessing wrong produces a kernel that
+    /// compiles and computes the wrong thing.
+    pub raw_args: Vec<String>,
+    /// The call's type signature, verbatim, e.g. `(i32, i32, f32, i32, i32) -> i32`.
+    pub raw_sig: String,
+    /// Positions within `raw_args` that carry `inputs`, parallel to `inputs`.
+    pub input_pos: Vec<usize>,
+    /// `(elem, rows, cols)` per input, parallel to `inputs`.
+    pub in_meta: Vec<(String, usize, usize)>,
+    /// `(elem, rows, cols)` of the value this step writes.
+    pub out_meta: (String, usize, usize),
+}
+
+/// A decomposed chain lowered to runnable kernels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainKernel {
+    /// Entry point name in `msl`.
+    pub name: String,
+    /// Generated Metal source for this one step.
+    pub msl: String,
+    /// Buffer slots to bind, in kernel argument order: inputs then the output.
+    pub binds: Vec<usize>,
+    /// Uniform names the emitted kernel declares, in buffer order, starting
+    /// after the data buffers. The caller must supply each one.
+    pub uniforms: Vec<String>,
+    /// Value for each entry of `uniforms`, in the same order. Resolved here
+    /// rather than by the caller: `num_elements` means the row width to a
+    /// row-wise kernel and the total element count to a pointwise one, and
+    /// getting that backwards silently reduces over the wrong extent.
+    pub uniform_values: Vec<usize>,
+    /// Threadgroup count to dispatch. Row-wise kernels want one per row;
+    /// pointwise kernels cover the flat extent.
+    pub threadgroups: usize,
+    /// Threads per threadgroup. Pointwise kernels index `row * tcount + tid`,
+    /// so this and `threadgroups` must together span the extent — a single
+    /// threadgroup silently covers only the first 1024 elements.
+    pub threads_per_threadgroup: usize,
+    /// Rows and columns this step covers, for the dispatch extent.
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Element type a slot holds, derived from an intrinsic name's trailing token.
+fn chain_elem_of(op: &str) -> String {
+    for t in ["f32", "f16", "i8", "i32", "u32"] {
+        if op.ends_with(t) {
+            return t.to_string();
+        }
+    }
+    "f32".to_string()
+}
+
+/// Decompose a composed chain into ordered single-op steps.
+///
+/// Returns `Ok(None)` when the function holds at most one compute intrinsic —
+/// it already lowers directly and needs no decomposition.
+pub fn plan_composed_chain(mlir_text: &str) -> Result<Option<Vec<ChainStep>>, String> {
+    let module = parse_module(mlir_text)?;
+    let func = module
+        .functions
+        .iter()
+        .find(|f| f.is_entry && !f.body_lines.is_empty())
+        .ok_or("plan_composed_chain: no entry function")?;
+
+    // ssa name -> buffer slot. Kernel arguments are pre-assigned in declaration
+    // order so a slot index IS the index the caller already binds that buffer
+    // at; intermediates then take fresh slots past the last argument. Handing
+    // slots out in first-seen order instead would renumber arguments by the
+    // order their loads happen to appear, which is not what the caller binds.
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    let mut next_slot = 0usize;
+    for a in &func.args {
+        if a.is_gm {
+            slot.insert(a.name.clone(), next_slot);
+            next_slot += 1;
+        }
+    }
+    let mut steps: Vec<ChainStep> = Vec::new();
+
+    // Integer constants, so shape operands resolve to the numbers a dispatch
+    // needs. `%n` is not a size until it is looked up here.
+    let mut consts: HashMap<String, usize> = HashMap::new();
+    for line in &func.body_lines {
+        let Some(eq) = line.find(" = llvm.mlir.constant(") else { continue };
+        let lhs = line[..eq].trim().to_string();
+        let rhs = &line[eq + " = llvm.mlir.constant(".len()..];
+        let v = rhs.split(':').next().unwrap_or("").trim();
+        if let Ok(n) = v.parse::<usize>() {
+            consts.insert(lhs, n);
+        }
+    }
+    // slot -> (elem, rows, cols), so a synthesized step knows how to load the
+    // intermediate the previous step wrote.
+    let mut meta: HashMap<usize, (String, usize, usize)> = HashMap::new();
+
+    for line in &func.body_lines {
+        let Some(at) = line.find("@__tile_") else { continue };
+        let rest = &line[at + 1..];
+        let end = rest.find('(').unwrap_or(rest.len());
+        let name = rest[..end].to_string();
+        let args = extract_call_args(line).unwrap_or_default();
+        let sig = line
+            .rfind(") : ")
+            .map(|i| line[i + 4..].trim().to_string())
+            .unwrap_or_default();
+
+        if name.starts_with("__tile_load") {
+            // a load names a kernel argument; its result stands for that buffer
+            if let Some(res) = extract_result_ssa(line) {
+                let gm = args.first().map(|s| s.trim().to_string()).unwrap_or_default();
+                let s = *slot.entry(gm).or_insert_with(|| {
+                    let s = next_slot;
+                    next_slot += 1;
+                    s
+                });
+                slot.insert(res, s);
+                let dim = |i: usize| {
+                    args.get(i)
+                        .and_then(|a| consts.get(a.trim()))
+                        .copied()
+                        .unwrap_or(1)
+                };
+                meta.insert(s, (chain_elem_of(&name), dim(1), dim(2)));
+            }
+            continue;
+        }
+        if name.starts_with("__tile_store") {
+            // a store binds the last value to an output buffer
+            if let (Some(gm), Some(val)) = (args.first(), args.get(1)) {
+                let gm = gm.trim().to_string();
+                let val = val.trim().to_string();
+                let s = *slot.entry(gm).or_insert_with(|| {
+                    let s = next_slot;
+                    next_slot += 1;
+                    s
+                });
+                if let Some(step) = steps.last_mut() {
+                    if slot.get(&val).copied() == Some(step.output) {
+                        // Retarget the producing step straight at the output
+                        // buffer, so the sequence ends where the caller reads
+                        // rather than in a scratch slot needing a copy out.
+                        step.output = s;
+                        meta.insert(s, step.out_meta.clone());
+                    }
+                }
+                slot.insert(val, s);
+            }
+            continue;
+        }
+        if is_structural_intrinsic(&name) {
+            continue;
+        }
+
+        // A compute op. Operand 0 is the intrinsic's `dst` hint, not an input
+        // (see the __tile_* extern decls: `fn __tile_mul_f32(dst, src1, src2,
+        // rows, cols)`), so it is skipped. Remaining operands split into buffer
+        // inputs and non-buffer scalars; rows/cols are always the trailing two.
+        let mut inputs = Vec::new();
+        let mut input_pos = Vec::new();
+        let mut in_meta = Vec::new();
+        let mut shape = Vec::new();
+        let raw_args: Vec<String> = args.iter().map(|a| a.trim().to_string()).collect();
+        for (i, a) in raw_args.iter().enumerate().skip(1) {
+            match slot.get(a) {
+                Some(s) => {
+                    // The same buffer can appear twice in one call; bind it once.
+                    if !inputs.contains(s) {
+                        inputs.push(*s);
+                        input_pos.push(i);
+                        in_meta.push(
+                            meta.get(s).cloned().unwrap_or_else(|| ("f32".into(), 1, 1)),
+                        );
+                    }
+                }
+                None => shape.push(a.clone()),
+            }
+        }
+
+        // rows/cols are the trailing two operands; anything before them is a
+        // scalar the op carries (a dequant scale, say), not a dimension.
+        let dim_at = |k: usize| {
+            shape
+                .len()
+                .checked_sub(k)
+                .and_then(|i| shape.get(i))
+                .and_then(|t| consts.get(t.as_str()))
+                .copied()
+        };
+        let rows = dim_at(2).unwrap_or(1);
+        let cols = dim_at(1).unwrap_or(1);
+        // A reduction collapses the scanned axis, so its result is one column
+        // wide regardless of the extent it was given.
+        let out_cols = if name.starts_with("__tile_reduce_") || name.starts_with("__tile_arg") {
+            1
+        } else {
+            cols
+        };
+
+        let out = next_slot;
+        next_slot += 1;
+        if let Some(res) = extract_result_ssa(line) {
+            slot.insert(res, out);
+        }
+        let out_meta = (chain_elem_of(&name), rows, out_cols);
+        meta.insert(out, out_meta.clone());
+        steps.push(ChainStep {
+            op: name,
+            inputs,
+            output: out,
+            shape,
+            raw_args,
+            raw_sig: sig,
+            input_pos,
+            in_meta,
+            out_meta,
+        });
+    }
+
+    if steps.len() <= 1 {
+        return Ok(None);
+    }
+    Ok(Some(steps))
+}
+
+/// Lower a composed chain to one runnable kernel per compute op.
+///
+/// Each step is re-expressed as a standalone single-op MLIR module — load its
+/// inputs, perform the op, store the result — and lowered through the ordinary
+/// emitter. Nothing about the emitter changes; the decomposition happens
+/// entirely above it, which is why the resulting kernels are exactly as
+/// trustworthy as any single-op kernel it already produces.
+///
+/// Returns `Ok(None)` for a function that needs no decomposition.
+pub fn lower_composed_chain(mlir_text: &str) -> Result<Option<Vec<ChainKernel>>, String> {
+    let Some(steps) = plan_composed_chain(mlir_text)? else {
+        return Ok(None);
+    };
+
+    let mut out = Vec::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let name = format!("chain_step{}_{}", i, step.op.trim_start_matches("__tile_"));
+
+        // Kernel arguments: one per distinct input, then the output.
+        let nargs = step.inputs.len() + 1;
+        let params: Vec<String> = (0..nargs)
+            .map(|k| format!("%arg{}: !llvm.ptr<1>", k))
+            .collect();
+
+        // Declare every dimension this step names. Constants are emitted under
+        // generated names so a shape operand cannot collide with an SSA value.
+        let mut body = String::new();
+        let mut dim_name = |body: &mut String, seen: &mut Vec<usize>, v: usize| -> String {
+            if !seen.contains(&v) {
+                seen.push(v);
+                body.push_str(&format!(
+                    "    %d{} = llvm.mlir.constant({} : i32) : i32\n",
+                    v, v
+                ));
+            }
+            format!("%d{}", v)
+        };
+        let mut seen_dims: Vec<usize> = Vec::new();
+
+        // Any non-dimension scalar (a dequant scale, say) is carried through
+        // verbatim, so it needs its original constant declaration re-emitted.
+        let dims: Vec<&String> = step.shape.iter().rev().take(2).collect();
+        for tok in &step.shape {
+            if dims.contains(&tok) || consts_of(mlir_text).contains_key(tok.as_str()) {
+                continue;
+            }
+            if let Some(decl) = float_const_decl(mlir_text, tok) {
+                body.push_str(&format!("    {}\n", decl));
+            }
+        }
+
+        let mut operands: Vec<String> = step.raw_args.clone();
+        for (k, (&pos, (elem, r, c))) in step.input_pos.iter().zip(step.in_meta.iter()).enumerate() {
+            let rn = dim_name(&mut body, &mut seen_dims, *r);
+            let cn = dim_name(&mut body, &mut seen_dims, *c);
+            let ssa = format!("%in{}", k);
+            body.push_str(&format!(
+                "    {} = llvm.call @__tile_load_{}(%arg{}, {}, {}) : (!llvm.ptr<1>, i32, i32) -> i32\n",
+                ssa, elem, k, rn, cn
+            ));
+            // Rewrite every occurrence of this buffer, including the `dst` hint
+            // in operand 0 — it names the same SSA value in the source chain.
+            let orig = step.raw_args[pos].clone();
+            for o in operands.iter_mut() {
+                if *o == orig {
+                    *o = ssa.clone();
+                }
+            }
+        }
+        // Dimension operands must refer to this step's own constants.
+        for tok in &step.shape {
+            if let Some(v) = consts_of(mlir_text).get(tok.as_str()) {
+                let n = dim_name(&mut body, &mut seen_dims, *v);
+                for o in operands.iter_mut() {
+                    if o == tok {
+                        *o = n.clone();
+                    }
+                }
+            }
+        }
+
+        body.push_str(&format!(
+            "    %res = llvm.call @{}({}) : {}\n",
+            step.op,
+            operands.join(", "),
+            step.raw_sig
+        ));
+
+        let (oe, or, oc) = &step.out_meta;
+        let orn = dim_name(&mut body, &mut seen_dims, *or);
+        let ocn = dim_name(&mut body, &mut seen_dims, *oc);
+        body.push_str(&format!(
+            "    llvm.call @__tile_store_{}(%arg{}, %res, {}, {}) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n",
+            oe,
+            step.inputs.len(),
+            orn,
+            ocn
+        ));
+
+        let module = format!(
+            "module {{\n  llvm.func @{}({}) attributes {{hacc.entry}} {{\n    ^bb0:\n{}    llvm.return\n  }}\n}}\n",
+            name,
+            params.join(", "),
+            body
+        );
+
+        let msl = convert_mlir_to_msl(&module).map_err(|e| {
+            format!("chain step {} ({}) failed to lower: {}\n{}", i, step.op, e, module)
+        })?;
+
+        let mut binds = step.inputs.clone();
+        binds.push(step.output);
+
+        // Read the buffer list back off the kernel the emitter actually
+        // produced. A step's operand count is NOT a reliable predictor of it:
+        // dequantize, for one, always declares a separate scale buffer. Binding
+        // by assumption instead of by declaration puts the right data in the
+        // wrong slot, which computes a wrong answer without failing.
+        let (data, uniforms) = msl_buffer_signature(&msl);
+        // A row-wise kernel indexes `p[row * num_elements + i]`, so its
+        // num_elements is the row width and it wants one threadgroup per row.
+        let per_row = step.op.starts_with("__tile_reduce_")
+            || step.op.starts_with("__tile_sum_rows")
+            || step.op.starts_with("__tile_arg")
+            || step.op.starts_with("__tile_broadcast_row")
+            || step.op.starts_with("__tile_softmax")
+            || step.op.starts_with("__tile_rms_norm");
+        let (in_rows, in_cols) = step
+            .in_meta
+            .first()
+            .map(|(_, r, c)| (*r, *c))
+            .unwrap_or((*or, *oc));
+        // broadcast_row's operand is one column wide; its extent is the result.
+        let (ext_rows, ext_cols) = if step.op.starts_with("__tile_broadcast_row") {
+            (*or, *oc)
+        } else {
+            (in_rows, in_cols)
+        };
+        let uniform_values: Vec<usize> = uniforms
+            .iter()
+            .map(|u| match u.as_str() {
+                "rows" => ext_rows,
+                "cols" => ext_cols,
+                _ if per_row => ext_cols,
+                _ => ext_rows * ext_cols,
+            })
+            .collect();
+        const MAX_TG: usize = 1024;
+        let (threadgroups, threads_per_threadgroup) = if per_row {
+            (ext_rows, ext_cols.clamp(32, MAX_TG))
+        } else {
+            let elements = ext_rows * ext_cols;
+            let tpg = elements.clamp(1, MAX_TG);
+            ((elements + tpg - 1) / tpg, tpg)
+        };
+        if data != binds.len() {
+            return Err(format!(
+                "chain step {} ({}) declares {} data buffers but the plan binds {} \
+                 ({:?}); the step's operands do not match the emitted kernel",
+                i, step.op, data, binds.len(), binds
+            ));
+        }
+
+        out.push(ChainKernel {
+            name,
+            msl,
+            binds,
+            uniforms,
+            uniform_values,
+            threadgroups,
+            threads_per_threadgroup,
+            rows: *or,
+            cols: *oc,
+        });
+    }
+    Ok(Some(out))
+}
+
+/// Data-buffer count and uniform names of an emitted Metal kernel, read from
+/// its `[[ buffer(N) ]]` parameter list.
+fn msl_buffer_signature(msl: &str) -> (usize, Vec<String>) {
+    let mut data = 0usize;
+    let mut uniforms = Vec::new();
+    for line in msl.lines() {
+        let l = line.trim();
+        if !l.contains("[[ buffer(") {
+            continue;
+        }
+        if l.starts_with("device ") {
+            data += 1;
+        } else if let Some(amp) = l.find('&') {
+            let rest = &l[amp + 1..];
+            let name = rest.split_whitespace().next().unwrap_or("").trim();
+            if !name.is_empty() {
+                uniforms.push(name.to_string());
+            }
+        }
+    }
+    (data, uniforms)
+}
+
+/// Integer constants declared in an MLIR body, by SSA name.
+fn consts_of(mlir_text: &str) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for line in mlir_text.lines() {
+        let Some(eq) = line.find(" = llvm.mlir.constant(") else { continue };
+        let lhs = line[..eq].trim().to_string();
+        let rhs = &line[eq + " = llvm.mlir.constant(".len()..];
+        if let Ok(n) = rhs.split(':').next().unwrap_or("").trim().parse::<usize>() {
+            m.insert(lhs, n);
+        }
+    }
+    m
+}
+
+/// The verbatim declaration of a non-integer constant, so a synthesized step
+/// can carry a scalar operand such as a dequantization scale.
+fn float_const_decl(mlir_text: &str, ssa: &str) -> Option<String> {
+    mlir_text
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| l.starts_with(ssa) && l[ssa.len()..].trim_start().starts_with("= llvm.mlir.constant("))
+        .map(|l| l.to_string())
 }
