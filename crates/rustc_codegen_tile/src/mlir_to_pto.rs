@@ -1684,6 +1684,30 @@ fn analyze_body(
             continue;
         }
 
+        // A tile intrinsic with no arm above would be dropped into a comment
+        // here, and the emitted kernel would simply not perform the op — a
+        // wrong answer that assembles and runs. Refuse instead. Structural
+        // intrinsics carry no computation and are handled elsewhere.
+        if let Some(at) = line.find("@__tile_") {
+            let rest = &line[at + 1..];
+            let name = &rest[..rest.find('(').unwrap_or(rest.len())];
+            let structural = name.starts_with("__tile_load")
+                || name.starts_with("__tile_store")
+                || name.starts_with("__tile_buf_alloc")
+                || name.starts_with("__tile_pipe_barrier")
+                || name.starts_with("__tile_const")
+                || name.starts_with("__tile_view")
+                || name.starts_with("__tile_pipelined_for");
+            if !structural {
+                return Err(format!(
+                    "intrinsic {} has no PTO lowering; emitting it would silently \
+                     drop the operation. Add a translator for it, or restrict the \
+                     kernel to backends that support it.",
+                    name
+                ));
+            }
+        }
+
         // Unrecognized llvm calls: emit as comment
         if line.contains("llvm.call") || line.contains("llvm.") {
             ops.push(format!("// unhandled: {}", line));
@@ -8238,6 +8262,32 @@ module {
             let mlir = ghost_pto!(call);
             assert!(convert_mlir_to_pto(&mlir).is_err(), "{} unknown src must error", op);
         }
+    }
+
+    /// PTO lowers a whole composed body as one kernel, so the same mul_mv chain
+    /// the MSL emitter has to split into five dispatches should lower directly.
+    /// This is the parity check: the SAME fixture, both backends.
+    #[test]
+    fn test_pto_lowers_the_shared_matvec_row_chain() {
+        let pto = convert_mlir_to_pto(crate::mlir_parse::MATVEC_ROW_CHAIN_MLIR)
+            .expect("PTO must lower the composed mul_mv chain as one kernel");
+        // Every compute op in the chain must appear; a missing one would mean
+        // the op was dropped rather than translated.
+        for op in ["pto.trowexpand", "pto.trowsum"] {
+            assert!(pto.contains(op), "chain must lower {}:\n{}", op, pto);
+        }
+        assert!(!pto.contains("// unhandled"),
+            "no operation may be dropped into a comment:\n{}", pto);
+    }
+
+    /// An intrinsic with no PTO arm must be refused, not silently skipped —
+    /// the MSL emitter had the mirror-image defect and emitted a copy kernel.
+    #[test]
+    fn test_pto_unlowered_intrinsic_errs() {
+        let call = "%r = llvm.call @__tile_no_such_op_f32(%c0, %c0, %c32, %c32) : (i32, i32, i32, i32) -> i32";
+        let mlir = ghost_pto!(call);
+        assert!(convert_mlir_to_pto(&mlir).is_err(),
+            "an intrinsic with no lowering must error");
     }
 
     #[test]

@@ -2021,3 +2021,38 @@ mod k_unroll_tests {
         }
     }
 }
+
+/// The Q8_0 `mul_mv` chain over a whole row. Shared by the MSL and PTO
+/// tests so both backends are provably fed the SAME chain.
+///
+/// The Q8_0 `mul_mv` chain over a whole row: R blocks of 32, in the planar
+/// layout a repack buffer type provides.
+///
+/// arg0 quants (R x 32 int8), arg1 a 1.0 scale so dequantize widens the
+/// bytes without scaling, arg2 the per-block scales (R x 1), arg3 the
+/// activations (R x 32), arg4 the per-block partial sums (R x 1).
+///
+/// Per-block scales are why this needs broadcast_row: dequantize applies a
+/// single scalar scale, which only covers one block. Five compute ops.
+pub const MATVEC_ROW_CHAIN_MLIR: &str = r#"
+module {
+  llvm.func @mulmv_row(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>) attributes {hacc.entry} {
+^bb0:
+%one = llvm.mlir.constant(1 : i32) : i32
+%r = llvm.mlir.constant(8 : i32) : i32
+%c = llvm.mlir.constant(32 : i32) : i32
+%q = llvm.call @__tile_load_i8(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+%o1 = llvm.call @__tile_load_f32(%arg1, %one, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+%wf = llvm.call @__tile_dequantize_i8_f32(%q, %q, %o1, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+%sc = llvm.call @__tile_load_f32(%arg2, %r, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+%sb = llvm.call @__tile_broadcast_row_f32(%sc, %sc, %r, %c) : (i32, i32, i32, i32) -> i32
+%ws = llvm.call @__tile_mul_f32(%wf, %wf, %sb, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+%xb = llvm.call @__tile_load_f32(%arg3, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+%pr = llvm.call @__tile_mul_f32(%ws, %ws, %xb, %r, %c) : (i32, i32, i32, i32, i32) -> i32
+%rs = llvm.call @__tile_reduce_sum_f32(%pr, %pr, %r, %c) : (i32, i32, i32, i32) -> i32
+llvm.call @__tile_store_f32(%arg4, %rs, %r, %one) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+llvm.return
+  }
+}
+"#;
+
