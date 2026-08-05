@@ -750,6 +750,13 @@ struct PtoContext {
     ub: UbAllocator,
     /// First NPU tile-bound violation seen during analyze_body (C2-C5).
     tile_error: Option<String>,
+    /// Per-head GM element offsets while emitting a batched stage, as
+    /// (operand a, operand b, output). `None` outside one — batching must not
+    /// silently shift addresses in the ordinary path.
+    head_offsets: Option<(u32, u32, u32)>,
+    /// Constants injected for a synthesised call, so a re-emitted per-head line
+    /// can carry its dimensions without inventing MLIR constant declarations.
+    inline_consts: HashMap<String, u32>,
     /// Map from GM pointer arg name → (tensor_view_ssa, rows, cols, dtype)
     tv_map: HashMap<String, (String, u32, u32, String)>,
     /// Ordered list of sizes we need `arith.constant` for
@@ -942,6 +949,8 @@ impl PtoContext {
             next_ssa: 0,
             ub: UbAllocator::new::<A2A3>(),
             tile_error: None,
+            head_offsets: None,
+            inline_consts: HashMap::new(),
             tv_map: HashMap::new(),
             sizes_used: Vec::new(),
             ptr_aliases: HashMap::new(),
@@ -958,6 +967,11 @@ impl PtoContext {
     /// Resolve an SSA value to a u32 constant, checking const_map first
     /// then falling back to parse_const_arg for %cN / literal values.
     fn resolve_const(&self, s: &str) -> u32 {
+        // Synthesised per-head calls carry their dims here rather than as
+        // module constants.
+        if let Some(v) = self.inline_consts.get(s.trim()) {
+            return *v;
+        }
         if let Some(&n) = self.const_map.get(s.trim()) {
             return n;
         }
@@ -1225,6 +1239,34 @@ impl PtoContext {
             },
         );
         ssa
+    }
+
+    /// Element offsets for the head currently being emitted, if any.
+    fn set_head_offsets(&mut self, a: u32, b: u32, out: u32) {
+        self.head_offsets = Some((a, b, out));
+    }
+
+    fn clear_head_offsets(&mut self) {
+        self.head_offsets = None;
+        self.inline_consts.clear();
+    }
+
+    /// Dimensions for a synthesised per-head call. `resolve_const` consults
+    /// these first, so a re-emitted line can name them without the module
+    /// having declared matching `arith.constant`s.
+    fn set_inline_consts(&mut self, pairs: &[(&str, u32)]) {
+        self.inline_consts.clear();
+        for (k, v) in pairs {
+            self.inline_consts.insert((*k).to_string(), *v);
+        }
+    }
+
+    /// Make `alias` refer to the same tile as `existing`, so a downstream
+    /// store can find the batched result under the SSA the caller used.
+    fn alias_tile(&mut self, existing: &str, alias: &str) {
+        if let Some(t) = self.tiles.get(existing).cloned() {
+            self.tiles.insert(alias.to_string(), t);
+        }
     }
 
     fn get_tile(&self, mlir_ssa: &str) -> Option<&TileInfo> {
@@ -1530,6 +1572,18 @@ fn analyze_body(
         // tile.exp f16
         if line.contains("__tile_exp_f16") {
             translate_unary(line, "f16", "pto.texp", ctx, &mut ops)?;
+            continue;
+        }
+        // Batched variants FIRST: `__tile_softmax_f32` is a substring of
+        // `__tile_softmax_batched_f32`'s neighbours in spirit, and relying on
+        // substring order for correctness is exactly the kind of silent
+        // mis-dispatch that is hard to see later.
+        if line.contains("__tile_matmul_batched_f32") {
+            translate_batched(line, BatchedKind::Matmul, ctx, &mut ops)?;
+            continue;
+        }
+        if line.contains("__tile_softmax_batched_f32") {
+            translate_batched(line, BatchedKind::Softmax, ctx, &mut ops)?;
             continue;
         }
         // tile.softmax f32 — decomposed into 5 reduction ops
@@ -2388,6 +2442,98 @@ fn translate_unary(
 /// | left  | row_major | row_major | 512     |
 /// | right | row_major | col_major | 512     |
 /// | acc   | col_major | row_major | 1024    |
+/// Which batched stage `translate_batched` is emitting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchedKind {
+    /// `heads` independent (M×K)@(K×N) products.
+    Matmul,
+    /// `heads` independent row-softmaxes over (rows×cols).
+    Softmax,
+}
+
+/// Emit a stage that covers all attention heads in ONE launch.
+///
+/// Rather than a host loop issuing one launch per head, the heads are unrolled
+/// inside the kernel at their per-head GM offsets. Head `h` reads `a[h*M*K]`
+/// and `b[h*K*N]` and writes `out[h*M*N]`; those offsets go straight into
+/// `make_pv`, which already takes a flat element offset for GEP-derived
+/// addressing, so no new addressing machinery is needed.
+///
+/// Unrolling rather than emitting `scf.for %h = get_block_idx() ...`: the tile
+/// allocations differ per head (each needs its own accumulator), and the
+/// blocked-matmul path shows ptoas re-examining tile layouts when an outer
+/// scf.for is present — sometimes flipping BLayout even for a degenerate loop.
+/// Unrolled, every head takes the byte-for-byte codepath the per-head kernels
+/// already validated on device, and the launch saving is identical.
+///
+/// Why this exists: on the benchmarked MQA shape 72% of measured time is the
+/// fixed ~4.17 us per-launch cost and 18 of 22 launches are per-head attention
+/// stages. This trades launches for code size; the arithmetic is unchanged.
+fn translate_batched(
+    line: &str,
+    kind: BatchedKind,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let name = match kind {
+        BatchedKind::Matmul => "matmul_batched",
+        BatchedKind::Softmax => "softmax_batched",
+    };
+    let result_ssa = extract_result_ssa(line)
+        .ok_or_else(|| format!("{name}: no result SSA in: {line}"))?;
+    let args = extract_call_args(line)
+        .ok_or_else(|| format!("{name}: cannot parse args in: {line}"))?;
+
+    let heads = ctx.resolve_const(args.last().map(|s| s.as_str()).unwrap_or("0"));
+    if heads == 0 {
+        return Err(format!("{name}: head count is 0 or unresolved in: {line}"));
+    }
+
+    ops.push(format!(
+        "// --- {name}: {heads} heads unrolled into one launch ---"
+    ));
+
+    // Re-emit the per-head call once per head, with the head index folded into
+    // each operand's element offset. Reusing the existing translators is the
+    // point: the batched path cannot diverge from the validated per-head one,
+    // because it IS the per-head one, called `heads` times at shifted offsets.
+    for h in 0..heads {
+        ops.push(format!("// head {h}"));
+        match kind {
+            BatchedKind::Matmul => {
+                let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+                let k = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
+                let n = ctx.resolve_const(args.get(5).map(|s| s.as_str()).unwrap_or("0"));
+                let a = args.get(1).ok_or("matmul_batched: missing a")?.trim();
+                let b = args.get(2).ok_or("matmul_batched: missing b")?.trim();
+                ctx.set_head_offsets(h * m * k, h * k * n, h * m * n);
+                let inner = format!(
+                    "%__bh{h} = llvm.call @__tile_matmul_f32({a}, {a}, {b},                      %__m, %__k, %__n) : (i32, i32, i32, i32, i32, i32) -> i32"
+                );
+                ctx.set_inline_consts(&[("%__m", m), ("%__k", k), ("%__n", n)]);
+                translate_matmul(&inner, ctx, ops)?;
+            }
+            BatchedKind::Softmax => {
+                let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
+                let cols = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+                let x = args.get(1).ok_or("softmax_batched: missing src")?.trim();
+                ctx.set_head_offsets(h * rows * cols, 0, h * rows * cols);
+                let inner = format!(
+                    "%__bh{h} = llvm.call @__tile_softmax_f32({x}, {x}, %__r, %__c) :                      (i32, i32, i32, i32) -> i32"
+                );
+                ctx.set_inline_consts(&[("%__r", rows), ("%__c", cols)]);
+                translate_softmax(&inner, "f32", ctx, ops)?;
+            }
+        }
+        // The last head's output is what a downstream store should reference.
+        if h + 1 == heads {
+            ctx.alias_tile(&format!("%__bh{h}"), &result_ssa);
+        }
+    }
+    ctx.clear_head_offsets();
+    Ok(())
+}
+
 fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> Result<(), String> {
     let result_ssa =
         extract_result_ssa(line).ok_or_else(|| format!("matmul: no result SSA in: {}", line))?;

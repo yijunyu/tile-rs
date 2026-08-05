@@ -192,6 +192,29 @@ extern "C" {
     /// Matrix multiply: (M × K) @ (K × N) → (M × N), all f32.
     pub fn __tile_matmul_f32(dst: u32, a: u32, b: u32, m: u32, k: u32, n: u32) -> u32;
 
+    /// Batched matmul: `heads` independent (M × K) @ (K × N) products, one
+    /// kernel launch.
+    ///
+    /// The operands are contiguous per head — head `h` reads `a[h*M*K]` and
+    /// `b[h*K*N]` and writes `c[h*M*N]` — so the emitter walks them with a
+    /// grid-strided loop over `h` and the caller launches with
+    /// `blockDim = min(heads, aicores)` instead of looping on the host.
+    ///
+    /// This exists because launch count, not compute, dominates small attention
+    /// shapes: at the benchmarked MQA shape 72% of the measured time is the
+    /// fixed per-launch cost, and the per-head scores/PV products are 12 of the
+    /// 22 launches. Batching them is a launch-count optimisation, not an
+    /// arithmetic one — the same products are computed.
+    pub fn __tile_matmul_batched_f32(
+        dst: u32, a: u32, b: u32, m: u32, k: u32, n: u32, heads: u32,
+    ) -> u32;
+
+    /// Batched row-softmax: `heads` independent (rows × cols) tiles, one launch.
+    /// Head `h` occupies `src[h*rows*cols]`. See `__tile_matmul_batched_f32`.
+    pub fn __tile_softmax_batched_f32(
+        dst: u32, src: u32, rows: u32, cols: u32, heads: u32,
+    ) -> u32;
+
     /// Element-wise subtract two f32 tiles: a - b.
     pub fn __tile_sub_f32(dst: u32, src1: u32, src2: u32, rows: u32, cols: u32) -> u32;
 
