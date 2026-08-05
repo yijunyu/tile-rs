@@ -128,6 +128,9 @@ enum KernelType {
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
     AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
+    MulMvQ4_0Planar, // FUSED Q4_0 mat-vec over repacked planes: nibbles stay
+                     // PACKED in memory and are unpacked in registers, so a
+                     // Q4 model keeps the memory it was chosen for.
     MulMvQ8_0Planar, // FUSED Q8_0 mat-vec over repacked planes: the whole
                      // contraction in one kernel, against the composed chain
                      // that needs five. Planar (quants | scales) is the layout
@@ -601,7 +604,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention  => 4,    // q, k, v, out
         KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
-        KernelType::MulMvQ8_0Planar => 4, // quants, scales, activations, out
+        KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar => 4, // quants, scales, activations, out
         KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi => 2, // src bytes, dst f32
         KernelType::BroadcastRow => 2, // src (R x 1), dst (R x C)
         KernelType::Rope       => 2,    // src, dst
@@ -968,11 +971,14 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // Q8_0 quants are SIGNED bytes; reading them unsigned turns every
             // negative weight into a large positive one.
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
+            // Q4_0 nibbles are UNSIGNED bytes; the zero point is subtracted
+            // after unpacking, so signing them here would corrupt the high half.
+            else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "uchar" }
             // Scales stay in the fp16 the checkpoint already stores them in.
             // Widening the plane to f32 adds 3.7 MB of traffic to a 66 MB
             // kernel that is purely bandwidth bound, to carry no more
             // information than the source had.
-            else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 1 { "half" }
+            else if matches!(ctx.kernel_type, KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar) && i == 1 { "half" }
             // The i8 side of quantize/dequantize is stored as real signed bytes,
             // which is what a quantized checkpoint actually holds. Typing it as
             // float instead made the pair unable to address any weight buffer.
@@ -1082,7 +1088,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
-        KernelType::MulMvQ8_0Planar => {
+        KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar => {
             writeln!(out, "    constant uint& n_rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& blocks_per_row [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& n_cols         [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2274,7 +2280,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::PartitionCellStore
     | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
             | KernelType::BroadcastRow | KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi
-            | KernelType::MulMvQ8_0Planar
+            | KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar
         | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
@@ -2525,6 +2531,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
         KernelType::MulMvQ8_0Planar => emit_mul_mv_q8_0_planar_msl(out),
+        KernelType::MulMvQ4_0Planar => emit_mul_mv_q4_0_planar_msl(out),
         KernelType::UnpackNibblesLo => emit_unpack_nibbles_msl(out, msl_type, false),
         KernelType::UnpackNibblesHi => emit_unpack_nibbles_msl(out, msl_type, true),
         KernelType::BroadcastRow => emit_broadcast_row_msl(out, msl_type),
@@ -2930,7 +2937,8 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) -> Result<(), Stri
                 "__tile_attention_f32"     => { ctx.kernel_type = KernelType::Attention; }
                 "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
-                "__tile_mul_mv_q8_0_f32" => { ctx.kernel_type = KernelType::MulMvQ8_0Planar; }
+                "__tile_mul_mv_q8_0_planar_f32" => { ctx.kernel_type = KernelType::MulMvQ8_0Planar; }
+                "__tile_mul_mv_q4_0_planar_f32" => { ctx.kernel_type = KernelType::MulMvQ4_0Planar; }
                 "__tile_unpack_nibbles_lo_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesLo; } }
                 "__tile_unpack_nibbles_hi_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesHi; } }
                 "__tile_broadcast_row_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::BroadcastRow; } }
@@ -3956,6 +3964,101 @@ pub const MUL_MV_ROWS_PER_TG: usize = 16;
 /// registers, so it stops paying. Must divide the block: VPL*4 <= 32 and
 /// 32 % (VPL*4) == 0, so 1, 2, 4 or 8.
 pub const MUL_MV_VECS_PER_LANE: usize = 2;
+
+/// The same knob for Q4_0, which needs its own value.
+///
+/// A Q4_0 unit is 4 packed bytes = 8 weights, so a given VPL covers twice the
+/// weights it does for Q8_0, and the kernel is correspondingly less bandwidth
+/// bound and more unpack bound. At VPL = UPB (4) a lane owns exactly one block,
+/// which makes its activation reads contiguous and drops it to one scale load
+/// per step.
+pub const MUL_MV_Q4_VECS_PER_LANE: usize = 2;
+
+/// Fused Q4_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
+///
+/// The Q8_0 kernel's structure, over half the weight bytes. ggml stores element
+/// `j` in the low nibble of byte `j` and element `j+16` in the high nibble, so
+/// one `uchar4` of quants carries EIGHT weights: four from the low half of the
+/// block and four from the high, pairing with two different `float4`s of
+/// activations sixteen elements apart.
+///
+/// The nibbles stay packed in memory and are unpacked in registers, which is
+/// the whole point -- unpacking at load would double the memory a Q4 model was
+/// chosen to save. The zero point (`-8`) is applied after unpacking, so the
+/// quant plane is UNSIGNED: signing it would wreck the high half.
+fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
+    writeln!(out, "    const uint BLK  = 32u;                 // weights per block").unwrap();
+    writeln!(out, "    const uint QB   = BLK / 2u;            // quant BYTES per block").unwrap();
+    writeln!(out, "    const uint UPB  = QB / 4u;             // uchar4 units per block").unwrap();
+    writeln!(out, "    const uint VPL  = {}u;                  // units a lane takes per step", MUL_MV_Q4_VECS_PER_LANE).unwrap();
+    writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_ROWS_PER_TG).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint tg = row;").unwrap();
+    writeln!(out, "    uint row_tiles = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;").unwrap();
+    writeln!(out, "    if (tg >= row_tiles * n_cols) return;").unwrap();
+    writeln!(out, "    uint m  = tg / row_tiles;").unwrap();
+    writeln!(out, "    uint n0 = (tg % row_tiles) * ROWS_PER_TG;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint row_bytes = blocks_per_row * QB;   // quant bytes per weight row").unwrap();
+    writeln!(out, "    uint n_unit    = (blocks_per_row * UPB) / VPL;").unwrap();
+    writeln!(out, "    device const float4* x4 = (device const float4*)(p2 + (ulong)m * blocks_per_row * BLK);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
+    writeln!(out, "        uint i = u * VPL;                   // first uchar4 this lane owns").unwrap();
+    writeln!(out, "        uint b = i / UPB;                   // block it falls in").unwrap();
+    // The two activation halves of a block are 16 elements = 4 float4s apart.
+    writeln!(out, "        float4 xlo[VPL];").unwrap();
+    writeln!(out, "        float4 xhi[VPL];").unwrap();
+    writeln!(out, "        for (uint j = 0u; j < VPL; ++j) {{").unwrap();
+    writeln!(out, "            uint k = (i + j) % UPB;         // which quarter of the block").unwrap();
+    writeln!(out, "            uint bb = (i + j) / UPB;").unwrap();
+    writeln!(out, "            xlo[j] = x4[bb * 8u + k];").unwrap();
+    writeln!(out, "            xhi[j] = x4[bb * 8u + 4u + k];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "            uint n = n0 + r;").unwrap();
+    writeln!(out, "            if (n >= n_rows) break;").unwrap();
+    writeln!(out, "            device const uchar4* q4 = (device const uchar4*)(p0 + (ulong)n * row_bytes);").unwrap();
+    writeln!(out, "            float sum = 0.0f;").unwrap();
+    writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
+    writeln!(out, "                uchar4 qq = q4[i + j];").unwrap();
+    writeln!(out, "                float4 lo = float4(qq & (uchar4)0x0F) - 8.0f;").unwrap();
+    writeln!(out, "                float4 hi = float4(qq >> (uchar4)4) - 8.0f;").unwrap();
+    writeln!(out, "                float4 pl = lo * xlo[j];").unwrap();
+    writeln!(out, "                float4 ph = hi * xhi[j];").unwrap();
+    writeln!(out, "                sum += (pl.x + pl.y + pl.z + pl.w) + (ph.x + ph.y + ph.z + ph.w);").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * sum;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    constexpr uint MAX_SG = 1024u / 32u;").unwrap();
+    writeln!(out, "    threadgroup float mv_shared[ROWS_PER_TG][MAX_SG];").unwrap();
+    writeln!(out, "    uint lane = tid % 32u;").unwrap();
+    writeln!(out, "    uint sg   = tid / 32u;").unwrap();
+    writeln!(out, "    uint n_sg = (tcount + 31u) / 32u;").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "        if (sg == 0u && lane < MAX_SG) mv_shared[r][lane] = 0.0f;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "        float v = simd_sum(acc[r]);").unwrap();
+    writeln!(out, "        if (lane == 0u) mv_shared[r][sg] = v;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (sg == 0u) {{").unwrap();
+    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "            uint n = n0 + r;").unwrap();
+    writeln!(out, "            if (n >= n_rows) break;").unwrap();
+    writeln!(out, "            float v = (lane < n_sg) ? mv_shared[r][lane] : 0.0f;").unwrap();
+    writeln!(out, "            v = simd_sum(v);").unwrap();
+    writeln!(out, "            if (lane == 0u) p3[(ulong)m * n_rows + n] = v;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
 
 /// Fused Q8_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
 ///
@@ -15499,8 +15602,9 @@ module {
         // shape, so a consumer needs no second code path to run them. Its
         // uniforms name the contraction (n_rows / blocks_per_row / n_cols)
         // rather than a tile extent, which is what tells the two apart.
-        let fused: [(&str, &str); 1] = [
+        let fused: [(&str, &str); 2] = [
             ("q8_0_fused", crate::mlir_parse::MATVEC_Q8_0_FUSED_MLIR),
+            ("q4_0_fused", crate::mlir_parse::MATVEC_Q4_0_FUSED_MLIR),
         ];
         let mut fused_names: Vec<String> = Vec::new();
         for (tag, mlir) in fused {
@@ -15649,6 +15753,61 @@ module {
         // activation bytes, both naturally aligned, so there is no tail.
         assert!(msl.contains("char4") && msl.contains("float4"),
             "both operands must vectorize:\n{}", msl);
+    }
+
+    /// The fused Q4_0 kernel must unpack in registers, keep its quant plane
+    /// unsigned, and pair each nibble half with the right activations.
+    #[test]
+    fn test_msl_fused_q4_0_matvec() {
+        let msl = convert_mlir_to_msl(crate::mlir_parse::MATVEC_Q4_0_FUSED_MLIR)
+            .expect("the fused Q4_0 mat-vec must lower");
+
+        assert!(msl.contains("kernel void mulmv_q4_0_fused"), "{}", msl);
+
+        // UNSIGNED. The zero point is subtracted after unpacking, so signing
+        // the plane would make every high nibble wrong while the low half kept
+        // looking right -- which is the dangerous part.
+        assert!(msl.contains("device const  uchar* p0"),
+            "packed nibbles must be unsigned:\n{}", msl);
+
+        // Both halves, each against its own activation slice: ggml puts element
+        // j in the low nibble of byte j and element j+16 in the high.
+        assert!(msl.contains("qq & (uchar4)0x0F") && msl.contains("qq >> (uchar4)4"),
+            "both nibble halves must be taken:\n{}", msl);
+        assert!(msl.contains("x4[bb * 8u + k]") && msl.contains("x4[bb * 8u + 4u + k]"),
+            "the halves pair with activations 16 elements apart:\n{}", msl);
+        assert!(msl.contains("- 8.0f"), "the Q4_0 zero point must be applied:\n{}", msl);
+
+        // Unpacked weights must never reach memory; only the result is stored.
+        assert_eq!(msl.matches("p3[").count(), 1,
+            "exactly one device store, the result:\n{}", msl);
+    }
+
+    /// The planar kernels took NEW intrinsic names on purpose.
+    /// `__tile_mul_mv_q8_0_f32` already existed and reads ggml's interleaved
+    /// block_q8_0; when the planar kernel briefly claimed that name it shadowed
+    /// the original arm, so every existing caller would have been redirected to
+    /// a kernel addressing memory laid out differently -- silently, and only
+    /// for the quantized path.
+    #[test]
+    fn test_interleaved_q8_0_intrinsic_is_not_shadowed() {
+        let mlir = r#"
+module {
+  llvm.func @ds4mv(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %c = llvm.mlir.constant(32 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %c, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %r = llvm.call @__tile_mul_mv_q8_0_f32(%a, %a, %c, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %r, %c, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let msl = convert_mlir_to_msl(mlir).expect("the interleaved intrinsic must still lower");
+        // The planar kernel is recognisable by its own uniforms; the
+        // interleaved one must not produce them.
+        assert!(!msl.contains("blocks_per_row"),
+            "the interleaved intrinsic must NOT select the planar kernel:\n{}", msl);
     }
 
     /// A single compute intrinsic needs no decomposition -- the fused kernel is

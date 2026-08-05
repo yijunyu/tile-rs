@@ -2047,10 +2047,22 @@ extern "C" {
     /// nibbles supply elements `0..C` and the high nibbles `C..2C`, i.e. two
     /// successive block iterations of a mat-vec. Not materialising the wide
     /// tile is both portable and cheaper.
-    /// Fused Q8_0 mat-vec over repacked planes: quants, per-block scales,
+    /// Fused Q4_0 mat-vec over repacked planes. Same shape as the Q8_0 form,
+    /// but the quant plane holds two weights per byte and stays packed.
+    pub fn __tile_mul_mv_q4_0_planar_f32(
+        quants: *const u8, scales: *const f32, acts: *const f32, out: *mut f32,
+        n_rows: u32, blocks_per_row: u32, n_cols: u32,
+    );
+
+    /// Fused Q8_0 mat-vec over repacked PLANES: quants, per-block scales,
     /// activations, output. The whole contraction in one kernel, against the
     /// five a composed chain of the same template needs.
-    pub fn __tile_mul_mv_q8_0_f32(
+    ///
+    /// `_planar_` is load-bearing. `__tile_mul_mv_q8_0_f32` already exists and
+    /// reads ggml's interleaved block_q8_0; taking that name for a kernel that
+    /// reads split planes would silently redirect its callers to a kernel
+    /// addressing memory that is not laid out the way they think.
+    pub fn __tile_mul_mv_q8_0_planar_f32(
         quants: *const i8, scales: *const f32, acts: *const f32, out: *mut f32,
         n_rows: u32, blocks_per_row: u32, n_cols: u32,
     );
@@ -2451,8 +2463,26 @@ pub fn tile_reduce_sum_f32<const ROWS: usize, const COLS: usize>(
 /// a float plane of one scale per 32-element block -- because the DSL cannot
 /// address inside ggml's interleaved blocks. Unlike the composed form, the
 /// dequantized weights never reach memory: they are consumed in registers.
+/// Fused Q4_0 mat-vec: `out[m][n] = sum_k w[n][k] * x[m][k]`.
+///
+/// The quant plane holds two weights per byte and is consumed packed -- the
+/// nibbles are unpacked in registers, not at load, so a Q4 model keeps the
+/// memory it was quantized for.
 #[inline(always)]
-pub fn tile_mul_mv_q8_0_f32(
+pub fn tile_mul_mv_q4_0_planar_f32(
+    quants: *const u8,
+    scales: *const f32,
+    acts: *const f32,
+    out: *mut f32,
+    n_rows: u32,
+    blocks_per_row: u32,
+    n_cols: u32,
+) {
+    unsafe { __tile_mul_mv_q4_0_planar_f32(quants, scales, acts, out, n_rows, blocks_per_row, n_cols) }
+}
+
+#[inline(always)]
+pub fn tile_mul_mv_q8_0_planar_f32(
     quants: *const i8,
     scales: *const f32,
     acts: *const f32,
@@ -2461,7 +2491,7 @@ pub fn tile_mul_mv_q8_0_f32(
     blocks_per_row: u32,
     n_cols: u32,
 ) {
-    unsafe { __tile_mul_mv_q8_0_f32(quants, scales, acts, out, n_rows, blocks_per_row, n_cols) }
+    unsafe { __tile_mul_mv_q8_0_planar_f32(quants, scales, acts, out, n_rows, blocks_per_row, n_cols) }
 }
 
 pub fn tile_unpack_nibbles_lo_f32<const ROWS: usize, const COLS: usize>(
