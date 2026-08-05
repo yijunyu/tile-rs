@@ -973,7 +973,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
             // Q4_0 nibbles are UNSIGNED bytes; the zero point is subtracted
             // after unpacking, so signing them here would corrupt the high half.
-            else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "ushort" }
+            else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "uint" }
             // Scales stay in the fp16 the checkpoint already stores them in.
             // Widening the plane to f32 adds 3.7 MB of traffic to a 66 MB
             // kernel that is purely bandwidth bound, to carry no more
@@ -3980,7 +3980,7 @@ pub const MUL_MV_Q4_VECS_PER_LANE: usize = 2;
 /// halves pair with slices sixteen elements apart -- so it carries twice the
 /// live activation state of Q8_0 at the same depth, and sits at a different
 /// register-pressure optimum.
-pub const MUL_MV_Q4_ROWS_PER_TG: usize = 6;
+pub const MUL_MV_Q4_ROWS_PER_TG: usize = 4;
 
 /// Fused Q4_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
 ///
@@ -3995,27 +3995,11 @@ pub const MUL_MV_Q4_ROWS_PER_TG: usize = 6;
 /// chosen to save. The zero point (`-8`) is applied after unpacking, so the
 /// quant plane is UNSIGNED: signing it would wreck the high half.
 fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
-    // A lane applies ONE scale per step, indexed by the block its first unit
-    // falls in. That is only correct while a step stays inside one block. A
-    // Q4_0 block is 16 quant bytes = 2 ushort4 units, so VPL > 2 makes a lane
-    // straddle two blocks and scale the second by the first's factor --
-    // silently, and only on the quantized path.
-    //
-    // This is a knob PRECONDITION, not a preference, so it is enforced where
-    // the kernel is built rather than left to whoever runs the next sweep.
-    const Q4_UNITS_PER_BLOCK: usize = 2;
-    assert!(
-        MUL_MV_Q4_VECS_PER_LANE <= Q4_UNITS_PER_BLOCK
-            && Q4_UNITS_PER_BLOCK % MUL_MV_Q4_VECS_PER_LANE == 0,
-        "MUL_MV_Q4_VECS_PER_LANE={} straddles a Q4_0 block ({} units): a lane \
-         would apply one block's scale to another block's weights",
-        MUL_MV_Q4_VECS_PER_LANE, Q4_UNITS_PER_BLOCK
-    );
-
+    // A uint4 unit IS one Q4_0 block, so a lane-step can never straddle one
+    // and the per-lane width is fixed at 1. (The ushort4 form it replaces had
+    // two units per block and needed a guard against VPL > 2.)
     writeln!(out, "    const uint BLK  = 32u;                 // weights per block").unwrap();
-    writeln!(out, "    const uint QB   = BLK / 2u;            // quant BYTES per block").unwrap();
-    writeln!(out, "    const uint UPB  = QB / 8u;             // ushort4 units per block").unwrap();
-    writeln!(out, "    const uint VPL  = {}u;                  // units a lane takes per step", MUL_MV_Q4_VECS_PER_LANE).unwrap();
+    writeln!(out, "    const float SCALE_OF_PLANE[4] = {{ 1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f }};").unwrap();
     writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_Q4_ROWS_PER_TG).unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint tg = row;").unwrap();
@@ -4024,53 +4008,39 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "    uint m  = tg / row_tiles;").unwrap();
     writeln!(out, "    uint n0 = (tg % row_tiles) * ROWS_PER_TG;").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    uint row_units = blocks_per_row * UPB;  // ushort4 units per weight row").unwrap();
-    writeln!(out, "    uint n_unit    = row_units / VPL;").unwrap();
     writeln!(out, "    device const float4* x4 = (device const float4*)(p2 + (ulong)m * blocks_per_row * BLK);").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
     writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
     writeln!(out).unwrap();
-    // One 8-byte load yields sixteen weights as four masked planes. No nibble
-    // is ever shifted down: each stays at its bit position and the factor
-    // (1, 16, 256, 4096) rides on a pre-scaled activation. The zero point
-    // scales with it, so the planes subtract 8, 128, 2048 and 32768.
-    writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
-    writeln!(out, "        uint i = u * VPL;").unwrap();
-    writeln!(out, "        uint b = i / UPB;").unwrap();
-    writeln!(out, "        float4 xp[VPL][4];").unwrap();
-    // Every plane's zero point collapses to the SAME term. Plane p subtracts
-    // 8*16^p from a value multiplied by an activation pre-scaled by 16^-p, so
-    // each contributes exactly 8 * (that plane's raw activations):
-    //   128*(x/16) == 2048*(x/256) == 32768*(x/4096) == 8x
-    // So the four subtractions per unit PER ROW become one shared sum computed
-    // once per unit, and a single fused multiply-add per row.
-    writeln!(out, "        float xsum = 0.0f;").unwrap();
-    writeln!(out, "        for (uint j = 0u; j < VPL; ++j) {{").unwrap();
-    writeln!(out, "            float4 x0 = x4[4u * (i + j) + 0u];").unwrap();
-    writeln!(out, "            float4 x1 = x4[4u * (i + j) + 1u];").unwrap();
-    writeln!(out, "            float4 x2 = x4[4u * (i + j) + 2u];").unwrap();
-    writeln!(out, "            float4 x3 = x4[4u * (i + j) + 3u];").unwrap();
-    writeln!(out, "            xsum += (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w)").unwrap();
-    writeln!(out, "                  + (x2.x + x2.y + x2.z + x2.w) + (x3.x + x3.y + x3.z + x3.w);").unwrap();
-    writeln!(out, "            xp[j][0] = x0;").unwrap();
-    writeln!(out, "            xp[j][1] = x1 * (1.0f / 16.0f);").unwrap();
-    writeln!(out, "            xp[j][2] = x2 * (1.0f / 256.0f);").unwrap();
-    writeln!(out, "            xp[j][3] = x3 * (1.0f / 4096.0f);").unwrap();
+    // One 16-byte load yields a whole block as EIGHT masked planes. Nibbles
+    // above bit 20 would leave f32's exact-integer range (15*2^24 > 2^24), so
+    // the upper four planes come from a single `>> 16` -- one shift per block,
+    // not one per plane.
+    writeln!(out, "    for (uint u = tid; u < blocks_per_row; u += tcount) {{").unwrap();
+    writeln!(out, "        float4 xp[8];").unwrap();
+    writeln!(out, "        float  xsum = 0.0f;").unwrap();
+    writeln!(out, "        for (uint p = 0u; p < 8u; ++p) {{").unwrap();
+    writeln!(out, "            float4 xv = x4[8u * u + p];").unwrap();
+    writeln!(out, "            xsum += xv.x + xv.y + xv.z + xv.w;").unwrap();
+    writeln!(out, "            xp[p] = xv * SCALE_OF_PLANE[p & 3u];").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
-    writeln!(out, "            device const ushort4* q16 = (device const ushort4*)(p0 + (ulong)n * row_units * 4u);").unwrap();
+    writeln!(out, "            device const uint4* q32 = (device const uint4*)(p0 + (ulong)n * blocks_per_row * 4u);").unwrap();
+    writeln!(out, "            uint4 wl = q32[u];").unwrap();
+    writeln!(out, "            uint4 wh = wl >> (uint4)16;").unwrap();
     writeln!(out, "            float sum = 0.0f;").unwrap();
-    writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
-    writeln!(out, "                ushort4 ww = q16[i + j];").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x000F), xp[j][0]);").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x00F0), xp[j][1]);").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x0F00), xp[j][2]);").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0xF000), xp[j][3]);").unwrap();
-    writeln!(out, "            }}").unwrap();
-    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * (sum - 8.0f * xsum);").unwrap();
+    writeln!(out, "            sum += dot(float4(wl & (uint4)0x0000000F), xp[0]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wl & (uint4)0x000000F0), xp[1]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wl & (uint4)0x00000F00), xp[2]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wl & (uint4)0x0000F000), xp[3]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wh & (uint4)0x0000000F), xp[4]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wh & (uint4)0x000000F0), xp[5]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wh & (uint4)0x00000F00), xp[6]);").unwrap();
+    writeln!(out, "            sum += dot(float4(wh & (uint4)0x0000F000), xp[7]);").unwrap();
+    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + u] * (sum - 8.0f * xsum);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
@@ -15817,36 +15787,22 @@ module {
         // UNSIGNED. The zero point is subtracted after unpacking, so signing
         // the plane would make every high nibble wrong while the low half kept
         // looking right -- which is the dangerous part.
-        assert!(msl.contains("device const  ushort* p0"),
-            "packed nibbles must be an unsigned 16-bit plane:\n{}", msl);
+        assert!(msl.contains("device const  uint* p0"),
+            "packed nibbles must be an unsigned 32-bit plane:\n{}", msl);
 
-        // FOUR nibble planes from one 8-byte load, each masked in place. No
-        // nibble is shifted down; its bit position rides on a pre-scaled
-        // activation, and the zero point scales with it.
-        for mask in ["0x000F", "0x00F0", "0x0F00", "0xF000"] {
-            assert!(msl.contains(&format!("ww & (ushort4){}", mask)),
-                "plane {} must be masked in place:\n{}", mask, msl);
-        }
-        assert!(!msl.contains(">>"), "no nibble may be shifted down:\n{}", msl);
-        // Collapse the emitter's column alignment before matching, so the
-        // assertions pin the arithmetic rather than the whitespace.
         let flat: String = msl.split_whitespace().collect::<Vec<_>>().join(" ");
-        for scale in ["16.0f", "256.0f", "4096.0f"] {
-            assert!(flat.contains(&format!("(1.0f / {})", scale)),
-                "activation plane must carry 1/{}:\n{}", scale, msl);
+        // EIGHT planes from one 16-byte load. The upper four come from a single
+        // shift, because nibbles above bit 20 leave f32's exact-integer range.
+        for m in ["0x0000000F", "0x000000F0", "0x00000F00", "0x0000F000"] {
+            assert!(flat.contains(&format!("wl & (uint4){}", m))
+                 && flat.contains(&format!("wh & (uint4){}", m)),
+                "plane {} must be taken from both halves:\n{}", m, msl);
         }
-        // Every plane's zero point collapses to 8 * raw activations, so it is
-        // ONE shared term rather than four subtractions per row.
+        assert_eq!(flat.matches(">> (uint4)16").count(), 1,
+            "exactly one shift per block, not one per plane:\n{}", msl);
+        // Zero point still collapses to one shared term.
         assert!(flat.contains("sum - 8.0f * xsum"),
             "the zero point must collapse to a single shared term:\n{}", msl);
-        assert!(!flat.contains("- 128.0f") && !flat.contains("- 32768.0f"),
-            "no per-plane zero point should survive the collapse:\n{}", msl);
-        // The four planes land on four CONSECUTIVE float4s, which is what the
-        // repack permutation buys.
-        for k in 0..4 {
-            assert!(msl.contains(&format!("x4[4u * (i + j) + {}u]", k)),
-                "plane {} must read an adjacent activation float4:\n{}", k, msl);
-        }
 
         // Unpacked weights must never reach memory; only the result is stored.
         assert_eq!(msl.matches("p3[").count(), 1,
