@@ -2056,3 +2056,42 @@ llvm.return
 }
 "#;
 
+/// The Q4_0 `mul_mv` chain over a whole row: R blocks of 32 weights held as
+/// 16 packed bytes each, in the planar layout the repack buffer type provides.
+///
+/// arg0 packed nibbles (R x 16), arg1 a plane of 8.0 for the Q4_0 zero point,
+/// arg2 the per-block scales (R x 1), arg3/arg4 the activations split to match
+/// the nibble halves, arg5 the per-block partial sums (R x 1).
+///
+/// ggml's Q4_0 puts element j in the low nibble of byte j and element j+16 in
+/// the high nibble, so the two halves stay separate rather than being
+/// concatenated: a flat concat would break the per-row structure that
+/// broadcast_row and the reduction depend on. The halves rejoin at the add.
+pub const MATVEC_Q4_0_CHAIN_MLIR: &str = r#"
+module {
+  llvm.func @mulmv_q4_0(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>, %arg5: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %r = llvm.mlir.constant(8 : i32) : i32
+    %w = llvm.mlir.constant(16 : i32) : i32
+    %q = llvm.call @__tile_load_i8(%arg0, %r, %w) : (!llvm.ptr<1>, i32, i32) -> i32
+    %lo = llvm.call @__tile_unpack_nibbles_lo_f32(%q, %q, %r, %w) : (i32, i32, i32, i32) -> i32
+    %hi = llvm.call @__tile_unpack_nibbles_hi_f32(%q, %q, %r, %w) : (i32, i32, i32, i32) -> i32
+    %e = llvm.call @__tile_load_f32(%arg1, %r, %w) : (!llvm.ptr<1>, i32, i32) -> i32
+    %lz = llvm.call @__tile_sub_f32(%lo, %lo, %e, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %hz = llvm.call @__tile_sub_f32(%hi, %hi, %e, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %sc = llvm.call @__tile_load_f32(%arg2, %r, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %sb = llvm.call @__tile_broadcast_row_f32(%sc, %sc, %r, %w) : (i32, i32, i32, i32) -> i32
+    %ls = llvm.call @__tile_mul_f32(%lz, %lz, %sb, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %hs = llvm.call @__tile_mul_f32(%hz, %hz, %sb, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %xl = llvm.call @__tile_load_f32(%arg3, %r, %w) : (!llvm.ptr<1>, i32, i32) -> i32
+    %xh = llvm.call @__tile_load_f32(%arg4, %r, %w) : (!llvm.ptr<1>, i32, i32) -> i32
+    %lp = llvm.call @__tile_mul_f32(%ls, %ls, %xl, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %hp = llvm.call @__tile_mul_f32(%hs, %hs, %xh, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %sm = llvm.call @__tile_add_f32(%lp, %lp, %hp, %r, %w) : (i32, i32, i32, i32, i32) -> i32
+    %rs = llvm.call @__tile_reduce_sum_f32(%sm, %sm, %r, %w) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg5, %rs, %r, %one) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
