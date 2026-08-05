@@ -4085,8 +4085,8 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
 /// kernel is barrier-bound rather than compute-bound -- measured 13x slower
 /// than ggml. A micro-tile raises the work per barrier by `RT*CT` while reading
 /// `RT + CT` values from the stage instead of `RT*CT`.
-pub const MUL_MM_TN: usize = 64;
-pub const MUL_MM_TM: usize = 16;
+pub const MUL_MM_TN: usize = 128;
+pub const MUL_MM_TM: usize = 32;
 pub const MUL_MM_RT: usize = 4;
 pub const MUL_MM_CT: usize = 2;
 
@@ -4117,8 +4117,14 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "    uint ti = tid % (TN / RT);             // my micro-tile, row direction").unwrap();
     writeln!(out, "    uint tj = tid / (TN / RT);             // and column direction").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    threadgroup float tgW[TN][BLK];        // dequantized weights").unwrap();
-    writeln!(out, "    threadgroup float tgX[TM][BLK];        // activations").unwrap();
+    // PAD is not cosmetic. A row of exactly BLK floats puts every row on the
+    // same threadgroup-memory bank (BLK == 32 == the bank count), and the inner
+    // product has each thread read a DIFFERENT row at the same element -- a
+    // 32-way conflict on every access, invariant to the tile size. One float of
+    // padding stride-shifts each row into its own bank.
+    writeln!(out, "    const uint PAD = BLK + 1u;").unwrap();
+    writeln!(out, "    threadgroup float tgW[TN][PAD];        // dequantized weights").unwrap();
+    writeln!(out, "    threadgroup float tgX[TM][PAD];        // activations").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint K = blocks_per_row * BLK;").unwrap();
     writeln!(out, "    float acc[RT][CT];").unwrap();
@@ -4131,6 +4137,8 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "            uint r = idx / BLK, e = idx % BLK;").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n < n_rows) {{").unwrap();
+    // The scale is per (row, block), not per element -- reading it inside this
+    // loop fetches it BLK times per row.
     writeln!(out, "                float s = (float)p1[(ulong)n * blocks_per_row + kb];").unwrap();
     writeln!(out, "                tgW[r][e] = (float)p0[(ulong)n * K + kb * BLK + e] * s;").unwrap();
     writeln!(out, "            }} else {{").unwrap();
@@ -15920,9 +15928,15 @@ module {
         assert!(msl.contains("kernel void mulmm_q8_0_fused"), "{}", msl);
 
         // Both operands staged, so a weight load serves the whole tile.
-        assert!(msl.contains("threadgroup float tgW[TN][BLK]")
-             && msl.contains("threadgroup float tgX[TM][BLK]"),
+        assert!(msl.contains("threadgroup float tgW[TN][PAD]")
+             && msl.contains("threadgroup float tgX[TM][PAD]"),
             "both operands must be staged in threadgroup memory:\n{}", msl);
+        // The pad is load-bearing: a row of exactly BLK floats puts every row
+        // on the same bank, and the inner product reads a different row per
+        // thread -- a 32-way conflict invariant to the tile size. Measured 2.5x
+        // at n=8 purely from this one word.
+        assert!(msl.contains("const uint PAD = BLK + 1u;"),
+            "the stage must be padded against bank conflicts:\n{}", msl);
 
         // TWO barriers per K-block. With only the first, a fast thread can
         // overwrite the staging buffers for the next block while a slow one is
