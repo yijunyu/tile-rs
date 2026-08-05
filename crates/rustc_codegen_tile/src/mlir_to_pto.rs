@@ -2761,6 +2761,24 @@ fn translate_attention(
     // lowers it on PIPE_MTE3 as a UB→L1 copy. dst must be blayout=col_major
     // + slayout=row_major (which `mat_tile_type` already produces) and src
     // must be blayout=row_major + slayout=none_box (which vec tiles are).
+    //
+    // SECOND a2a3 blocker (see the Acc->Vec note earlier in this function).
+    // `pto.tinsert` is A5-only, so an a2a3-compatible attention needs BOTH
+    // crossings rerouted, not just the score move:
+    //
+    //   1. scores  Acc -> Vec   (softmax input)
+    //   2. weights Vec -> Mat   (this tinsert: softmax output -> cube)
+    //
+    // Both take the same fix and can share ONE S x S GM scratch buffer used
+    // sequentially: tstore to GM, then tload back into the destination tile
+    // kind. The precedent for the second leg is already in this function --
+    // V is loaded GM partition_view -> mat precisely to "avoid vec->mat
+    // tmov" -- so GM -> Mat is known-good on a2a3; only the store side is new.
+    //
+    // That makes an a2a3 attention path a self-contained change: a new
+    // opt-in intrinsic taking a scratch GM pointer (intrinsics may take raw
+    // GM pointers -- cf. `tile_store_f32(gm: *mut f32, ...)`), two
+    // tstore/tload round trips, and exclusion from `module_uses_a5_ops`.
     ctx.use_size(0);
     ops.push(format!(
         "pto.tinsert ins({}, %c0, %c0 : {}, index, index) outs({} : {})",
