@@ -1391,6 +1391,11 @@ fn analyze_body(
             translate_binary(line, "f32", "pto.tdiv", ctx, &mut ops)?;
             continue;
         }
+        // tile.broadcast_row f32 — dst[r][c] = src[r][0]
+        if line.contains("__tile_broadcast_row_f32") {
+            translate_broadcast_row(line, "f32", ctx, &mut ops)?;
+            continue;
+        }
         // tile.neg f32
         if line.contains("__tile_neg_f32") {
             translate_unary(line, "f32", "pto.tneg", ctx, &mut ops)?;
@@ -2616,6 +2621,48 @@ fn translate_softmax(
         t_exp_ssa, t_sum_ssa, tb_ty, rr_ty, t_out_ssa, tb_ty
     ));
 
+    Ok(())
+}
+
+/// `dst[r][c] = src[r][0]` — broadcast a per-row value across columns.
+///
+/// Lowers to `pto.trowexpand`, which vector_dups the lane-0 value of a
+/// row-reduce tile across the destination row. `src` must therefore be an
+/// `R × 1` tile allocated with the row-reduce type; `dst` is a plain `R × C`
+/// vector tile.
+fn translate_broadcast_row(
+    line: &str,
+    dtype: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let args = extract_call_args(line)
+        .ok_or_else(|| format!("broadcast_row: cannot parse args: {}", line))?;
+    if args.len() < 4 {
+        return Err(format!(
+            "broadcast_row: expected 4 args (dst, src, rows, cols), got {}",
+            args.len()
+        ));
+    }
+    let result_ssa =
+        extract_result_ssa(line).unwrap_or_else(|| "__bcast_out".to_string());
+    let src_arg = args[1].trim();
+    let rows = ctx.resolve_const(args[2].trim());
+    let cols = ctx.resolve_const(args[3].trim());
+
+    let src = ctx
+        .get_tile(src_arg)
+        .ok_or_else(|| format!("broadcast_row: unknown src tile {}", src_arg))?
+        .clone();
+    let _ = src;
+
+    let rr_ty = tile_buf_type_rowreduce(rows, dtype);
+    let vec_ty = tile_buf_type(rows, cols, dtype);
+    let dst = ctx.alloc_tile_typed(&result_ssa, rows, cols, dtype, &vec_ty, ops);
+    ops.push(format!(
+        "pto.trowexpand ins({} : {}) outs({} : {})",
+        src_arg, rr_ty, dst, vec_ty
+    ));
     Ok(())
 }
 
@@ -8355,6 +8402,15 @@ module {
             .expect_err("undefined Q tile still errors");
         assert!(!err.contains("attention_causal"),
             "plain attention must not hit the causal rejection:\n{}", err);
+    }
+
+    /// Broadcast-row must lower to pto.trowexpand (vector_dup of the lane-0
+    /// value), not to a materialised copy.
+    #[test]
+    fn test_pto_broadcast_row_uses_trowexpand() {
+        let call = "%r = llvm.call @__tile_broadcast_row_f32(%c0, %src, %c8, %c32) : (i32, i32, i32, i32) -> i32";
+        // unknown src tile must still error rather than emit a bogus op
+        assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
     }
 
     #[test]

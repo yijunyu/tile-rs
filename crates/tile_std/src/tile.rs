@@ -2037,6 +2037,18 @@ extern "C" {
         m: u32, k: u32, n: u32,
     ) -> u32;
 
+    /// Broadcast a per-row value across columns: `dst[r][c] = src[r][0]`.
+    ///
+    /// The missing piece for quantised kernels whose scales vary along the
+    /// reduction axis: a block's scale arrives as an `R × 1` column and must
+    /// be applied to an `R × C` tile of dequantised weights. Without this the
+    /// scale cannot leave its tile — `tile_scale_f32` takes a scalar *value*,
+    /// and nothing extracts a scalar from a tile.
+    ///
+    /// PTO lowers this to `pto.trowexpand` (vector_dup of the lane-0 value
+    /// across the destination row); MSL to an index-broadcast copy.
+    pub fn __tile_broadcast_row_f32(dst: u32, src: u32, rows: u32, cols: u32) -> u32;
+
     /// Load a `ROWS × COLS` i8 tile from global memory.
     ///
     /// PTO lowering: tload into a `loc=mat, dtype=i8` tile → tmov into `loc=left`
@@ -2399,6 +2411,20 @@ pub fn tile_reduce_sum_f32<const ROWS: usize, const COLS: usize>(
 
 /// Scale all elements of a tile by a scalar.
 #[inline(always)]
+/// Broadcast a per-row value across `COLS` columns: `dst[r][c] = src[r][0]`.
+///
+/// Complements [`tile_scale_f32`], which can only apply a scalar known to the
+/// program. Use this when the multiplier lives in memory — notably a
+/// quantisation scale that varies along the reduction axis.
+#[inline(always)]
+pub fn tile_broadcast_row_f32<const ROWS: usize, const COLS: usize>(
+    src: Tile<ROWS, 1, f32>,
+) -> Tile<ROWS, COLS, f32> {
+    let buf_id =
+        unsafe { __tile_broadcast_row_f32(0, src.buf_id, ROWS as u32, COLS as u32) };
+    Tile { buf_id, _phantom: PhantomData }
+}
+
 pub fn tile_scale_f32<const ROWS: usize, const COLS: usize>(
     src: Tile<ROWS, COLS, f32>,
     scalar: f32,

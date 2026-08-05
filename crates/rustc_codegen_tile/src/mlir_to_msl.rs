@@ -128,6 +128,7 @@ enum KernelType {
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
     AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
+    BroadcastRow, // dst[r][c] = src[r][0] — per-row value across columns
     Rope,        // rotary position embeddings
     RopeDsv4,    // DS4 partial-RoPE: copy n_nope prefix, rotate tail with YaRN
     Dsv4Ratio4Shift, // DS4 KV ratio-4 recurrent-state shift: state[i]=state[4w+i] for two buffers
@@ -587,6 +588,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention  => 4,    // q, k, v, out
         KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
+        KernelType::BroadcastRow => 2, // src (R x 1), dst (R x C)
         KernelType::Rope       => 2,    // src, dst
         KernelType::RopeDsv4   => 4,    // src, pos(int), src2_freq(float, optional), dst
         KernelType::Dsv4Ratio4Shift => 2, // state_kv, state_score
@@ -1045,6 +1047,10 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& seq          [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& dim          [[ buffer({}) ]],", params_idx + 2).unwrap();
+        }
+        KernelType::BroadcastRow => {
+            writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
         KernelType::Rope => {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
@@ -2228,7 +2234,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
                 KernelType::PartitionCell
             | KernelType::PartitionCellStore
     | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
-            | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
+            | KernelType::BroadcastRow
+        | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
             | KernelType::FlashAttnExtF16Dk512Dv512
@@ -2477,6 +2484,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention    => emit_attention_msl(out, msl_type),
         KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
+        KernelType::BroadcastRow => emit_broadcast_row_msl(out, msl_type),
         KernelType::Rope         => emit_rope_msl(out, msl_type),
         KernelType::RopeDsv4     => emit_rope_dsv4_msl(out),
         KernelType::Dsv4Ratio4Shift => emit_dsv4_ratio4_shift_msl(out),
@@ -2876,6 +2884,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_attention_f32"     => { ctx.kernel_type = KernelType::Attention; }
                 "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
+                "__tile_broadcast_row_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::BroadcastRow; } }
                 "__tile_rope_f32"          => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Rope; } }
                 "__tile_rope_dsv4_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::RopeDsv4; } }
                 "__tile_dsv4_ratio4_shift_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Dsv4Ratio4Shift; } }
@@ -3859,6 +3868,19 @@ fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
 /// Rope: rotary position embeddings.
 /// Buffers: p0=src (rows×cols), p1=dst (rows×cols).
 /// Params: rows, cols, pos.
+/// Broadcast a per-row value across columns: `dst[r][c] = src[r][0]`.
+///
+/// The scale-application primitive quantised kernels need: a per-block scale
+/// arrives as an `R x 1` column and must multiply an `R x C` tile. One
+/// threadgroup per row; threads stripe the columns.
+fn emit_broadcast_row_msl(out: &mut String, msl_type: &str) {
+    writeln!(out, "    uint r = row;").unwrap();
+    writeln!(out, "    if (r >= rows) return;").unwrap();
+    writeln!(out, "    {} v = p0[r];   // the row's single value", msl_type).unwrap();
+    writeln!(out, "    for (uint c = tid; c < cols; c += tcount)").unwrap();
+    writeln!(out, "        p1[r * cols + c] = v;").unwrap();
+}
+
 fn emit_rope_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    // RoPE: apply cos/sin rotation for each pair of dims").unwrap();
     writeln!(out, "    uint r = row;").unwrap();
@@ -13393,6 +13415,33 @@ module {
         assert!(!msl.contains("k_end"), "plain attention must not emit a causal bound:\n{}", msl);
     }
 
+    /// Broadcast-row is the scale-application primitive for quantised
+    /// kernels: it must read ONE value per row and fan it across the columns.
+    #[test]
+    fn test_msl_broadcast_row() {
+        let mlir = r#"
+module {
+  llvm.func @bcast(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(8 : i32) : i32
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(32 : i32) : i32
+    %s = llvm.call @__tile_load_f32(%arg0, %r, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %d = llvm.call @__tile_broadcast_row_f32(%s, %r, %c) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %d, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let msl = convert_mlir_to_msl(mlir).unwrap();
+        assert!(msl.contains("float v = p0[r];"),
+            "must read one value per row:\n{}", msl);
+        assert!(msl.contains("p1[r * cols + c] = v;"),
+            "must fan that value across the row:\n{}", msl);
+        assert!(msl.contains("for (uint c = tid; c < cols; c += tcount)"),
+            "threads must stripe the columns:\n{}", msl);
+    }
+
     /// P1 (monotone-predicate block elision) on Metal: the causal op must
     /// bound every key loop by the diagonal instead of computing the full
     /// score matrix and masking it.
@@ -15079,6 +15128,27 @@ module {
             alt.push_str(&base[end..]);
             std::fs::write(format!("{}/mmt_u{}.metal", dir, f), alt.replace("kernel void mmt(", &format!("kernel void mmt_u{}(", f))).unwrap();
         }
+    }
+
+    /// Dump broadcast_row for device verification.
+    #[test]
+    fn dump_broadcast_row_msl() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let mlir = r#"
+module {
+  llvm.func @bcast(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(8 : i32) : i32
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(32 : i32) : i32
+    %s = llvm.call @__tile_load_f32(%arg0, %r, %one) : (!llvm.ptr<1>, i32, i32) -> i32
+    %d = llvm.call @__tile_broadcast_row_f32(%s, %r, %c) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %d, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        std::fs::write(format!("{}/bcast.metal", dir), convert_mlir_to_msl(mlir).unwrap()).unwrap();
     }
 
     /// Dumps the generated MSL for the causal op so the standalone Metal A/B
