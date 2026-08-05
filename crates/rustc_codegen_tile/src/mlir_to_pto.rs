@@ -2741,12 +2741,18 @@ fn translate_attention_scratch(
     let sv = ctx.alloc_tile_typed(&format!("{}__sv", result_ssa), s, s, "f32", &vec_ty, ops);
     // CROSSING 1 (Acc -> Vec) via GM. A direct tmov here is A5-only; both
     // legs below are supported on a2a3 and A5 alike.
+    // Two DISJOINT S x S regions of the scratch buffer, one per crossing.
+    // Reusing a single region made both round trips alias the same partition
+    // view; ptoas's auto-sync did not order them and the kernel hung
+    // (ACL_ERROR_RT_AICORE_TIMEOUT). Disjoint regions remove the aliasing
+    // outright, so the scratch must hold 2 * S * S elements.
     let scratch_gm = resolve_gm_name(&ctx.resolve_ptr(scratch_arg), func);
-    let tv_scratch = ctx.get_or_make_tv(&scratch_gm, s, s, "f32", ops);
-    let pv_scratch = ctx.make_pv(&tv_scratch, s, s, "f32", 0, ops);
+    let tv_scratch = ctx.get_or_make_tv(&scratch_gm, 2 * s, s, "f32", ops);
+    let pv_scores = ctx.make_pv(&tv_scratch, s, s, "f32", 0, ops);
+    let pv_weights = ctx.make_pv(&tv_scratch, s, s, "f32", s * s, ops);
     let pv_ss = ptv_type(s, s, "f32");
-    ops.push(format!("pto.tstore ins({} : {}) outs({} : {})", scores, acc_ty, pv_scratch, pv_ss));
-    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_scratch, pv_ss, sv, vec_ty));
+    ops.push(format!("pto.tstore ins({} : {}) outs({} : {})", scores, acc_ty, pv_scores, pv_ss));
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_scores, pv_ss, sv, vec_ty));
 
     // Step 3: softmax (5-step) — mirrors translate_softmax.
     // max and sum are row-reductions (rows×1, col_major), so they need the
@@ -2786,8 +2792,8 @@ fn translate_attention_scratch(
     // crossing 1 has been fully consumed into `sv`. `pto.tinsert` is the
     // A5-only op the ordinary lowering uses here; GM -> Mat is already the
     // path V takes below, so this leg is known-good on a2a3.
-    ops.push(format!("pto.tstore ins({} : {}) outs({} : {})", wt, vec_ty, pv_scratch, pv_ss));
-    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_scratch, pv_ss, mw, mw_ty));
+    ops.push(format!("pto.tstore ins({} : {}) outs({} : {})", wt, vec_ty, pv_weights, pv_ss));
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_weights, pv_ss, mw, mw_ty));
     ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", mw, mw_ty, lw, lw_ty));
     ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", mv, mv_ty, rv, rv_ty));
     ops.push(format!("pto.tmatmul ins({}, {} : {}, {}) outs({} : {})", lw, rv, lw_ty, rv_ty, out, out_ty));

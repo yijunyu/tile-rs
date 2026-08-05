@@ -3531,3 +3531,68 @@ pub mod safe {
     }
 
 }
+
+// =============================================================================
+// ggml coverage: quant formats as a trait over REPACKED planes
+// =============================================================================
+//
+// ggml stores quantised weights as interleaved blocks, e.g.
+// `block_q8_0 { ggml_half d; int8_t qs[32] }` — 34 bytes, scale and quants
+// adjacent. This DSL cannot address that: every `tile_load_*` takes a bare
+// pointer plus const ROWS/COLS, with no stride, offset or byte addressing.
+//
+// So a tile-rs ggml backend stores tensors REPACKED into separate contiguous
+// planes — one plane of quants, one of scales — converting at `set_tensor`.
+// That is ggml's own sanctioned mechanism: see
+// `ggml_backend_cpu_repack_buffer_type()` and `ggml/src/ggml-cpu/repack.h`,
+// whose `template<int K, int N> struct block { ggml_half d[N]; ... }` is the
+// same grouped-scale shape. Planes also coalesce better on GPU than a 34-byte
+// stride, so this is not a concession.
+//
+// `Quant` describes one such format. Op templates (`mul_mv`, `mul_mm`,
+// `flash_attn`) are written ONCE against this trait; adding a format means
+// implementing the trait, not re-deriving the op.
+
+/// A quantised weight format, described over its repacked planes.
+pub trait Quant {
+    /// Elements per scale block (ggml's `QK*`): 32 for Q8_0/Q4_0, 256 for K-quants.
+    const BLOCK: usize;
+    /// Bits per quantised weight — 8 for Q8_0, 4 for Q4_0, 6 for Q6_K.
+    const BITS: usize;
+    /// Quants per stored byte in the quant plane (8 / BITS, min 1).
+    const PER_BYTE: usize;
+    /// True when the format carries a per-block minimum/offset plane as well
+    /// as a scale plane (Q4_1, Q5_1, K-quants with mins).
+    const HAS_MIN: bool;
+}
+
+/// ggml `Q8_0`: 32 int8 quants per block, one f16 scale, no minimum.
+/// Repacked as a plane of `i8` quants and a plane of `f32` scales.
+pub struct Q8_0;
+impl Quant for Q8_0 {
+    const BLOCK: usize = 32;
+    const BITS: usize = 8;
+    const PER_BYTE: usize = 1;
+    const HAS_MIN: bool = false;
+}
+
+/// ggml `Q4_0`: 32 quants of 4 bits (two per byte), one f16 scale, no minimum.
+pub struct Q4_0;
+impl Quant for Q4_0 {
+    const BLOCK: usize = 32;
+    const BITS: usize = 4;
+    const PER_BYTE: usize = 2;
+    const HAS_MIN: bool = false;
+}
+
+/// Number of scale-blocks spanning `K` elements of one row, for format `Q`.
+#[inline(always)]
+pub const fn blocks_per_row<Q: Quant>(k: usize) -> usize {
+    (k + Q::BLOCK - 1) / Q::BLOCK
+}
+
+/// Bytes occupied by one row's quants in the repacked quant plane.
+#[inline(always)]
+pub const fn quant_bytes_per_row<Q: Quant>(k: usize) -> usize {
+    (k + Q::PER_BYTE - 1) / Q::PER_BYTE
+}
