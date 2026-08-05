@@ -4017,14 +4017,20 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
     writeln!(out, "        uint i = u * VPL;                   // first uchar4 this lane owns").unwrap();
     writeln!(out, "        uint b = i / UPB;                   // block it falls in").unwrap();
-    // The two activation halves of a block are 16 elements = 4 float4s apart.
+    // The quant plane is re-interleaved at repack time so a unit's two nibble
+    // halves cover elements 8u..8u+3 and 8u+4..8u+7 -- float4 2u and 2u+1,
+    // ADJACENT. In ggml's own layout the halves sit sixteen elements apart and
+    // this is two scattered streams instead of one contiguous pair.
     writeln!(out, "        float4 xlo[VPL];").unwrap();
     writeln!(out, "        float4 xhi[VPL];").unwrap();
     writeln!(out, "        for (uint j = 0u; j < VPL; ++j) {{").unwrap();
-    writeln!(out, "            uint k = (i + j) % UPB;         // which quarter of the block").unwrap();
-    writeln!(out, "            uint bb = (i + j) / UPB;").unwrap();
-    writeln!(out, "            xlo[j] = x4[bb * 8u + k];").unwrap();
-    writeln!(out, "            xhi[j] = x4[bb * 8u + 4u + k];").unwrap();
+    writeln!(out, "            xlo[j] = x4[2u * (i + j)];").unwrap();
+    // Pre-scaled by 1/16 so the high nibble never has to be shifted down: it
+    // is masked IN PLACE as (q & 0xF0), which is 16x its value, and the
+    // activation carries the 1/16. The zero point scales with it, hence -128
+    // rather than -8. One multiply per unit, amortized over every row in the
+    // tile, replaces a shift per unit PER ROW.
+    writeln!(out, "            xhi[j] = x4[2u * (i + j) + 1u] * (1.0f / 16.0f);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
@@ -4036,8 +4042,8 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "            float sum = 0.0f;").unwrap();
     writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
     writeln!(out, "                uchar4 qq = q4[i + j];").unwrap();
-    writeln!(out, "                sum += dot(float4(qq & (uchar4)0x0F) - 8.0f, xlo[j]);").unwrap();
-    writeln!(out, "                sum += dot(float4(qq >> (uchar4)4)   - 8.0f, xhi[j]);").unwrap();
+    writeln!(out, "                sum += dot(float4(qq & (uchar4)0x0F) -   8.0f, xlo[j]);").unwrap();
+    writeln!(out, "                sum += dot(float4(qq & (uchar4)0xF0) - 128.0f, xhi[j]);").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * sum;").unwrap();
     writeln!(out, "        }}").unwrap();
@@ -15780,11 +15786,19 @@ module {
 
         // Both halves, each against its own activation slice: ggml puts element
         // j in the low nibble of byte j and element j+16 in the high.
-        assert!(msl.contains("qq & (uchar4)0x0F") && msl.contains("qq >> (uchar4)4"),
-            "both nibble halves must be taken:\n{}", msl);
-        assert!(msl.contains("x4[bb * 8u + k]") && msl.contains("x4[bb * 8u + 4u + k]"),
-            "the halves pair with activations 16 elements apart:\n{}", msl);
-        assert!(msl.contains("- 8.0f"), "the Q4_0 zero point must be applied:\n{}", msl);
+        // The high nibble is masked in place, never shifted -- its factor of
+        // 16 rides on the pre-scaled activation instead.
+        assert!(msl.contains("qq & (uchar4)0x0F") && msl.contains("qq & (uchar4)0xF0"),
+            "both nibble halves must be taken, by mask:\n{}", msl);
+        assert!(!msl.contains(">> (uchar4)4"),
+            "the high nibble must not be shifted down:\n{}", msl);
+        assert!(msl.contains("* (1.0f / 16.0f)") && msl.contains("- 128.0f"),
+            "the shift must be folded into the activation and the zero point:\n{}", msl);
+        // Adjacent, not sixteen elements apart: the repack re-interleaves the
+        // plane so a unit's halves land on consecutive float4s.
+        assert!(msl.contains("x4[2u * (i + j)]") && msl.contains("x4[2u * (i + j) + 1u]"),
+            "the halves must pair with ADJACENT activations:\n{}", msl);
+        assert!(msl.contains("-   8.0f"), "the Q4_0 zero point must be applied:\n{}", msl);
 
         // Unpacked weights must never reach memory; only the result is stored.
         assert_eq!(msl.matches("p3[").count(), 1,
