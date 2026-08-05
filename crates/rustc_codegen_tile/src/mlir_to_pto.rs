@@ -2112,6 +2112,18 @@ fn emit_blocked_matmul_loops(
     // outer scf.for is present, sometimes flipping RowMajor→ColMajor even if
     // the loop is degenerate (0..1). Emitting the K-loop directly at top
     // level matches the probe and keeps ptoas on the verified codepath.
+    //
+    // SCOPE OF THAT CAUTION, settled on device 2026-08-06 (910B2, ptoas 0.55):
+    // it is i8-specific and does NOT apply to f32. The same f32 matmul emitted
+    // with and without the outer loop gives `BLayout::RowMajor` for the Left
+    // tile in both generated C++ files, and both match a host reference to
+    // 2.98e-08 — identical, and the check is not vacuous (perturbing one input
+    // element drives it to 5.5e-02 and fails). See `bin/blayout_probe.rs`.
+    //
+    // The elision above is therefore conservative rather than required for
+    // f32. It is kept because it costs nothing here, but it does NOT mean an
+    // f32 kernel must avoid an outer scf.for — which matters for batched
+    // heads, where the loop form lifts the UB ceiling that unrolling imposes.
     let (n_off_ssa, outer_indent) = if p.n_iters > 1 {
         let bi64_ssa = ctx.fresh_ssa();
         let bn64_ssa = ctx.fresh_ssa();
