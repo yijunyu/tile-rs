@@ -3931,6 +3931,18 @@ fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
 /// lower it too — composing a wide tile there needs the A5-only
 /// `pto.tinsert`. ggml's Q4 layout makes the halves independent anyway: the
 /// low half is elements `0..C`, the high half `C..2C`.
+/// Output rows one threadgroup of the fused mat-vec covers.
+///
+/// Tuned on an Apple M1 Ultra against a Q8_0 4096x14336 decode mat-vec, which
+/// is purely bandwidth bound (ggml's hand-written kernel sustains ~820 GB/s
+/// there, at the part's roofline). The activation vector is fetched once per
+/// threadgroup and reused across its rows, so this trades registers for
+/// activation traffic: at 1 the whole vector is re-read for every output row.
+///
+/// A consumer's dispatch grid MUST agree with this -- it is row TILES times
+/// columns, not one threadgroup per output element.
+pub const MUL_MV_ROWS_PER_TG: usize = 16;
+
 /// Fused Q8_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
 ///
 /// One threadgroup per output element, threads striding over the row's blocks,
@@ -3945,45 +3957,67 @@ fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
 /// different, for no gain.
 fn emit_mul_mv_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "    const uint BLK = 32u;").unwrap();
-    writeln!(out, "    uint gid = row;   // one threadgroup per output element").unwrap();
-    writeln!(out, "    if (gid >= n_rows * n_cols) return;").unwrap();
-    writeln!(out, "    uint n = gid % n_rows;   // weight row").unwrap();
-    writeln!(out, "    uint m = gid / n_rows;   // activation column").unwrap();
+    writeln!(out, "    const uint VEC = 4u;").unwrap();
+    writeln!(out, "    const uint VPB = BLK / VEC;            // vectors per block").unwrap();
+    // Each threadgroup covers ROWS_PER_TG output rows so the activation vector
+    // is fetched once and reused across them. With one row per threadgroup the
+    // whole vector is re-read for every row -- for a 4096-row projection that
+    // is 4096 passes over it, and it, not the weights, becomes the limit.
+    writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_ROWS_PER_TG).unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    device const char*  q = p0 + (ulong)n * blocks_per_row * BLK;").unwrap();
-    writeln!(out, "    device const float* s = p1 + (ulong)n * blocks_per_row;").unwrap();
-    writeln!(out, "    device const float* x = p2 + (ulong)m * blocks_per_row * BLK;").unwrap();
+    writeln!(out, "    uint tg = row;   // threadgroup covers ROWS_PER_TG rows of one column").unwrap();
+    writeln!(out, "    uint row_tiles = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;").unwrap();
+    writeln!(out, "    if (tg >= row_tiles * n_cols) return;").unwrap();
+    writeln!(out, "    uint m  = tg / row_tiles;              // activation column").unwrap();
+    writeln!(out, "    uint n0 = (tg % row_tiles) * ROWS_PER_TG;").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    for (uint b = tid; b < blocks_per_row; b += tcount) {{").unwrap();
-    // A block is 32 bytes of quants against 128 bytes of activations, both
-    // naturally aligned, so both sides vectorize without a tail.
-    writeln!(out, "        device const char4*  q4 = (device const char4*)(q + (ulong)b * BLK);").unwrap();
-    writeln!(out, "        device const float4* x4 = (device const float4*)(x + (ulong)b * BLK);").unwrap();
-    writeln!(out, "        float4 part = float4(0.0f);").unwrap();
-    writeln!(out, "        for (uint j = 0; j < BLK / 4u; ++j) {{").unwrap();
-    writeln!(out, "            part += float4(q4[j]) * x4[j];").unwrap();
+    writeln!(out, "    uint n_vec = blocks_per_row * VPB;").unwrap();
+    writeln!(out, "    device const float4* x4 = (device const float4*)(p2 + (ulong)m * blocks_per_row * BLK);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
+    writeln!(out).unwrap();
+    // Consecutive lanes read consecutive vectors, so a simdgroup covers one
+    // contiguous span on every operand it touches.
+    writeln!(out, "    for (uint i = tid; i < n_vec; i += tcount) {{").unwrap();
+    writeln!(out, "        float4 xv = x4[i];          // fetched once for all ROWS_PER_TG rows").unwrap();
+    writeln!(out, "        uint   b  = i / VPB;").unwrap();
+    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "            uint n = n0 + r;").unwrap();
+    writeln!(out, "            if (n >= n_rows) break;").unwrap();
+    writeln!(out, "            device const char4* q4 = (device const char4*)(p0 + (ulong)n * blocks_per_row * BLK);").unwrap();
+    writeln!(out, "            device const float* s  = p1 + (ulong)n * blocks_per_row;").unwrap();
+    writeln!(out, "            float4 p = float4(q4[i]) * xv;").unwrap();
+    writeln!(out, "            acc[r] += s[b] * (p.x + p.y + p.z + p.w);").unwrap();
     writeln!(out, "        }}").unwrap();
-    writeln!(out, "        acc += s[b] * (part.x + part.y + part.z + part.w);").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    // simdgroup reduction, then across simdgroups through shared memory").unwrap();
-    writeln!(out, "    acc = simd_sum(acc);").unwrap();
     writeln!(out, "    constexpr uint MAX_SG = 1024u / 32u;").unwrap();
-    writeln!(out, "    threadgroup float mv_shared[MAX_SG];").unwrap();
+    writeln!(out, "    threadgroup float mv_shared[ROWS_PER_TG][MAX_SG];").unwrap();
     writeln!(out, "    uint lane = tid % 32u;").unwrap();
     writeln!(out, "    uint sg   = tid / 32u;").unwrap();
     writeln!(out, "    uint n_sg = (tcount + 31u) / 32u;").unwrap();
-    writeln!(out, "    if (sg == 0u && lane < MAX_SG) mv_shared[lane] = 0.0f;").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "        if (sg == 0u && lane < MAX_SG) mv_shared[r][lane] = 0.0f;").unwrap();
+    writeln!(out, "    }}").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    if (lane == 0u) mv_shared[sg] = acc;").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "        float v = simd_sum(acc[r]);").unwrap();
+    writeln!(out, "        if (lane == 0u) mv_shared[r][sg] = v;").unwrap();
+    writeln!(out, "    }}").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
     writeln!(out, "    if (sg == 0u) {{").unwrap();
-    writeln!(out, "        float v = (lane < n_sg) ? mv_shared[lane] : 0.0f;").unwrap();
-    writeln!(out, "        v = simd_sum(v);").unwrap();
-    writeln!(out, "        if (lane == 0u) p3[gid] = v;").unwrap();
+    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "            uint n = n0 + r;").unwrap();
+    writeln!(out, "            if (n >= n_rows) break;").unwrap();
+    writeln!(out, "            float v = (lane < n_sg) ? mv_shared[r][lane] : 0.0f;").unwrap();
+    writeln!(out, "            v = simd_sum(v);").unwrap();
+    writeln!(out, "            if (lane == 0u) p3[(ulong)m * n_rows + n] = v;").unwrap();
+    writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
 }
+
 
 fn emit_unpack_nibbles_msl(out: &mut String, msl_type: &str, high: bool) {
     writeln!(out, "    uint r = row;").unwrap();
@@ -15543,12 +15577,25 @@ module {
 
         // The dequantized weights must never reach memory -- that is the whole
         // difference from the composed path. The only device store is the result.
-        let stores = msl.matches("p3[gid] =").count();
+        let stores = msl.matches("p3[").count();
         assert_eq!(stores, 1, "exactly one device store, the result:\n{}", msl);
 
-        // Scale applied per block, after that block's products are summed --
-        // ggml's own association.
-        assert!(msl.contains("acc += s[b] *"), "per-block scale:\n{}", msl);
+        // Activations are fetched once per threadgroup and reused across its
+        // rows. One row per threadgroup re-reads the whole vector for every
+        // output row, and at 4096 rows that traffic outweighs the weights.
+        assert!(msl.contains("ROWS_PER_TG"), "rows must share their activations:\n{}", msl);
+        assert!(msl.contains("float4 xv = x4[i];"), "one fetch, many rows:\n{}", msl);
+
+        // The scale is indexed by the vector's block, so a lane that reads
+        // four weights still gets the scale of the block they came from.
+        assert!(msl.contains("uint   b  = i / VPB;") && msl.contains("acc[r] += s[b] *"),
+            "the scale must follow the vector's block:\n{}", msl);
+
+        // Consecutive lanes must read consecutive vectors. Striding by BLOCK
+        // instead puts neighbouring lanes 32 bytes apart inside one load,
+        // which halves achievable bandwidth on a bandwidth-bound kernel.
+        assert!(msl.contains("for (uint i = tid; i < n_vec; i += tcount)"),
+            "the stride must be one vector, not one block:\n{}", msl);
 
         // Vectorized both sides; a block is 32 quant bytes against 128
         // activation bytes, both naturally aligned, so there is no tail.
