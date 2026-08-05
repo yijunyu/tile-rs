@@ -2640,6 +2640,21 @@ fn translate_softmax(
 ///
 /// Numerically identical to `translate_attention`: same matmuls, same
 /// softmax op sequence, same operand order. Only the transport changes.
+///
+/// **STATUS: compiles for a2a3, but DOES NOT RUN YET — do not ship.**
+/// The emitted module carries no `a5` attribute and `ccec
+/// --cce-aicore-arch=dav-c220-cube` accepts it with 0 errors (the ordinary
+/// lowering fails there with `TMov: Invalid TileType`), so the tile-kind
+/// problem really is solved. But executing it on a 910c faults with
+/// `ACL_ERROR_RT_AICORE_TIMEOUT` (507014) — the kernel hangs.
+///
+/// Most likely cause: the store and the re-load alias the same global
+/// buffer, and ptoas's auto-inserted synchronisation does not appear to
+/// order them — a `wait_flag` never fires. A timeout rather than wrong
+/// numbers points at sync, not at layout. Things to try next: an explicit
+/// pipe barrier / `dcci` between the `tstore` and `tload` of each round
+/// trip, `--bisheng-vf-auto-sync=global`, or two disjoint scratch regions
+/// (one per crossing) to remove the aliasing entirely.
 fn translate_attention_scratch(
     line: &str,
     ctx: &mut PtoContext,
