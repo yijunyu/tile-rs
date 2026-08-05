@@ -128,6 +128,12 @@ enum KernelType {
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
     AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
+    MulMmQ8_0Planar, // FUSED Q8_0 mat-MAT over repacked planes: a cooperative
+                     // GEMM. Each THREADGROUP owns a tile and stages both
+                     // operands in threadgroup memory, so a weight load serves
+                     // every column of the tile. The mat-vec gives each THREAD
+                     // a set of blocks, which is why columns cannot be folded
+                     // into it -- they would have to live in registers.
     MulMvQ4_0Planar, // FUSED Q4_0 mat-vec over repacked planes: nibbles stay
                      // PACKED in memory and are unpacked in registers, so a
                      // Q4 model keeps the memory it was chosen for.
@@ -604,7 +610,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention  => 4,    // q, k, v, out
         KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
-        KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar => 4, // quants, scales, activations, out
+        KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar => 4, // quants, scales, activations, out
         KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi => 2, // src bytes, dst f32
         KernelType::BroadcastRow => 2, // src (R x 1), dst (R x C)
         KernelType::Rope       => 2,    // src, dst
@@ -971,6 +977,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // Q8_0 quants are SIGNED bytes; reading them unsigned turns every
             // negative weight into a large positive one.
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
+            else if ctx.kernel_type == KernelType::MulMmQ8_0Planar && i == 0 { "char" }
             // Q4_0 nibbles are UNSIGNED bytes; the zero point is subtracted
             // after unpacking, so signing them here would corrupt the high half.
             else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "uint" }
@@ -978,7 +985,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // Widening the plane to f32 adds 3.7 MB of traffic to a 66 MB
             // kernel that is purely bandwidth bound, to carry no more
             // information than the source had.
-            else if matches!(ctx.kernel_type, KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar) && i == 1 { "half" }
+            else if matches!(ctx.kernel_type, KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar) && i == 1 { "half" }
             // The i8 side of quantize/dequantize is stored as real signed bytes,
             // which is what a quantized checkpoint actually holds. Typing it as
             // float instead made the pair unable to address any weight buffer.
@@ -1088,7 +1095,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
-        KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar => {
+        KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar => {
             writeln!(out, "    constant uint& n_rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& blocks_per_row [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& n_cols         [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2280,7 +2287,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::PartitionCellStore
     | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
             | KernelType::BroadcastRow | KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi
-            | KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar
+            | KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar
         | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
@@ -2532,6 +2539,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
         KernelType::MulMvQ8_0Planar => emit_mul_mv_q8_0_planar_msl(out),
         KernelType::MulMvQ4_0Planar => emit_mul_mv_q4_0_planar_msl(out),
+        KernelType::MulMmQ8_0Planar => emit_mul_mm_q8_0_planar_msl(out),
         KernelType::UnpackNibblesLo => emit_unpack_nibbles_msl(out, msl_type, false),
         KernelType::UnpackNibblesHi => emit_unpack_nibbles_msl(out, msl_type, true),
         KernelType::BroadcastRow => emit_broadcast_row_msl(out, msl_type),
@@ -2939,6 +2947,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) -> Result<(), Stri
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
                 "__tile_mul_mv_q8_0_planar_f32" => { ctx.kernel_type = KernelType::MulMvQ8_0Planar; }
                 "__tile_mul_mv_q4_0_planar_f32" => { ctx.kernel_type = KernelType::MulMvQ4_0Planar; }
+                "__tile_mul_mm_q8_0_planar_f32" => { ctx.kernel_type = KernelType::MulMmQ8_0Planar; }
                 "__tile_unpack_nibbles_lo_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesLo; } }
                 "__tile_unpack_nibbles_hi_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesHi; } }
                 "__tile_broadcast_row_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::BroadcastRow; } }
@@ -4065,6 +4074,97 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "            float v = (lane < n_sg) ? mv_shared[r][lane] : 0.0f;").unwrap();
     writeln!(out, "            v = simd_sum(v);").unwrap();
     writeln!(out, "            if (lane == 0u) p3[(ulong)m * n_rows + n] = v;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Output tile of the Q8_0 GEMM, and the micro-tile each thread owns within it.
+///
+/// A thread computes `RT x CT` outputs, not one. With one output per thread the
+/// inner product is only `BLK` multiply-adds between two barriers, and the
+/// kernel is barrier-bound rather than compute-bound -- measured 13x slower
+/// than ggml. A micro-tile raises the work per barrier by `RT*CT` while reading
+/// `RT + CT` values from the stage instead of `RT*CT`.
+pub const MUL_MM_TN: usize = 64;
+pub const MUL_MM_TM: usize = 16;
+pub const MUL_MM_RT: usize = 4;
+pub const MUL_MM_CT: usize = 2;
+
+/// Fused Q8_0 mat-MAT over the repacked planes: a cooperative GEMM.
+///
+/// The mat-vec gives each THREAD a set of blocks, so folding columns into it
+/// would put a column tile in that thread's registers (measured: spills) or
+/// force re-reading the activations per row (measured: worse). This gives each
+/// THREADGROUP a tile instead, stages both operands in threadgroup memory, and
+/// gives each thread a register micro-tile of the result.
+///
+/// Weights are dequantized once, on the way into threadgroup memory, so the
+/// inner product is plain f32 and each weight is unpacked once per tile rather
+/// than once per output element.
+fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
+    writeln!(out, "    const uint BLK = 32u;                  // weights per block").unwrap();
+    writeln!(out, "    const uint TN  = {}u;                  // output rows per threadgroup", MUL_MM_TN).unwrap();
+    writeln!(out, "    const uint TM  = {}u;                  // output cols per threadgroup", MUL_MM_TM).unwrap();
+    writeln!(out, "    const uint RT  = {}u;                  // rows per thread", MUL_MM_RT).unwrap();
+    writeln!(out, "    const uint CT  = {}u;                  // cols per thread", MUL_MM_CT).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint row_tiles = (n_rows + TN - 1u) / TN;").unwrap();
+    writeln!(out, "    uint col_tiles = (n_cols + TM - 1u) / TM;").unwrap();
+    writeln!(out, "    if (row >= row_tiles * col_tiles) return;").unwrap();
+    writeln!(out, "    uint n0 = (row % row_tiles) * TN;").unwrap();
+    writeln!(out, "    uint m0 = (row / row_tiles) * TM;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint ti = tid % (TN / RT);             // my micro-tile, row direction").unwrap();
+    writeln!(out, "    uint tj = tid / (TN / RT);             // and column direction").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    threadgroup float tgW[TN][BLK];        // dequantized weights").unwrap();
+    writeln!(out, "    threadgroup float tgX[TM][BLK];        // activations").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint K = blocks_per_row * BLK;").unwrap();
+    writeln!(out, "    float acc[RT][CT];").unwrap();
+    writeln!(out, "    for (uint i = 0u; i < RT; ++i) for (uint j = 0u; j < CT; ++j) acc[i][j] = 0.0f;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint kb = 0u; kb < blocks_per_row; ++kb) {{").unwrap();
+    // Both stages are strided by the whole threadgroup, so consecutive lanes
+    // read consecutive elements of the same row -- coalesced on both operands.
+    writeln!(out, "        for (uint idx = tid; idx < TN * BLK; idx += tcount) {{").unwrap();
+    writeln!(out, "            uint r = idx / BLK, e = idx % BLK;").unwrap();
+    writeln!(out, "            uint n = n0 + r;").unwrap();
+    writeln!(out, "            if (n < n_rows) {{").unwrap();
+    writeln!(out, "                float s = (float)p1[(ulong)n * blocks_per_row + kb];").unwrap();
+    writeln!(out, "                tgW[r][e] = (float)p0[(ulong)n * K + kb * BLK + e] * s;").unwrap();
+    writeln!(out, "            }} else {{").unwrap();
+    writeln!(out, "                tgW[r][e] = 0.0f;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        for (uint idx = tid; idx < TM * BLK; idx += tcount) {{").unwrap();
+    writeln!(out, "            uint c = idx / BLK, e = idx % BLK;").unwrap();
+    writeln!(out, "            uint m = m0 + c;").unwrap();
+    writeln!(out, "            tgX[c][e] = (m < n_cols) ? p2[(ulong)m * K + kb * BLK + e] : 0.0f;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    // RT + CT reads from the stage feed RT * CT multiply-adds. That ratio is
+    // the whole reason for the micro-tile.
+    writeln!(out, "        for (uint e = 0u; e < BLK; ++e) {{").unwrap();
+    writeln!(out, "            float wf[RT], xf[CT];").unwrap();
+    writeln!(out, "            for (uint i = 0u; i < RT; ++i) wf[i] = tgW[ti * RT + i][e];").unwrap();
+    writeln!(out, "            for (uint j = 0u; j < CT; ++j) xf[j] = tgX[tj * CT + j][e];").unwrap();
+    writeln!(out, "            for (uint i = 0u; i < RT; ++i)").unwrap();
+    writeln!(out, "                for (uint j = 0u; j < CT; ++j) acc[i][j] += wf[i] * xf[j];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    // The second barrier is not optional: without it a fast thread can begin
+    // overwriting the staging buffers for block kb+1 while a slow one is still
+    // reading block kb.
+    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint i = 0u; i < RT; ++i) {{").unwrap();
+    writeln!(out, "        uint n = n0 + ti * RT + i;").unwrap();
+    writeln!(out, "        if (n >= n_rows) break;").unwrap();
+    writeln!(out, "        for (uint j = 0u; j < CT; ++j) {{").unwrap();
+    writeln!(out, "            uint m = m0 + tj * CT + j;").unwrap();
+    writeln!(out, "            if (m >= n_cols) break;").unwrap();
+    writeln!(out, "            p3[(ulong)m * n_rows + n] = acc[i][j];").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
 }
@@ -15622,9 +15722,10 @@ module {
         // shape, so a consumer needs no second code path to run them. Its
         // uniforms name the contraction (n_rows / blocks_per_row / n_cols)
         // rather than a tile extent, which is what tells the two apart.
-        let fused: [(&str, &str); 2] = [
+        let fused: [(&str, &str); 3] = [
             ("q8_0_fused", crate::mlir_parse::MATVEC_Q8_0_FUSED_MLIR),
             ("q4_0_fused", crate::mlir_parse::MATVEC_Q4_0_FUSED_MLIR),
+            ("q8_0_mm",    crate::mlir_parse::MATMAT_Q8_0_FUSED_MLIR),
         ];
         let mut fused_names: Vec<String> = Vec::new();
         for (tag, mlir) in fused {
@@ -15807,6 +15908,38 @@ module {
         // Unpacked weights must never reach memory; only the result is stored.
         assert_eq!(msl.matches("p3[").count(), 1,
             "exactly one device store, the result:\n{}", msl);
+    }
+
+    /// The GEMM must stage BOTH operands in threadgroup memory and barrier on
+    /// both sides of the inner product -- that is what makes it a GEMM rather
+    /// than a mat-vec with more columns.
+    #[test]
+    fn test_msl_fused_q8_0_matmat() {
+        let msl = convert_mlir_to_msl(crate::mlir_parse::MATMAT_Q8_0_FUSED_MLIR)
+            .expect("the fused GEMM must lower");
+        assert!(msl.contains("kernel void mulmm_q8_0_fused"), "{}", msl);
+
+        // Both operands staged, so a weight load serves the whole tile.
+        assert!(msl.contains("threadgroup float tgW[TN][BLK]")
+             && msl.contains("threadgroup float tgX[TM][BLK]"),
+            "both operands must be staged in threadgroup memory:\n{}", msl);
+
+        // TWO barriers per K-block. With only the first, a fast thread can
+        // overwrite the staging buffers for the next block while a slow one is
+        // still reading this one -- a race that shows up as rare wrong answers.
+        assert_eq!(msl.matches("threadgroup_barrier").count(), 2,
+            "one barrier after staging and one after consuming:\n{}", msl);
+
+        // Weights are dequantized once on the way in, not per output element.
+        assert!(msl.contains("tgW[r][e] = (float)p0["),
+            "weights must be dequantized into the stage:\n{}", msl);
+        assert!(msl.contains("acc[i][j] += wf[i] * xf[j];"),
+            "the inner product must read the stage, not memory:\n{}", msl);
+        // RT + CT stage reads feed RT * CT multiply-adds. One output per thread
+        // leaves only BLK multiply-adds between two barriers, which measured
+        // 13x slower than ggml -- barrier bound, not compute bound.
+        assert!(msl.contains("float wf[RT], xf[CT];"),
+            "each thread must own a register micro-tile:\n{}", msl);
     }
 
     /// The planar kernels took NEW intrinsic names on purpose.

@@ -2125,3 +2125,17 @@ module {
   }
 }
 "#;
+
+/// The FUSED Q8_0 mul_mm -- the GEMM form, for batched shapes.
+pub const MATMAT_Q8_0_FUSED_MLIR: &str = r#"
+module {
+  llvm.func @mulmm_q8_0_fused(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %nrows = llvm.mlir.constant(4096 : i32) : i32
+    %bpr = llvm.mlir.constant(448 : i32) : i32
+    %ncols = llvm.mlir.constant(512 : i32) : i32
+    llvm.call @__tile_mul_mm_q8_0_planar_f32(%arg0, %arg1, %arg2, %arg3, %nrows, %bpr, %ncols) : (!llvm.ptr<1>, !llvm.ptr<1>, !llvm.ptr<1>, !llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;

@@ -2047,6 +2047,13 @@ extern "C" {
     /// nibbles supply elements `0..C` and the high nibbles `C..2C`, i.e. two
     /// successive block iterations of a mat-vec. Not materialising the wide
     /// tile is both portable and cheaper.
+    /// Fused Q8_0 mat-MAT over repacked planes: a cooperative GEMM for the
+    /// batched shapes a mat-vec cannot serve.
+    pub fn __tile_mul_mm_q8_0_planar_f32(
+        quants: *const i8, scales: *const f32, acts: *const f32, out: *mut f32,
+        n_rows: u32, blocks_per_row: u32, n_cols: u32,
+    );
+
     /// Fused Q4_0 mat-vec over repacked planes. Same shape as the Q8_0 form,
     /// but the quant plane holds two weights per byte and stays packed.
     pub fn __tile_mul_mv_q4_0_planar_f32(
@@ -2463,6 +2470,21 @@ pub fn tile_reduce_sum_f32<const ROWS: usize, const COLS: usize>(
 /// a float plane of one scale per 32-element block -- because the DSL cannot
 /// address inside ggml's interleaved blocks. Unlike the composed form, the
 /// dequantized weights never reach memory: they are consumed in registers.
+/// Fused Q8_0 mat-MAT: the same contraction as the mat-vec, tiled so a weight
+/// load is shared across a threadgroup's columns rather than re-read per column.
+#[inline(always)]
+pub fn tile_mul_mm_q8_0_planar_f32(
+    quants: *const i8,
+    scales: *const f32,
+    acts: *const f32,
+    out: *mut f32,
+    n_rows: u32,
+    blocks_per_row: u32,
+    n_cols: u32,
+) {
+    unsafe { __tile_mul_mm_q8_0_planar_f32(quants, scales, acts, out, n_rows, blocks_per_row, n_cols) }
+}
+
 /// Fused Q4_0 mat-vec: `out[m][n] = sum_k w[n][k] * x[m][k]`.
 ///
 /// The quant plane holds two weights per byte and is consumed packed -- the
