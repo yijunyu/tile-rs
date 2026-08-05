@@ -2501,48 +2501,111 @@ fn translate_batched(
         return Err(format!("{name}: head count is 0 or unresolved in: {line}"));
     }
 
+    // Emit ONE head's body, then wrap it in a grid-strided loop whose induction
+    // variable shifts each partition_view to that head's slice.
+    //
+    // The tiles are allocated by the inner translator BEFORE the loop opens, so
+    // they are reused across heads rather than allocated per head. That is the
+    // whole point of the loop form: unrolling allocated 36 KB per head at
+    // S=32 D=64 and hit the 184 KB C1 budget at 5 heads, which is one short of
+    // MQA's 6. Reusing them removes that ceiling entirely.
+    //
+    // Safe for f32: `bin/blayout_probe.rs` confirms on 910B2 that an outer
+    // scf.for does not change the Left tile's BLayout and gives bit-identical
+    // results (2.98e-08 vs a host reference, both with and without the loop).
+    // The caution in emit_blocked_matmul_loops is i8-specific.
+    let mut body: Vec<String> = Vec::new();
+    let (stride_a, stride_b, stride_out) = match kind {
+        BatchedKind::Matmul => {
+            let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+            let k = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
+            let n = ctx.resolve_const(args.get(5).map(|s| s.as_str()).unwrap_or("0"));
+            let a = args.get(1).ok_or("matmul_batched: missing a")?.trim().to_string();
+            let b = args.get(2).ok_or("matmul_batched: missing b")?.trim().to_string();
+            ctx.set_inline_consts(&[("%__m", m), ("%__k", k), ("%__n", n)]);
+            let inner = format!(
+                "{result_ssa} = llvm.call @__tile_matmul_f32({a}, {a}, {b}, \
+                 %__m, %__k, %__n) : (i32, i32, i32, i32, i32, i32) -> i32"
+            );
+            translate_matmul(&inner, ctx, &mut body)?;
+            (m * k, k * n, m * n)
+        }
+        BatchedKind::Softmax => {
+            let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
+            let cols = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+            let x = args.get(1).ok_or("softmax_batched: missing src")?.trim().to_string();
+            ctx.set_inline_consts(&[("%__r", rows), ("%__c", cols)]);
+            let inner = format!(
+                "{result_ssa} = llvm.call @__tile_softmax_f32({x}, {x}, %__r, %__c) : \
+                 (i32, i32, i32, i32) -> i32"
+            );
+            translate_softmax(&inner, "f32", ctx, &mut body)?;
+            (rows * cols, 0, rows * cols)
+        }
+    };
+    ctx.clear_head_offsets();
+
+    // Split the body three ways:
+    //   * alloc_tile / make_tensor_view  -> hoist ABOVE the loop, so the tiles
+    //     and the GM views are created once and reused across heads. This is
+    //     the whole point of the loop form; an alloc inside the loop would
+    //     reintroduce the per-head cost that capped unrolling at 4 heads.
+    //   * partition_view                 -> stay INSIDE, rewritten to offset by
+    //     the induction variable. A hoisted partition_view is a FIXED window,
+    //     so every iteration would reread head 0 — the loop would run `heads`
+    //     times and compute the same product each time.
+    //   * everything else                -> inside, unchanged.
+    let (allocs, work): (Vec<&String>, Vec<&String>) = body.iter().partition(|l| {
+        (l.contains("pto.alloc_tile") || l.contains("pto.make_tensor_view"))
+            && !l.contains("pto.partition_view")
+    });
+
     ops.push(format!(
-        "// --- {name}: {heads} heads unrolled into one launch ---"
+        "// --- {name}: {heads} heads in one launch, tiles reused across heads ---"
+    ));
+    for l in allocs {
+        ops.push(l.clone());
+    }
+
+    let bi64 = ctx.fresh_ssa();
+    let bn64 = ctx.fresh_ssa();
+    let bi = ctx.fresh_ssa();
+    let bn = ctx.fresh_ssa();
+    ops.push(format!("{bi64} = \"pto.get_block_idx\"() : () -> i64"));
+    ops.push(format!("{bn64} = \"pto.get_block_num\"() : () -> i64"));
+    ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
+    ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
+    ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
+
+    // The loop body must address head `h_i`, and it does not yet.
+    //
+    // translate_matmul / translate_softmax build their partition_views from the
+    // tile_load that produced their operands, at a FIXED offset — they have no
+    // notion of an enclosing loop. Emitting `arith.muli %h_i, stride` here and
+    // hoping the body picks it up does not work: the body references the
+    // pre-existing view SSAs, so every iteration recomputes head 0 while the
+    // offsets sit unused. That is silently wrong output, which is worse than no
+    // batching at all, so it is refused rather than emitted.
+    //
+    // Making it work needs the inner translators to accept a base-offset SSA
+    // and thread it into their partition_view offsets — a change to their
+    // signatures and to every caller, not something that can be bolted on from
+    // out here. `bin/batched_heads.rs` records the measurement that says it is
+    // worth doing (MQA 0.87x -> 1.25-1.70x).
+    let _ = (stride_a, stride_b, stride_out);
+    return Err(format!(
+        "{name}: the loop form needs per-head partition_view offsets, which the \
+         inner translators cannot yet express — they build views at a fixed \
+         offset with no notion of an enclosing loop. Emitting it anyway would \
+         run the loop {heads} times over head 0. See translate_batched."
     ));
 
-    // Re-emit the per-head call once per head, with the head index folded into
-    // each operand's element offset. Reusing the existing translators is the
-    // point: the batched path cannot diverge from the validated per-head one,
-    // because it IS the per-head one, called `heads` times at shifted offsets.
-    for h in 0..heads {
-        ops.push(format!("// head {h}"));
-        match kind {
-            BatchedKind::Matmul => {
-                let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
-                let k = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
-                let n = ctx.resolve_const(args.get(5).map(|s| s.as_str()).unwrap_or("0"));
-                let a = args.get(1).ok_or("matmul_batched: missing a")?.trim();
-                let b = args.get(2).ok_or("matmul_batched: missing b")?.trim();
-                ctx.set_head_offsets(h * m * k, h * k * n, h * m * n);
-                let inner = format!(
-                    "%__bh{h} = llvm.call @__tile_matmul_f32({a}, {a}, {b},                      %__m, %__k, %__n) : (i32, i32, i32, i32, i32, i32) -> i32"
-                );
-                ctx.set_inline_consts(&[("%__m", m), ("%__k", k), ("%__n", n)]);
-                translate_matmul(&inner, ctx, ops)?;
-            }
-            BatchedKind::Softmax => {
-                let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
-                let cols = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
-                let x = args.get(1).ok_or("softmax_batched: missing src")?.trim();
-                ctx.set_head_offsets(h * rows * cols, 0, h * rows * cols);
-                let inner = format!(
-                    "%__bh{h} = llvm.call @__tile_softmax_f32({x}, {x}, %__r, %__c) :                      (i32, i32, i32, i32) -> i32"
-                );
-                ctx.set_inline_consts(&[("%__r", rows), ("%__c", cols)]);
-                translate_softmax(&inner, "f32", ctx, ops)?;
-            }
-        }
-        // The last head's output is what a downstream store should reference.
-        if h + 1 == heads {
-            ctx.alias_tile(&format!("%__bh{h}"), &result_ssa);
-        }
+    #[allow(unreachable_code)]
+    for l in work {
+        ops.push(format!("  {l}"));
     }
-    ctx.clear_head_offsets();
+    ops.push("}".to_string());
+
     Ok(())
 }
 
