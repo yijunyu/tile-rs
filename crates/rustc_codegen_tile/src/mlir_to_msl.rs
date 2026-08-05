@@ -136,6 +136,8 @@ enum KernelType {
     /// A block is 34 bytes, so `qs` lands on 34b+2 and is only 4-byte aligned on
     /// alternating blocks: quants MUST be read as scalars, not as char4.
     MulMvQ8_0Interleaved,
+    /// The GEMM over the same native interleaved blocks. Three buffers.
+    MulMmQ8_0Interleaved,
     MulMmQ8_0Planar, // FUSED Q8_0 mat-MAT over repacked planes: a cooperative
                      // GEMM. Each THREADGROUP owns a tile and stages both
                      // operands in threadgroup memory, so a weight load serves
@@ -620,7 +622,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::AttentionGqa => 4,  // q, k, v, out
         KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar => 4, // quants, scales, activations, out
         // Interleaved carries its scales inside the weight buffer, so three.
-        KernelType::MulMvQ8_0Interleaved => 3, // weights, activations, out
+        KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved => 3, // weights, activations, out
         KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi => 2, // src bytes, dst f32
         KernelType::BroadcastRow => 2, // src (R x 1), dst (R x C)
         KernelType::Rope       => 2,    // src, dst
@@ -988,7 +990,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // negative weight into a large positive one.
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
             else if ctx.kernel_type == KernelType::MulMmQ8_0Planar && i == 0 { "char" }
-            else if ctx.kernel_type == KernelType::MulMvQ8_0Interleaved && i == 0 { "char" }
+            else if matches!(ctx.kernel_type, KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved) && i == 0 { "char" }
             // Q4_0 nibbles are UNSIGNED bytes; the zero point is subtracted
             // after unpacking, so signing them here would corrupt the high half.
             else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "uint" }
@@ -1107,7 +1109,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
         KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar
-        | KernelType::MulMvQ8_0Interleaved => {
+        | KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved => {
             writeln!(out, "    constant uint& n_rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& blocks_per_row [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& n_cols         [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2300,7 +2302,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
             | KernelType::BroadcastRow | KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi
             | KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar
-            | KernelType::MulMvQ8_0Interleaved
+            | KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved
         | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
@@ -2554,6 +2556,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::MulMvQ4_0Planar => emit_mul_mv_q4_0_planar_msl(out),
         KernelType::MulMmQ8_0Planar => emit_mul_mm_q8_0_planar_msl(out),
         KernelType::MulMvQ8_0Interleaved => emit_mul_mv_q8_0_interleaved_msl(out),
+        KernelType::MulMmQ8_0Interleaved => emit_mul_mm_q8_0_interleaved_msl(out),
         KernelType::UnpackNibblesLo => emit_unpack_nibbles_msl(out, msl_type, false),
         KernelType::UnpackNibblesHi => emit_unpack_nibbles_msl(out, msl_type, true),
         KernelType::BroadcastRow => emit_broadcast_row_msl(out, msl_type),
@@ -2963,6 +2966,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) -> Result<(), Stri
                 "__tile_mul_mv_q4_0_planar_f32" => { ctx.kernel_type = KernelType::MulMvQ4_0Planar; }
                 "__tile_mul_mm_q8_0_planar_f32" => { ctx.kernel_type = KernelType::MulMmQ8_0Planar; }
                 "__tile_mul_mv_q8_0_interleaved_f32" => { ctx.kernel_type = KernelType::MulMvQ8_0Interleaved; }
+                "__tile_mul_mm_q8_0_interleaved_f32" => { ctx.kernel_type = KernelType::MulMmQ8_0Interleaved; }
                 "__tile_unpack_nibbles_lo_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesLo; } }
                 "__tile_unpack_nibbles_hi_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesHi; } }
                 "__tile_broadcast_row_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::BroadcastRow; } }
@@ -4132,6 +4136,17 @@ pub const MUL_MM_SGN: usize = 16;
 /// inner product is plain f32 and each weight is unpacked once per tile rather
 /// than once per output element.
 fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
+    emit_mul_mm_q8_0_msl(out, false)
+}
+
+/// The same GEMM over ggml's NATIVE INTERLEAVED blocks. Only the weight STAGING
+/// differs -- once staged as half in threadgroup memory the contraction is
+/// byte-for-byte the same code, so both layouts share every tuned constant.
+fn emit_mul_mm_q8_0_interleaved_msl(out: &mut String) {
+    emit_mul_mm_q8_0_msl(out, true)
+}
+
+fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool) {
     // Hardware matrix tiles are 8x8. TM sets the simdgroup count (one per 8
     // output columns of the activation side), TN the accumulators per
     // simdgroup. Both must be multiples of 8 or the tiling does not close.
@@ -4160,6 +4175,9 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "    constexpr uint BLK = 32u;              // weights per block").unwrap();
     writeln!(out, "    constexpr uint PAD = BLK + 1u;         // pad: bank conflicts").unwrap();
     writeln!(out, "    constexpr uint WQ  = BLK / 4u;         // char4 units per block row").unwrap();
+    if interleaved {
+        writeln!(out, "    constexpr uint BLKB = 34u;             // BYTES per block: half d + int8 qs[32]").unwrap();
+    }
     writeln!(out, "    constexpr uint TN  = {}u;              // weight rows per threadgroup", MUL_MM_TN).unwrap();
     writeln!(out, "    constexpr uint TM  = {}u;              // activation cols per threadgroup", MUL_MM_TM).unwrap();
     writeln!(out, "    constexpr uint KC  = {}u;              // K-blocks per barrier round", MUL_MM_KC).unwrap();
@@ -4204,9 +4222,19 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "            uint n = n0 + r, kb = kb0 + kk;").unwrap();
     writeln!(out, "            float4 wv = float4(0.0f);").unwrap();
     writeln!(out, "            if (n < n_rows && kb < blocks_per_row) {{").unwrap();
-    writeln!(out, "                float s = (float)p1[(ulong)n * blocks_per_row + kb];").unwrap();
-    writeln!(out, "                device const char4* w4 = (device const char4*)(p0 + (ulong)n * K + kb * BLK);").unwrap();
-    writeln!(out, "                wv = float4(w4[q]) * s;").unwrap();
+    if interleaved {
+        // block_q8_0 is 34 bytes, so qs lands at 34b+2 and is 4-byte aligned
+        // only on alternating blocks -- a char4 load here would be misaligned
+        // half the time. Scalar loads, as ggml's own kernels do.
+        writeln!(out, "                device const char* blk = p0 + (ulong)n * blocks_per_row * BLKB + (ulong)kb * BLKB;").unwrap();
+        writeln!(out, "                float s = (float)(*(device const half*)blk);").unwrap();
+        writeln!(out, "                device const char* qs = blk + 2u + q * 4u;").unwrap();
+        writeln!(out, "                wv = float4((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]) * s;").unwrap();
+    } else {
+        writeln!(out, "                float s = (float)p1[(ulong)n * blocks_per_row + kb];").unwrap();
+        writeln!(out, "                device const char4* w4 = (device const char4*)(p0 + (ulong)n * K + kb * BLK);").unwrap();
+        writeln!(out, "                wv = float4(w4[q]) * s;").unwrap();
+    }
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            uint ko = kk * BLK + q * 4u;").unwrap();
     writeln!(out, "            tgW[ko+0u][r] = (half)wv.x; tgW[ko+1u][r] = (half)wv.y;").unwrap();
@@ -4219,7 +4247,8 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "            uint m = m0 + c, kb = kb0 + kk;").unwrap();
     writeln!(out, "            float4 xv = float4(0.0f);").unwrap();
     writeln!(out, "            if (m < n_cols && kb < blocks_per_row) {{").unwrap();
-    writeln!(out, "                device const float4* a4 = (device const float4*)(p2 + (ulong)m * K + kb * BLK);").unwrap();
+    let (act, dst) = if interleaved { ("p1", "p2") } else { ("p2", "p3") };
+    writeln!(out, "                device const float4* a4 = (device const float4*)({} + (ulong)m * K + kb * BLK);", act).unwrap();
     writeln!(out, "                xv = a4[q];").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            tgX[c][eo+0u] = (half)xv.x; tgX[c][eo+1u] = (half)xv.y;").unwrap();
@@ -4257,7 +4286,7 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "            uint c = e / 8u, r = e % 8u;").unwrap();
     writeln!(out, "            uint m = m0 + mo + (t / NI) * 8u + c;").unwrap();
     writeln!(out, "            uint n = n0 + no + (t % NI) * 8u + r;").unwrap();
-    writeln!(out, "            if (m < n_cols && n < n_rows) p3[(ulong)m * n_rows + n] = mmres[sg][e];").unwrap();
+    writeln!(out, "            if (m < n_cols && n < n_rows) {}[(ulong)m * n_rows + n] = mmres[sg][e];", dst).unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        simdgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -16095,6 +16124,66 @@ module {
     /// {half d; int8 qs[32]}, 34 bytes -- so a generated kernel can be compared
     /// against ggml's without the "different layouts" caveat, and dispatched
     /// from inside ggml-metal with no repacking buffer.
+    /// The interleaved GEMM shares every tuned constant with the planar one --
+    /// only the weight staging differs, and once staged the contraction is the
+    /// same code. This asserts that: same tile, same grid, same matrix ops.
+    #[test]
+    fn test_msl_fused_q8_0_matmat_interleaved() {
+        let ilv = convert_mlir_to_msl(crate::mlir_parse::MATMAT_Q8_0_INTERLEAVED_MLIR)
+            .expect("the interleaved GEMM must lower");
+        let planar = convert_mlir_to_msl(crate::mlir_parse::MATMAT_Q8_0_FUSED_MLIR)
+            .expect("the planar GEMM must lower");
+        assert!(ilv.contains("kernel void mulmm_q8_0_interleaved"), "{}", ilv);
+        assert!(!ilv.contains("p3"), "interleaved takes three buffers, not four:\n{}", ilv);
+
+        // Scalar quant loads: qs sits at 34b+2, 4-byte aligned only on
+        // alternating blocks, so a char4 load off p0 is misaligned half the time.
+        assert!(ilv.contains("const uint BLKB = 34u;") || ilv.contains("BLKB = 34u"),
+            "a block is 34 bytes:\n{}", ilv);
+        assert!(ilv.contains("float4((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]) * s"),
+            "quants must be staged with scalar loads:\n{}", ilv);
+        assert!(!ilv.contains("(device const char4*)(p0"),
+            "a char4 load off the weight buffer is misaligned on odd blocks:\n{}", ilv);
+
+        // The contraction is shared, not reimplemented.
+        for line in ["simdgroup_half8x8 ma[MI], mb[NI];",
+                     "simdgroup_multiply_accumulate(acc[i * NI + j], ma[i], mb[j], acc[i * NI + j]);",
+                     "constexpr uint TN  = 128u;",
+                     "constexpr uint TM  = 128u;"] {
+            assert!(ilv.contains(line) && planar.contains(line),
+                "both layouts must share the contraction, missing {:?}", line);
+        }
+
+        if let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") {
+            std::fs::write(format!("{}/mulmm_q8_0_interleaved.metal", dir), &ilv).unwrap();
+        }
+
+        // The C header ggml-metal compiles into ITS OWN library, so the kernels
+        // are dispatched on ggml-metal's command buffer with no separate
+        // backend and no graph-split boundary. The boundary, not the kernel, is
+        // what stood between microbench parity and end-to-end parity.
+        //
+        // Both kernels go into one source: one library, one compile. The second
+        // one's preamble is stripped -- MSL tolerates a repeated include, but
+        // not a repeated `using namespace`.
+        if let Ok(dir) = std::env::var("TILERS_METAL_HEADER_DIR") {
+            let mv = convert_mlir_to_msl(crate::mlir_parse::MATVEC_Q8_0_INTERLEAVED_MLIR)
+                .expect("the interleaved mat-vec must lower");
+            let body = match ilv.find("kernel void") {
+                Some(i) => &ilv[i..],
+                None => panic!("no kernel in the generated GEMM:\n{}", ilv),
+            };
+            let h = format!(
+                "// Generated by tile-rs mlir_to_msl -- DO NOT EDIT\n\
+                 // MATVEC_Q8_0_INTERLEAVED_MLIR -> KernelType::MulMvQ8_0Interleaved\n\
+                 // MATMAT_Q8_0_INTERLEAVED_MLIR -> KernelType::MulMmQ8_0Interleaved\n\
+                 #pragma once\n\n\
+                 static const char * TILERS_MSL_SRC = R\"TILERS(\n{}\n\n{}\n)TILERS\";\n",
+                mv, body);
+            std::fs::write(format!("{}/tilers-generated.h", dir), h).unwrap();
+        }
+    }
+
     #[test]
     fn test_msl_fused_q8_0_matvec_interleaved() {
         let msl = convert_mlir_to_msl(crate::mlir_parse::MATVEC_Q8_0_INTERLEAVED_MLIR)
@@ -16129,19 +16218,7 @@ module {
         if let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") {
             std::fs::write(format!("{}/mulmv_q8_0_interleaved.metal", dir), &msl).unwrap();
         }
-        // And as a C header, so ggml-metal can build a library from the source
-        // directly and dispatch it on ITS OWN command buffer -- no separate
-        // backend, so no graph-split boundary. The boundary, not the kernel,
-        // is what stood between microbench parity and end-to-end parity.
-        if let Ok(dir) = std::env::var("TILERS_METAL_HEADER_DIR") {
-            let h = format!(
-                "// Generated by tile-rs mlir_to_msl -- DO NOT EDIT\n\
-                 // Source: MATVEC_Q8_0_INTERLEAVED_MLIR -> KernelType::MulMvQ8_0Interleaved\n\
-                 #pragma once\n\n\
-                 static const char * TILERS_MSL_SRC = R\"TILERS(\n{}\n)TILERS\";\n",
-                msl);
-            std::fs::write(format!("{}/tilers-generated.h", dir), h).unwrap();
-        }
+
     }
 
     #[test]
