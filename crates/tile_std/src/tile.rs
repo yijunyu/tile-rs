@@ -3622,3 +3622,53 @@ pub const fn blocks_per_row<Q: Quant>(k: usize) -> usize {
 pub const fn quant_bytes_per_row<Q: Quant>(k: usize) -> usize {
     (k + Q::PER_BYTE - 1) / Q::PER_BYTE
 }
+
+// =============================================================================
+// ggml coverage: op templates over `Quant`
+// =============================================================================
+
+/// One K-block of a quantised mat-vec row: `sum(dequant(w) * scale * x)`.
+///
+/// Written ONCE over [`Quant`]; a format is added by implementing the trait,
+/// not by re-deriving the op. Caller drives this over `blocks_per_row::<Q>(k)`
+/// blocks and sums the partials — matching how ggml's `mul_mv` assigns one
+/// output row to a threadgroup.
+///
+/// Operates on the REPACKED planes (see [`Quant`]): `quants` is this row's
+/// block of quantised weights, `scale` its single f32 scale, `x` the matching
+/// slice of activations.
+///
+/// The scale is applied via [`tile_broadcast_row_f32`] rather than
+/// [`tile_dequantize_i8_f32`]'s scalar argument, because it lives in memory
+/// and varies per block — the whole reason that broadcast primitive exists.
+///
+/// Currently covers 8-bit formats (`Q::BITS == 8`, `PER_BYTE == 1`), e.g.
+/// `Q8_0`. Sub-byte formats need a nibble-unpack op the DSL does not yet
+/// have; that is the next gap to close, not a flaw in this shape.
+#[inline(always)]
+pub fn mul_mv_block<Q: Quant>(
+    quants: *const i8,
+    scale: *const f32,
+    x: *const f32,
+) -> Tile<1, 1, f32>
+where
+    [(); Q::BLOCK]:,
+{
+    // i8 -> f32 with unit scale; the real scale is applied below.
+    let w = tile_dequantize_i8_f32::<1, { Q::BLOCK }>(tile_load_i8::<1, { Q::BLOCK }>(quants), 1.0);
+    let s = tile_broadcast_row_f32::<1, { Q::BLOCK }>(tile_load_f32::<1, 1>(scale));
+    let ws = tile_mul_f32::<1, { Q::BLOCK }>(w, s);
+    let xb = tile_load_f32::<1, { Q::BLOCK }>(x);
+    tile_reduce_sum_f32::<1, { Q::BLOCK }>(tile_mul_f32::<1, { Q::BLOCK }>(ws, xb))
+}
+
+/// Concrete `Q8_0` instantiation — proves `mul_mv_block` monomorphises and
+/// pins the block size the repack layout must produce.
+#[inline(always)]
+pub fn mul_mv_block_q8_0(
+    quants: *const i8,
+    scale: *const f32,
+    x: *const f32,
+) -> Tile<1, 1, f32> {
+    mul_mv_block::<Q8_0>(quants, scale, x)
+}
