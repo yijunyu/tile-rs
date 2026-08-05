@@ -3718,3 +3718,70 @@ pub fn mul_mv_block_q8_0(
 ) -> Tile<1, 1, f32> {
     mul_mv_block::<Q8_0>(quants, scale, x)
 }
+
+/// One block of a **4-bit** quantised mat-vec row: `sum((nib - zp) * scale * x)`.
+///
+/// The sub-byte counterpart of [`mul_mv_block`]. A `Q::BLOCK`-element block is
+/// stored in `Q::BLOCK / 2` bytes; ggml packs element `j` in byte `j`'s low
+/// nibble and element `j + HALF` in its high nibble. So the two halves are
+/// separate contiguous runs of the row, and this consumes them as two
+/// accumulations — which is exactly why the unpack returns
+/// [`tile_unpack_nibbles_lo_f32`] / [`tile_unpack_nibbles_hi_f32`] as
+/// same-shaped tiles instead of one wide one (composing a wide tile needs an
+/// A5-only op, so the split keeps this portable to a2a3).
+///
+/// `zp` is the format's zero point: 8 for `Q4_0`, whose quants are stored
+/// biased into `0..=15`. Formats carrying a per-block minimum instead
+/// (`Q4_1`, `HAS_MIN`) want a variant that subtracts a broadcast min rather
+/// than a constant, which is a small edit to this shape rather than a new op.
+///
+/// `x_lo` and `x_hi` are the activation slices matching the two halves:
+/// elements `0..HALF` and `HALF..BLOCK`. They are passed separately because
+/// the DSL's loads take a bare pointer with no offset.
+#[inline(always)]
+pub fn mul_mv_block_4bit<Q: Quant>(
+    quants: *const i8,
+    scale: *const f32,
+    x_lo: *const f32,
+    x_hi: *const f32,
+    zp: f32,
+) -> Tile<1, 1, f32>
+where
+    [(); Q::BLOCK / 2]:,
+{
+    // Tiles are not Copy — an op consumes its operand — so the shared
+    // values (packed bytes, scale broadcast, bias) are re-created per half
+    // rather than reused. The loads are idempotent; backends are free to CSE.
+    let lo = {
+        let packed = tile_load_i8::<1, { Q::BLOCK / 2 }>(quants);
+        let s = tile_broadcast_row_f32::<1, { Q::BLOCK / 2 }>(tile_load_f32::<1, 1>(scale));
+        let bias = tile_fill_f32::<1, { Q::BLOCK / 2 }>(zp);
+        let n = tile_unpack_nibbles_lo_f32::<1, { Q::BLOCK / 2 }>(packed);
+        let v = tile_mul_f32::<1, { Q::BLOCK / 2 }>(tile_sub_f32::<1, { Q::BLOCK / 2 }>(n, bias), s);
+        tile_mul_f32::<1, { Q::BLOCK / 2 }>(v, tile_load_f32::<1, { Q::BLOCK / 2 }>(x_lo))
+    };
+    let hi = {
+        let packed = tile_load_i8::<1, { Q::BLOCK / 2 }>(quants);
+        let s = tile_broadcast_row_f32::<1, { Q::BLOCK / 2 }>(tile_load_f32::<1, 1>(scale));
+        let bias = tile_fill_f32::<1, { Q::BLOCK / 2 }>(zp);
+        let n = tile_unpack_nibbles_hi_f32::<1, { Q::BLOCK / 2 }>(packed);
+        let v = tile_mul_f32::<1, { Q::BLOCK / 2 }>(tile_sub_f32::<1, { Q::BLOCK / 2 }>(n, bias), s);
+        tile_mul_f32::<1, { Q::BLOCK / 2 }>(v, tile_load_f32::<1, { Q::BLOCK / 2 }>(x_hi))
+    };
+    tile_add_f32::<1, 1>(
+        tile_reduce_sum_f32::<1, { Q::BLOCK / 2 }>(lo),
+        tile_reduce_sum_f32::<1, { Q::BLOCK / 2 }>(hi),
+    )
+}
+
+/// Concrete `Q4_0` instantiation (zero point 8), proving the 4-bit template
+/// monomorphises the same way the 8-bit one does.
+#[inline(always)]
+pub fn mul_mv_block_q4_0(
+    quants: *const i8,
+    scale: *const f32,
+    x_lo: *const f32,
+    x_hi: *const f32,
+) -> Tile<1, 1, f32> {
+    mul_mv_block_4bit::<Q4_0>(quants, scale, x_lo, x_hi, 8.0)
+}
