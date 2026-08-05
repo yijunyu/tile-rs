@@ -2037,20 +2037,21 @@ extern "C" {
         m: u32, k: u32, n: u32,
     ) -> u32;
 
-    /// Split each packed byte into its two 4-bit halves, as f32 in `0..=15`.
+    /// Low 4 bits of each packed byte, as f32 in `0..=15`. `R x C -> R x C`.
     ///
-    /// Output is `ROWS x 2*COLS`: the **low** nibbles of all `COLS` bytes
-    /// first, then the **high** nibbles. That ordering is ggml's Q4 layout —
-    /// `qs[j]` holds element `j` in its low nibble and element `j + COLS` in
-    /// its high nibble — so the halves land contiguously and need no
-    /// interleave (which this DSL could not express anyway).
-    ///
-    /// Values are raw `0..=15`; a format's offset (Q4_0's -8) or minimum
-    /// (Q4_1) is applied by the caller, keeping this op format-agnostic.
-    ///
-    /// MSL lowers to mask/shift. PTO has no bitwise ops, so it lowers
-    /// arithmetically: `hi = trunc(b / 16)`, `lo = b - 16*hi`.
-    pub fn __tile_unpack_nibbles_f32(dst: u32, src: u32, rows: u32, cols: u32) -> u32;
+    /// Paired with [`__tile_unpack_nibbles_hi_f32`]. Deliberately TWO ops
+    /// returning same-shaped halves rather than one `R x 2C` op: composing a
+    /// wide tile from two halves needs `pto.tinsert`, which a2a3 (dav-c220)
+    /// does not implement, and no a2a3-safe slice/concat primitive exists.
+    /// Consumers never need them adjacent anyway — in ggml's Q4 layout the low
+    /// nibbles supply elements `0..C` and the high nibbles `C..2C`, i.e. two
+    /// successive block iterations of a mat-vec. Not materialising the wide
+    /// tile is both portable and cheaper.
+    pub fn __tile_unpack_nibbles_lo_f32(dst: u32, src: u32, rows: u32, cols: u32) -> u32;
+
+    /// High 4 bits of each packed byte, as f32 in `0..=15`. `R x C -> R x C`.
+    /// See [`__tile_unpack_nibbles_lo_f32`].
+    pub fn __tile_unpack_nibbles_hi_f32(dst: u32, src: u32, rows: u32, cols: u32) -> u32;
 
     /// Broadcast a per-row value across columns: `dst[r][c] = src[r][0]`.
     ///
@@ -2426,18 +2427,33 @@ pub fn tile_reduce_sum_f32<const ROWS: usize, const COLS: usize>(
 
 /// Scale all elements of a tile by a scalar.
 #[inline(always)]
-/// Split packed bytes into 4-bit halves: `ROWS x COLS` bytes -> `ROWS x 2*COLS`
-/// f32 values in `0..=15`, low nibbles first then high (ggml Q4 order).
+/// Low 4 bits of each packed byte, as f32 in `0..=15` (`ROWS x COLS`).
 ///
-/// The unlock for sub-byte formats (Q4_0, Q4_1, Q4_K, Q5_*, IQ*), which are
-/// most of ggml's quant set and were previously inexpressible: the DSL has no
-/// bitwise or shift ops on tiles at all.
+/// With [`tile_unpack_nibbles_hi_f32`], the unlock for sub-byte formats
+/// (Q4_0, Q4_1, Q4_K, Q5_*, IQ*) — most of ggml's quant set — which were
+/// inexpressible because the DSL has no bitwise or shift ops on tiles.
+///
+/// Returns a same-shaped half rather than a wide `ROWS x 2*COLS` tile so both
+/// backends can lower it: composing halves requires `pto.tinsert`, an A5-only
+/// op. In ggml's Q4 layout the low half is elements `0..COLS` and the high
+/// half `COLS..2*COLS`, so a mat-vec simply runs two more block iterations.
 #[inline(always)]
-pub fn tile_unpack_nibbles_f32<const ROWS: usize, const COLS: usize>(
+pub fn tile_unpack_nibbles_lo_f32<const ROWS: usize, const COLS: usize>(
     src: Tile<ROWS, COLS, u32>,
-) -> Tile<ROWS, { 2 * COLS }, f32> {
+) -> Tile<ROWS, COLS, f32> {
     let buf_id =
-        unsafe { __tile_unpack_nibbles_f32(0, src.buf_id, ROWS as u32, COLS as u32) };
+        unsafe { __tile_unpack_nibbles_lo_f32(0, src.buf_id, ROWS as u32, COLS as u32) };
+    Tile { buf_id, _phantom: PhantomData }
+}
+
+/// High 4 bits of each packed byte, as f32 in `0..=15` (`ROWS x COLS`).
+/// See [`tile_unpack_nibbles_lo_f32`].
+#[inline(always)]
+pub fn tile_unpack_nibbles_hi_f32<const ROWS: usize, const COLS: usize>(
+    src: Tile<ROWS, COLS, u32>,
+) -> Tile<ROWS, COLS, f32> {
+    let buf_id =
+        unsafe { __tile_unpack_nibbles_hi_f32(0, src.buf_id, ROWS as u32, COLS as u32) };
     Tile { buf_id, _phantom: PhantomData }
 }
 
