@@ -109,6 +109,93 @@ pub(crate) use crate::mlir_parse::{
 /// consumable by `ptoas --enable-insert-sync`.
 ///
 /// Returns the PTO-MLIR source string, or an error on parse failure.
+/// Which AI-core types a generated kernel's tiles live on.
+///
+/// This decides how the kernel must be BUILT, so it is part of the emitter's
+/// contract rather than a detail of any one benchmark harness.
+///
+/// The Ascend AI Core is two engines with separate memories. A PTO tile's `loc`
+/// says which one it uses: `mat`/`left`/`right`/`acc` are the cube side
+/// (L1 / L0A / L0B / L0C), `vec` is the vector side (UB). `ccec` compiles for
+/// one engine at a time — `--cce-aicore-arch=dav-c220-{cube,vec}` — and each
+/// rejects the other's instructions.
+///
+/// - [`Cube`] or [`Vector`]: a single-engine kernel. Builds through the normal
+///   `ascendc_library()` CMake path, which generates the `aclrtlaunch_<name>`
+///   entry point. No hand-written driver or linking involved.
+/// - [`Mix`]: touches both. `ascendc_library()` does NOT work, because its
+///   preprocess pass compiles the source for both engines and the shipped
+///   pto-isa headers carry no `__CCE_AICORE__` gating, so `TLoad.hpp` /
+///   `TExtract.hpp` instantiate cube intrinsics during the vector pass and fail.
+///   Such a kernel must either be decomposed into single-engine kernels
+///   (see the attention pipeline: scores/pv on cube, softmax on vector) or
+///   built by hand per engine and linked.
+///
+/// The distinction is a CANN packaging gap, not a property of PTO: a MIX kernel
+/// is perfectly legal ISA, there is simply no supported single-source build for
+/// it in CANN 8.5.2's header layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelCores {
+    /// Cube only (`mat`, `left`, `right`, `acc` tiles).
+    Cube,
+    /// Vector only (`vec` tiles).
+    Vector,
+    /// Both engines — see the caveat above.
+    Mix,
+    /// No tiles at all (empty or non-tile kernel).
+    None,
+}
+
+impl KernelCores {
+    /// True when `ascendc_library()` can build this kernel from one source.
+    pub fn buildable_with_ascendc_library(self) -> bool {
+        !matches!(self, KernelCores::Mix)
+    }
+
+    /// The `--cce-aicore-arch` suffix for a single-engine kernel.
+    pub fn ccec_arch(self) -> Option<&'static str> {
+        match self {
+            KernelCores::Cube => Some("cube"),
+            // A tile-less kernel still has to be compiled for something; the
+            // vector engine is the safe default (it is the scalar/AIV path).
+            KernelCores::Vector | KernelCores::None => Some("vec"),
+            KernelCores::Mix => None,
+        }
+    }
+}
+
+/// Classify generated PTO text by the engines its tiles use.
+///
+/// Callers use this to pick a build strategy without having to know the
+/// per-op cube/vector mapping themselves.
+pub fn classify_kernel_cores(pto: &str) -> KernelCores {
+    let mut cube = false;
+    let mut vector = false;
+    for line in pto.lines() {
+        if !line.contains("!pto.tile_buf<") {
+            continue;
+        }
+        // A single line can mention several tiles (ins/outs operand types).
+        for seg in line.split("loc=").skip(1) {
+            let loc = seg
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            match loc {
+                "mat" | "left" | "right" | "acc" => cube = true,
+                "vec" => vector = true,
+                _ => {}
+            }
+        }
+    }
+    match (cube, vector) {
+        (true, true) => KernelCores::Mix,
+        (true, false) => KernelCores::Cube,
+        (false, true) => KernelCores::Vector,
+        (false, false) => KernelCores::None,
+    }
+}
+
 pub fn convert_mlir_to_pto(mlir_text: &str) -> Result<String, String> {
     let module = parse_module(mlir_text)?;
 
@@ -433,6 +520,78 @@ impl TileInfo {
 // discipline is UbAllocator.
 // ============================================================================
 
+/// Hardware limits for one SoC, as published by the vendor.
+///
+/// These are NOT to be invented. CANN ships the authoritative numbers per SoC in
+/// `<CANN>/<arch>-linux/data/platform_config/<SocVersion>.ini`, `[AICoreSpec]`,
+/// and the same values are queryable at runtime via
+/// `platform_ascendc::PlatformAscendC::GetCoreMemSize(CoreMemType::UB, ...)`.
+///
+/// Example, verified on a real 910B2 (CANN 8.5.2) — `Ascend910B2.ini`:
+/// ```text
+/// [AICoreSpec]
+/// ub_size=196608      # 192 KB   <- the UB capacity the C1 budget must respect
+/// ubblock_size=32     # 32 B     <- footprint block alignment
+/// ubbank_size=4096
+/// l0_a_size=65536  l0_b_size=65536  l0_c_size=131072  l1_size=524288
+/// ```
+/// `Ascend910_9392.ini` (the `910c` host) reports the same `ub_size=196608`.
+///
+/// A2/A3 additionally reserves the TOP 8 KB of UB as instruction scratch, so the
+/// budget available to tiles is 192 - 8 = 184 KB. That reservation is stated in
+/// the pto-isa headers themselves:
+/// `pto/npu/a2a3/TSels.hpp` — "8KB, start from 184KB, UB:192KB=184+8KB",
+/// and `pto/npu/a2a3/TMrgSort.hpp` — `constexpr int UBSIZE = 196608;`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocSpec {
+    /// `ub_size` from `[AICoreSpec]`, in bytes.
+    pub ub_size: usize,
+    /// Bytes at the top of UB reserved by the runtime, unavailable to tiles.
+    pub ub_reserved: usize,
+    /// `ubblock_size` from `[AICoreSpec]`, in bytes.
+    pub ubblock_size: usize,
+}
+
+impl SocSpec {
+    /// UB actually available to tiles: capacity minus runtime reservation.
+    pub const fn ub_budget(&self) -> usize {
+        self.ub_size - self.ub_reserved
+    }
+
+    /// Parse `[AICoreSpec]` out of a CANN `platform_config/<Soc>.ini`.
+    ///
+    /// Use this to re-derive the constants below from a CANN install rather than
+    /// trusting the checked-in copies:
+    /// `SocSpec::from_platform_ini(&fs::read_to_string(".../Ascend910B2.ini")?)`.
+    pub fn from_platform_ini(ini: &str, ub_reserved: usize) -> Option<SocSpec> {
+        let mut in_aicore = false;
+        let (mut ub_size, mut ubblock_size) = (None, None);
+        for line in ini.lines() {
+            let l = line.trim();
+            if l.starts_with('[') {
+                in_aicore = l.eq_ignore_ascii_case("[AICoreSpec]");
+                continue;
+            }
+            if !in_aicore {
+                continue;
+            }
+            let Some((k, v)) = l.split_once('=') else { continue };
+            let v = v.trim().parse::<usize>().ok()?;
+            match k.trim() {
+                "ub_size" => ub_size = Some(v),
+                "ubblock_size" => ubblock_size = Some(v),
+                _ => {}
+            }
+        }
+        Some(SocSpec { ub_size: ub_size?, ub_reserved, ubblock_size: ubblock_size? })
+    }
+}
+
+/// 910B2 / Ascend910_9392, from `Ascend910B2.ini` `[AICoreSpec]`.
+/// `ub_reserved` is the 8 KB A2/A3 TMP_UB scratch documented in TSels.hpp.
+pub const SPEC_A2A3: SocSpec =
+    SocSpec { ub_size: 196608, ub_reserved: 8 * 1024, ubblock_size: 32 };
+
 /// Target Ascend architecture — the constraints are arch-parametric (C6).
 trait AscendArch {
     const UB_SIZE: usize;        // total Unified Buffer capacity (bytes)
@@ -445,9 +604,16 @@ trait AscendArch {
 /// 910B2 / a2a3 (the 910c test box).
 struct A2A3;
 impl AscendArch for A2A3 {
-    const UB_SIZE: usize = 262144;   // 256 KB (pto/npu/a5 UB_SIZE)
+    // Derived from the vendor spec (`SPEC_A2A3`, parsed from Ascend910B2.ini),
+    // NOT hand-written: 196608 B capacity - 8 KB A2/A3 TMP_UB scratch = 184 KB.
+    //
+    // This previously read 262144 with the comment "(pto/npu/a5 UB_SIZE)" — the
+    // A5 figure copied onto A2/A3. That made the C1 guard UNSOUND on A2/A3: it
+    // accepted tile working sets between 184 KB and 256 KB that do not fit the
+    // hardware, which is exactly the class of bug this guard exists to catch.
+    const UB_SIZE: usize = SPEC_A2A3.ub_budget();
     const FRACTAL_BYTES: usize = 512;
-    const BLOCK_BYTES: usize = 32;
+    const BLOCK_BYTES: usize = SPEC_A2A3.ubblock_size;
     const REQUIRES_ROW16: bool = false;
     const NAME: &'static str = "a2a3";
 }
@@ -3062,7 +3228,19 @@ fn translate_silu(
 
 /// Block size constants used by the K/N-blocked matmul emission.
 /// See comment above `detect_blocked_matmul_loads` for the rationale.
-const PTO_MM_KB: u32 = 256;
+///
+/// Kb was 256 with Nb=64. That combination does not fit real 910B2:
+///   - L0B (`b_right`, Kb*Nb*4) = 64 KB, i.e. EXACTLY the 64 KB L0B cap. The
+///     comment above already records that Nb=64 at Kb=256 caused "aicore
+///     execution exception" on 910B2, attributed to fractal metadata pushing
+///     the allocation past the hardware cap.
+///   - the five live tiles (mat_a, mat_b, a_left, b_right, acc) sum to 272 KB,
+///     far over the 184 KB UB budget the vendor spec allows (`SPEC_A2A3`).
+/// Both were masked while `A2A3::UB_SIZE` wrongly carried the 256 KB A5 figure.
+///
+/// Kb=128, Nb=64 keeps L0A/L0B at 32 KB each (half the cap, clear of the
+/// exception) and the UB working set at 144 KB, inside the 184 KB budget.
+const PTO_MM_KB: u32 = 128;
 const PTO_MM_NB: u32 = 64;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
 /// BLayout based on the companion `Right` tile width. At Nb=64 with i8 Left,
@@ -3257,11 +3435,17 @@ fn silu_mul_needs_blocking(rows: u32, cols: u32, dtype: &str) -> bool {
     peak > SILU_MUL_UB_BUDGET_BYTES
 }
 
-/// UB budget for the 5-tile silu_mul emit: 256 KB UB cap minus ~32 KB reserved
-/// for kernel code, stack, and scalars. Used by both the unblocked path's
-/// guard and the blocked-path detector. Defined once here to keep the two
-/// in sync.
-const SILU_MUL_UB_BUDGET_BYTES: u64 = 224 * 1024;
+/// UB budget for the 5-tile silu_mul emit.
+///
+/// Derived from the vendor spec (`SPEC_A2A3`, i.e. `ub_size=196608` from CANN's
+/// `platform_config/Ascend910B2.ini`) minus the 8 KB A2/A3 TMP_UB scratch, minus
+/// a further 32 KB reserved for kernel code, stack, and scalars — the same
+/// reservation the previous constant assumed.
+///
+/// This read `224 * 1024` when `A2A3::UB_SIZE` was wrongly 256 KB. Both figures
+/// came from the A5 UB capacity, so on real 910B2 silicon (192 KB) the blocked
+/// path could pick a chunk whose peak overflows the hardware buffer.
+const SILU_MUL_UB_BUDGET_BYTES: u64 = (SPEC_A2A3.ub_budget() - 32 * 1024) as u64;
 
 /// Pick a chunk size `Nb` along the inner dim such that the per-chunk
 /// 5-tile peak (gate + up + neg + silu + out) fits the UB budget AND
@@ -6121,25 +6305,58 @@ mod tests {
 
     #[test]
     fn test_pick_kb_for_n_clamps_on_outer_stride_overflow() {
-        // Default Kb=256 stands when N is small (Kb*N <= 2^23).
-        assert_eq!(pick_kb_for_n(1536, 1536), 256); // q/o_proj
-        assert_eq!(pick_kb_for_n(1536, 256), 256); // kv_proj
-        assert_eq!(pick_kb_for_n(1536, 8960), 256); // gate/up_proj
-        assert_eq!(pick_kb_for_n(8960, 1536), 256); // down_proj
+        // Default Kb (PTO_MM_KB) stands when N is small (Kb*N <= 2^23).
+        // PTO_MM_KB is 128, lowered from 256 when the UB budget was corrected to
+        // the vendor's 184 KB: at Kb=256/Nb=64 the L0B tile sat exactly on the
+        // 64 KB cap and the UB working set was 272 KB.
+        assert_eq!(pick_kb_for_n(1536, 1536), PTO_MM_KB); // q/o_proj
+        assert_eq!(pick_kb_for_n(1536, 256), PTO_MM_KB); // kv_proj
+        assert_eq!(pick_kb_for_n(1536, 8960), PTO_MM_KB); // gate/up_proj
+        assert_eq!(pick_kb_for_n(8960, 1536), PTO_MM_KB); // down_proj
         // lm_head: N=151936 forces Kb down so that Kb*N < 2^24. With our
         // 2^23 threshold, Kb ≤ (2^23)/151936 ≈ 55 → aligned to 48.
         // 1536 % 48 == 0, so expect Kb=48.
         assert_eq!(pick_kb_for_n(1536, 151936), 48);
         // N=65536 exactly at old failure boundary: 2^23/65536 = 128. 1536%128=0.
+        // The stride cap (128) and the default Kb (128) coincide here.
         assert_eq!(pick_kb_for_n(1536, 65536), 128);
-        // N=32768 safe at full Kb=256: 256*32768 = 2^23 (equal to threshold,
-        // cap = 2^23/32768 = 256, so we get Kb=256).
-        assert_eq!(pick_kb_for_n(1536, 32768), 256);
+        // N=32768: stride cap = 2^23/32768 = 256, so the default Kb governs.
+        assert_eq!(pick_kb_for_n(1536, 32768), PTO_MM_KB);
         // Degenerate / small K that's still > kb_cap.
         // K=128 (base=128), cap=48: 128%48!=0 → fallback halving to 32 (divides 128, ≤48).
         assert_eq!(pick_kb_for_n(128, 151936), 32);
         // K=64 (base=64), cap=48: 64%48!=0 → fallback to 32 (divides 64, ≤48).
         assert_eq!(pick_kb_for_n(64, 151936), 32);
+    }
+
+    /// The blocked-matmul block sizes must fit the real hardware, not just
+    /// divide evenly. `emit_blocked_matmul_loops` keeps five tiles live —
+    /// mat_a (M×Kb), mat_b (Kb×Nb), a_left (M×Kb), b_right (Kb×Nb), acc (M×Nb)
+    /// — and each of L0A/L0B is capped at 64 KB.
+    ///
+    /// Regression guard: Kb=256/Nb=64 put L0B exactly ON the 64 KB cap (the
+    /// documented "aicore execution exception" on 910B2) and the UB working set
+    /// at 272 KB, which only looked acceptable while UB_SIZE wrongly read 256 KB.
+    #[test]
+    fn test_blocked_matmul_blocks_fit_hardware() {
+        const L0_CAP: usize = 64 * 1024;
+        let (kb, nb) = (PTO_MM_KB as usize, PTO_MM_NB as usize);
+        // M=64 is the projection shape from the 20_FlashAttentionV2 benchmark;
+        // it is also the largest M the emitter pads to for these kernels.
+        let m = 64usize;
+        let f32b = 4;
+
+        let l0a = m * kb * f32b;
+        let l0b = kb * nb * f32b;
+        assert!(l0a < L0_CAP, "L0A tile {l0a} B must be UNDER the {L0_CAP} B cap");
+        assert!(l0b < L0_CAP, "L0B tile {l0b} B must be UNDER the {L0_CAP} B cap");
+
+        let ub_live = (m * kb + kb * nb + m * kb + kb * nb + m * nb) * f32b;
+        assert!(
+            ub_live <= A2A3::UB_SIZE,
+            "blocked-matmul working set {ub_live} B exceeds the UB budget {} B",
+            A2A3::UB_SIZE
+        );
     }
 
     #[test]
@@ -6305,6 +6522,123 @@ module {
             !pto.contains("tile.load"),
             "Stale tile.load in output:\n{}",
             pto
+        );
+    }
+
+    /// Core classification drives the build strategy, so it is checked against
+    /// real emitted kernels rather than hand-written PTO snippets.
+    ///
+    /// The three decomposed attention stages are single-engine and build through
+    /// `ascendc_library()`; the FUSED attention kernel is MIX and does not,
+    /// which is the whole reason the pipeline is emitted as separate stages.
+    #[test]
+    fn test_classify_kernel_cores() {
+        let matmul = |m: u32, k: u32, n: u32| {
+            format!(
+                r#"module {{
+  llvm.func @mm(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {{hacc.entry}} {{
+    %m = llvm.mlir.constant({m} : i32) : i32
+    %k = llvm.mlir.constant({k} : i32) : i32
+    %n = llvm.mlir.constant({n} : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32
+    %c = llvm.call @__tile_matmul_f32(%a, %a, %b, %m, %k, %n) : (i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %c, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }}
+}}
+"#
+            )
+        };
+        let softmax = r#"
+module {
+  llvm.func @sm(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    %r = llvm.mlir.constant(32 : i32) : i32
+    %c = llvm.mlir.constant(32 : i32) : i32
+    %x = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %o = llvm.call @__tile_softmax_f32(%x, %x, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %o, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let fused_attn = r#"
+module {
+  llvm.func @attn(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    %s = llvm.mlir.constant(32 : i32) : i32
+    %d = llvm.mlir.constant(64 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %o = llvm.call @__tile_attention_f32(%q, %q, %k, %v, %s, %d) : (i32, i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %o, %s, %d) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+
+        // scores / pv: pure cube.
+        let scores = convert_mlir_to_pto(&matmul(32, 64, 32)).expect("scores");
+        assert_eq!(classify_kernel_cores(&scores), KernelCores::Cube);
+        assert_eq!(classify_kernel_cores(&scores).ccec_arch(), Some("cube"));
+        assert!(classify_kernel_cores(&scores).buildable_with_ascendc_library());
+
+        // softmax: pure vector.
+        let sm = convert_mlir_to_pto(softmax).expect("softmax");
+        assert_eq!(classify_kernel_cores(&sm), KernelCores::Vector);
+        assert_eq!(classify_kernel_cores(&sm).ccec_arch(), Some("vec"));
+        assert!(classify_kernel_cores(&sm).buildable_with_ascendc_library());
+
+        // Fused attention: cube matmuls AND vector softmax in one kernel.
+        // This is the case ascendc_library() cannot build.
+        let fa = convert_mlir_to_pto(fused_attn).expect("fused attention");
+        assert_eq!(classify_kernel_cores(&fa), KernelCores::Mix);
+        assert_eq!(
+            classify_kernel_cores(&fa).ccec_arch(),
+            None,
+            "a MIX kernel has no single --cce-aicore-arch"
+        );
+        assert!(!classify_kernel_cores(&fa).buildable_with_ascendc_library());
+    }
+
+    /// The UB constants must come from the vendor spec, not from memory.
+    ///
+    /// This parses the same `[AICoreSpec]` text CANN ships in
+    /// `data/platform_config/Ascend910B2.ini` and checks `SPEC_A2A3` against it.
+    /// The literal below is copied verbatim from a real CANN 8.5.2 install on a
+    /// 910B2; `Ascend910_9392.ini` (the `910c` host) reports the same `ub_size`.
+    ///
+    /// Regression guard: `A2A3::UB_SIZE` once held 262144 (the A5 figure), which
+    /// let the C1 budget accept working sets that overflow a 192 KB UB.
+    #[test]
+    fn test_ub_size_matches_vendor_platform_config() {
+        let ini = "\
+[Version]
+SoC_version=Ascend910B2
+
+[AICoreSpec]
+cube_freq=1800
+l0_a_size=65536
+l0_b_size=65536
+l0_c_size=131072
+l1_size=524288
+ub_size=196608
+ubblock_size=32
+ubbank_size=4096
+";
+        let spec = SocSpec::from_platform_ini(ini, 8 * 1024).expect("parse [AICoreSpec]");
+        assert_eq!(spec.ub_size, 196608, "vendor ub_size is 192 KB");
+        assert_eq!(spec, SPEC_A2A3, "SPEC_A2A3 must match the vendor platform_config");
+        assert_eq!(spec.ub_budget(), 188416, "184 KB usable after 8 KB TMP_UB scratch");
+        assert_eq!(
+            A2A3::UB_SIZE,
+            spec.ub_budget(),
+            "the C1 budget must be the spec-derived value, not a hardcoded one"
+        );
+        assert_eq!(A2A3::BLOCK_BYTES, spec.ubblock_size);
+        assert!(
+            A2A3::UB_SIZE < 262144,
+            "262144 is the A5 UB_SIZE; using it on a2a3 makes the C1 guard unsound"
         );
     }
 
