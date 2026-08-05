@@ -2037,6 +2037,20 @@ extern "C" {
         m: u32, k: u32, n: u32,
     ) -> u32;
 
+/// FUSED Q8_0 mat-vec over ggml's NATIVE INTERLEAVED blocks (`{half d; int8
+/// qs[32]}`, 34 bytes) rather than the repacked planes. Three buffers, since
+/// the scales ride inside the weight buffer.
+///
+/// The name matters: `__tile_mul_mv_q8_0_f32` already selects a different
+/// layout, and the match arms are ordered, so a shared name would silently
+/// redirect existing callers.
+#[unsafe(no_mangle)]
+pub fn __tile_mul_mv_q8_0_interleaved_f32(
+    _w: *const u8, _x: *const f32, _out: *mut f32,
+    _n_rows: i32, _blocks_per_row: i32, _n_cols: i32,
+) {
+}
+
     /// Low 4 bits of each packed byte, as f32 in `0..=15`. `R x C -> R x C`.
     ///
     /// Paired with [`__tile_unpack_nibbles_hi_f32`]. Deliberately TWO ops
