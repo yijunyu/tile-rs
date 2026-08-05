@@ -2047,6 +2047,13 @@ extern "C" {
     /// nibbles supply elements `0..C` and the high nibbles `C..2C`, i.e. two
     /// successive block iterations of a mat-vec. Not materialising the wide
     /// tile is both portable and cheaper.
+    /// Fused Q8_0 mat-vec over repacked planes: quants, per-block scales,
+    /// activations, output. The whole contraction in one kernel, against the
+    /// five a composed chain of the same template needs.
+    pub fn __tile_mul_mv_q8_0_f32(
+        quants: *const i8, scales: *const f32, acts: *const f32, out: *mut f32,
+        n_rows: u32, blocks_per_row: u32, n_cols: u32,
+    );
     pub fn __tile_unpack_nibbles_lo_f32(dst: u32, src: u32, rows: u32, cols: u32) -> u32;
 
     /// High 4 bits of each packed byte, as f32 in `0..=15`. `R x C -> R x C`.
@@ -2438,6 +2445,25 @@ pub fn tile_reduce_sum_f32<const ROWS: usize, const COLS: usize>(
 /// op. In ggml's Q4 layout the low half is elements `0..COLS` and the high
 /// half `COLS..2*COLS`, so a mat-vec simply runs two more block iterations.
 #[inline(always)]
+/// Fused Q8_0 mat-vec: `out[m][n] = sum_k w[n][k] * x[m][k]`.
+///
+/// Takes the planes a repack buffer type provides -- a byte plane of quants and
+/// a float plane of one scale per 32-element block -- because the DSL cannot
+/// address inside ggml's interleaved blocks. Unlike the composed form, the
+/// dequantized weights never reach memory: they are consumed in registers.
+#[inline(always)]
+pub fn tile_mul_mv_q8_0_f32(
+    quants: *const i8,
+    scales: *const f32,
+    acts: *const f32,
+    out: *mut f32,
+    n_rows: u32,
+    blocks_per_row: u32,
+    n_cols: u32,
+) {
+    unsafe { __tile_mul_mv_q8_0_f32(quants, scales, acts, out, n_rows, blocks_per_row, n_cols) }
+}
+
 pub fn tile_unpack_nibbles_lo_f32<const ROWS: usize, const COLS: usize>(
     src: Tile<ROWS, COLS, u32>,
 ) -> Tile<ROWS, COLS, f32> {
