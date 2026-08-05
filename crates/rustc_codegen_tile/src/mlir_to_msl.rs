@@ -973,7 +973,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
             // Q4_0 nibbles are UNSIGNED bytes; the zero point is subtracted
             // after unpacking, so signing them here would corrupt the high half.
-            else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "uchar" }
+            else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "ushort" }
             // Scales stay in the fp16 the checkpoint already stores them in.
             // Widening the plane to f32 adds 3.7 MB of traffic to a 66 MB
             // kernel that is purely bandwidth bound, to carry no more
@@ -3972,7 +3972,7 @@ pub const MUL_MV_VECS_PER_LANE: usize = 2;
 /// bound and more unpack bound. At VPL = UPB (4) a lane owns exactly one block,
 /// which makes its activation reads contiguous and drops it to one scale load
 /// per step.
-pub const MUL_MV_Q4_VECS_PER_LANE: usize = 2;
+pub const MUL_MV_Q4_VECS_PER_LANE: usize = 1;
 
 /// Row-tile depth for Q4_0, separate from Q8_0's.
 ///
@@ -3997,7 +3997,7 @@ pub const MUL_MV_Q4_ROWS_PER_TG: usize = 4;
 fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "    const uint BLK  = 32u;                 // weights per block").unwrap();
     writeln!(out, "    const uint QB   = BLK / 2u;            // quant BYTES per block").unwrap();
-    writeln!(out, "    const uint UPB  = QB / 4u;             // uchar4 units per block").unwrap();
+    writeln!(out, "    const uint UPB  = QB / 8u;             // ushort4 units per block").unwrap();
     writeln!(out, "    const uint VPL  = {}u;                  // units a lane takes per step", MUL_MV_Q4_VECS_PER_LANE).unwrap();
     writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_Q4_ROWS_PER_TG).unwrap();
     writeln!(out).unwrap();
@@ -4007,43 +4007,38 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "    uint m  = tg / row_tiles;").unwrap();
     writeln!(out, "    uint n0 = (tg % row_tiles) * ROWS_PER_TG;").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    uint row_bytes = blocks_per_row * QB;   // quant bytes per weight row").unwrap();
-    writeln!(out, "    uint n_unit    = (blocks_per_row * UPB) / VPL;").unwrap();
+    writeln!(out, "    uint row_units = blocks_per_row * UPB;  // ushort4 units per weight row").unwrap();
+    writeln!(out, "    uint n_unit    = row_units / VPL;").unwrap();
     writeln!(out, "    device const float4* x4 = (device const float4*)(p2 + (ulong)m * blocks_per_row * BLK);").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
     writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
     writeln!(out).unwrap();
+    // One 8-byte load yields sixteen weights as four masked planes. No nibble
+    // is ever shifted down: each stays at its bit position and the factor
+    // (1, 16, 256, 4096) rides on a pre-scaled activation. The zero point
+    // scales with it, so the planes subtract 8, 128, 2048 and 32768.
     writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
-    writeln!(out, "        uint i = u * VPL;                   // first uchar4 this lane owns").unwrap();
-    writeln!(out, "        uint b = i / UPB;                   // block it falls in").unwrap();
-    // The quant plane is re-interleaved at repack time so a unit's two nibble
-    // halves cover elements 8u..8u+3 and 8u+4..8u+7 -- float4 2u and 2u+1,
-    // ADJACENT. In ggml's own layout the halves sit sixteen elements apart and
-    // this is two scattered streams instead of one contiguous pair.
-    writeln!(out, "        float4 xlo[VPL];").unwrap();
-    writeln!(out, "        float4 xhi[VPL];").unwrap();
+    writeln!(out, "        uint i = u * VPL;").unwrap();
+    writeln!(out, "        uint b = i / UPB;").unwrap();
+    writeln!(out, "        float4 xp[VPL][4];").unwrap();
     writeln!(out, "        for (uint j = 0u; j < VPL; ++j) {{").unwrap();
-    writeln!(out, "            xlo[j] = x4[2u * (i + j)];").unwrap();
-    // Pre-scaled by 1/16 so the high nibble never has to be shifted down: it
-    // is masked IN PLACE as (q & 0xF0), which is 16x its value, and the
-    // activation carries the 1/16. The zero point scales with it, hence -128
-    // rather than -8. One multiply per unit, amortized over every row in the
-    // tile, replaces a shift per unit PER ROW.
-    writeln!(out, "            xhi[j] = x4[2u * (i + j) + 1u] * (1.0f / 16.0f);").unwrap();
+    writeln!(out, "            xp[j][0] = x4[4u * (i + j) + 0u];").unwrap();
+    writeln!(out, "            xp[j][1] = x4[4u * (i + j) + 1u] * (1.0f / 16.0f);").unwrap();
+    writeln!(out, "            xp[j][2] = x4[4u * (i + j) + 2u] * (1.0f / 256.0f);").unwrap();
+    writeln!(out, "            xp[j][3] = x4[4u * (i + j) + 3u] * (1.0f / 4096.0f);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
-    writeln!(out, "            device const uchar4* q4 = (device const uchar4*)(p0 + (ulong)n * row_bytes);").unwrap();
-    // Folding the zero point out as `sum q*x - 8*sum x` was tried and is
-    // SLOWER here (83 us against 75): the extra live activation sum costs more
-    // registers than the per-element subtraction costs arithmetic.
+    writeln!(out, "            device const ushort4* q16 = (device const ushort4*)(p0 + (ulong)n * row_units * 4u);").unwrap();
     writeln!(out, "            float sum = 0.0f;").unwrap();
     writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
-    writeln!(out, "                uchar4 qq = q4[i + j];").unwrap();
-    writeln!(out, "                sum += dot(float4(qq & (uchar4)0x0F) -   8.0f, xlo[j]);").unwrap();
-    writeln!(out, "                sum += dot(float4(qq & (uchar4)0xF0) - 128.0f, xhi[j]);").unwrap();
+    writeln!(out, "                ushort4 ww = q16[i + j];").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x000F) -     8.0f, xp[j][0]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x00F0) -   128.0f, xp[j][1]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x0F00) -  2048.0f, xp[j][2]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0xF000) - 32768.0f, xp[j][3]);").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * sum;").unwrap();
     writeln!(out, "        }}").unwrap();
@@ -15781,24 +15776,32 @@ module {
         // UNSIGNED. The zero point is subtracted after unpacking, so signing
         // the plane would make every high nibble wrong while the low half kept
         // looking right -- which is the dangerous part.
-        assert!(msl.contains("device const  uchar* p0"),
-            "packed nibbles must be unsigned:\n{}", msl);
+        assert!(msl.contains("device const  ushort* p0"),
+            "packed nibbles must be an unsigned 16-bit plane:\n{}", msl);
 
-        // Both halves, each against its own activation slice: ggml puts element
-        // j in the low nibble of byte j and element j+16 in the high.
-        // The high nibble is masked in place, never shifted -- its factor of
-        // 16 rides on the pre-scaled activation instead.
-        assert!(msl.contains("qq & (uchar4)0x0F") && msl.contains("qq & (uchar4)0xF0"),
-            "both nibble halves must be taken, by mask:\n{}", msl);
-        assert!(!msl.contains(">> (uchar4)4"),
-            "the high nibble must not be shifted down:\n{}", msl);
-        assert!(msl.contains("* (1.0f / 16.0f)") && msl.contains("- 128.0f"),
-            "the shift must be folded into the activation and the zero point:\n{}", msl);
-        // Adjacent, not sixteen elements apart: the repack re-interleaves the
-        // plane so a unit's halves land on consecutive float4s.
-        assert!(msl.contains("x4[2u * (i + j)]") && msl.contains("x4[2u * (i + j) + 1u]"),
-            "the halves must pair with ADJACENT activations:\n{}", msl);
-        assert!(msl.contains("-   8.0f"), "the Q4_0 zero point must be applied:\n{}", msl);
+        // FOUR nibble planes from one 8-byte load, each masked in place. No
+        // nibble is shifted down; its bit position rides on a pre-scaled
+        // activation, and the zero point scales with it.
+        for mask in ["0x000F", "0x00F0", "0x0F00", "0xF000"] {
+            assert!(msl.contains(&format!("ww & (ushort4){}", mask)),
+                "plane {} must be masked in place:\n{}", mask, msl);
+        }
+        assert!(!msl.contains(">>"), "no nibble may be shifted down:\n{}", msl);
+        // Collapse the emitter's column alignment before matching, so the
+        // assertions pin the arithmetic rather than the whitespace.
+        let flat: String = msl.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (scale, zero) in [("16.0f", "128.0f"), ("256.0f", "2048.0f"), ("4096.0f", "32768.0f")] {
+            assert!(flat.contains(&format!("(1.0f / {})", scale)),
+                "activation plane must carry 1/{}:\n{}", scale, msl);
+            assert!(flat.contains(&format!("- {}", zero)),
+                "zero point must scale with the plane ({}):\n{}", zero, msl);
+        }
+        // The four planes land on four CONSECUTIVE float4s, which is what the
+        // repack permutation buys.
+        for k in 0..4 {
+            assert!(msl.contains(&format!("x4[4u * (i + j) + {}u]", k)),
+                "plane {} must read an adjacent activation float4:\n{}", k, msl);
+        }
 
         // Unpacked weights must never reach memory; only the result is stored.
         assert_eq!(msl.matches("p3[").count(), 1,
