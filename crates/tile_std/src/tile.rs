@@ -223,6 +223,19 @@ extern "C" {
         seq_len: u32, head_dim: u32,
     ) -> u32;
 
+    /// Fused attention with a caller-supplied global-memory scratch buffer.
+    ///
+    /// Numerically identical to `__tile_attention_f32`; it exists so backends
+    /// without direct Acc->Vec / Vec->Mat tile moves can route those two
+    /// crossings through global memory instead. `scratch` must address at
+    /// least `seq_len * seq_len` elements and is used as pure temporary
+    /// storage (written and re-read twice, contents undefined afterwards).
+    pub fn __tile_attention_scratch_f32(
+        dst: u32, q: u32, k: u32, v: u32,
+        scratch: *mut f32,
+        seq_len: u32, head_dim: u32,
+    ) -> u32;
+
     /// Causal fused attention: softmax(mask(Q @ K^T / sqrt(d))) @ V, where
     /// `mask` sets every entry above the diagonal to -inf.
     /// Q: (S × D), K: (S × D), V: (S × D) → out: (S × D)
@@ -2424,6 +2437,29 @@ pub fn tile_attention_f32<const S: usize, const D: usize>(
 ) -> Tile<S, D, f32> {
     let buf_id = unsafe {
         __tile_attention_f32(0, q.buf_id, k.buf_id, v.buf_id, S as u32, D as u32)
+    };
+    Tile { buf_id, _phantom: PhantomData }
+}
+
+/// Fused attention that routes its two internal tile-kind crossings through a
+/// caller-supplied global-memory scratch buffer.
+///
+/// Same result as [`tile_attention_f32`]. On Ascend a2a3 (dav-c220) the direct
+/// `Acc -> Vec` and `Vec -> Mat` tile moves the ordinary lowering needs are
+/// A5-only, so that path cannot run there at all; this variant stores to `gm`
+/// and re-loads instead, which is supported on both generations.
+///
+/// `scratch` must have room for `S * S` f32 elements. It is scribbled over.
+#[inline(always)]
+pub fn tile_attention_scratch_f32<const S: usize, const D: usize>(
+    q: Tile<S, D, f32>,
+    k: Tile<S, D, f32>,
+    v: Tile<S, D, f32>,
+    scratch: *mut f32,
+) -> Tile<S, D, f32> {
+    let buf_id = unsafe {
+        __tile_attention_scratch_f32(
+            0, q.buf_id, k.buf_id, v.buf_id, scratch, S as u32, D as u32)
     };
     Tile { buf_id, _phantom: PhantomData }
 }

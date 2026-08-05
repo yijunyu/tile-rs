@@ -1487,6 +1487,11 @@ fn analyze_body(
                     .to_string(),
             );
         }
+        // tile.attention_scratch f32 — a2a3-safe attention (GM round trips).
+        if line.contains("__tile_attention_scratch_f32") {
+            translate_attention_scratch(line, ctx, func, &mut ops)?;
+            continue;
+        }
         // tile.attention f32 — fused Q@K^T → scale → softmax → @V
         // Decomposed into: matmul + scale + softmax_5ops + matmul
         if line.contains("__tile_attention_f32") {
@@ -2619,6 +2624,162 @@ fn translate_softmax(
 /// Decomposes into: matmul(Q,K^T) → softmax_5ops → matmul(@V)
 /// The full pipeline is emitted as sequential PTO ops, allowing ptoas to
 /// schedule them optimally across cube and vector engines.
+/// Fused attention that routes its two tile-kind crossings through a
+/// caller-supplied GM scratch buffer, so it runs on a2a3 (dav-c220) as well
+/// as A5.
+///
+/// `translate_attention` needs two moves that only A5 implements:
+/// `Acc -> Vec` (scores into the vector unit for softmax) and `Vec -> Mat`
+/// via `pto.tinsert` (softmax weights back to the cube). Neither exists on
+/// a2a3, which is why plain attention is stamped `pto.target_arch = "a5"`.
+///
+/// Both are replaced here by a `tstore` to global memory followed by a
+/// `tload` into the destination tile kind -- directions supported on both
+/// generations. One `S x S` scratch buffer serves both, reused after the
+/// first round trip has been fully consumed.
+///
+/// Numerically identical to `translate_attention`: same matmuls, same
+/// softmax op sequence, same operand order. Only the transport changes.
+fn translate_attention_scratch(
+    line: &str,
+    ctx: &mut PtoContext,
+    func: &MlirFunc,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let args =
+        extract_call_args(line).ok_or_else(|| format!("attention_scratch: cannot parse args: {}", line))?;
+    // args: [dst(0), q_buf, k_buf, v_buf, scratch_gm, seq_len, head_dim]
+    if args.len() < 7 {
+        return Err(format!(
+            "attention_scratch: expected 7 args (dst, q, k, v, scratch, S, D), got {}",
+            args.len()
+        ));
+    }
+    let result_ssa = extract_result_ssa(line).unwrap_or_else(|| "__att_scratch_out".to_string());
+    let q_arg = args[1].trim();
+    let k_arg = args[2].trim();
+    let v_arg = args[3].trim();
+    let scratch_arg = args[4].trim();
+    let s = ctx.resolve_const(args[5].trim());
+    let d = ctx.resolve_const(args[6].trim());
+
+    let tq = ctx.get_tile(q_arg).ok_or_else(|| format!("attention_scratch: unknown Q tile {}", q_arg))?.clone();
+    let tk = ctx.get_tile(k_arg).ok_or_else(|| format!("attention_scratch: unknown K tile {}", k_arg))?.clone();
+    let tv = ctx.get_tile(v_arg).ok_or_else(|| format!("attention_scratch: unknown V tile {}", v_arg))?.clone();
+
+    // ptoas does not accept the vec→mat tmov address-space pair on a5 when the
+    // source tile has slayout=none_box. The working matmul path (translate_matmul)
+    // goes GM-partition_view → mat directly via `pto.tload`. We do the same here
+    // by re-tload'ing from the same partition views for Q/K/V — the user-level
+    // `tile_load_view_f32` did put them into vec tiles already, but for the cube
+    // path we want mat tiles straight from GM.
+    let pv_q = tq.pv_ssa.clone().ok_or_else(|| {
+        format!("attention_scratch: Q tile {} has no partition view (not loaded from GM)", q_arg)
+    })?;
+    let pv_v = tv.pv_ssa.clone().ok_or_else(|| {
+        format!("attention_scratch: V tile {} has no partition view (not loaded from GM)", v_arg)
+    })?;
+    // K needs to be fed into the cube as D×S (right operand of tmatmul),
+    // but the user loaded it as S×D row-major. Construct a *transposed*
+    // tensor_view on the same GM buffer and a fresh D×S partition_view.
+    let k_gm = tk.gm_name.clone().ok_or_else(|| {
+        format!("attention_scratch: K tile {} has no recorded GM name (not loaded from GM)", k_arg)
+    })?;
+
+    ops.push(format!("// --- attention_scratch (a2a3-safe, GM round trips): S={}, D={} ---", s, d));
+
+    // Step 1: scores = Q(S×D) @ K^T(D×S) → S×S via cube unit.
+    // Q is loaded ND→NZ (GM row-major view, mat blayout=col_major/slayout=row_major).
+    // K uses a *transposed* tensor_view (DN) and thus a ZN mat tile
+    // (blayout=row_major/slayout=col_major) to satisfy TLoadGm2L1's supported
+    // DN→ZN path. ZN happens to match the `right` operand layout exactly,
+    // so the subsequent CBUF→L0B tmov is just a location change.
+    let mat_q_ty = mat_tile_type(s, d, "f32");
+    let mat_k_ty = mat_tile_type_zn(d, s, "f32");
+    let l_ty = left_tile_type(s, d, "f32");
+    let r_ty = right_tile_type(d, s, "f32");
+    let acc_ty = acc_tile_type(s, s, "f32");
+
+    let mq = ctx.alloc_tile_typed(&format!("{}__mq", result_ssa), s, d, "f32", &mat_q_ty, ops);
+    let mk = ctx.alloc_tile_typed(&format!("{}__mk", result_ssa), d, s, "f32", &mat_k_ty, ops);
+    let lq = ctx.alloc_tile_typed(&format!("{}__lq", result_ssa), s, d, "f32", &l_ty, ops);
+    let rk = ctx.alloc_tile_typed(&format!("{}__rk", result_ssa), d, s, "f32", &r_ty, ops);
+    let scores = ctx.alloc_tile_typed(&format!("{}__scores", result_ssa), s, s, "f32", &acc_ty, ops);
+
+    // tload Q (S×D) and K (D×S via *transposed* tensor_view) directly into
+    // CBUF mat tiles. The K transpose is encoded in the view: shape [D,S]
+    // with strides [1, D] reads the same S×D row-major GM buffer as if it
+    // were column-major — which is exactly K^T.
+    let pv_sd = ptv_type(s, d, "f32");
+    let tv_k_t = ctx.make_tv_transposed(&k_gm, s, d, "f32", ops);
+    let pv_k_t = ctx.make_pv(&tv_k_t, d, s, "f32", 0, ops);
+    let pv_ds = ptv_type(d, s, "f32");
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_q, pv_sd, mq, mat_q_ty));
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_k_t, pv_ds, mk, mat_k_ty));
+    // mat → L0A/L0B (CBUF → L0 is the supported tmov pair)
+    ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", mq, mat_q_ty, lq, l_ty));
+    ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", mk, mat_k_ty, rk, r_ty));
+    ops.push(format!("pto.tmatmul ins({}, {} : {}, {}) outs({} : {})", lq, rk, l_ty, r_ty, scores, acc_ty));
+
+    // Step 2: move scores to VEC for softmax
+    let vec_ty = tile_buf_type(s, s, "f32");
+    let sv = ctx.alloc_tile_typed(&format!("{}__sv", result_ssa), s, s, "f32", &vec_ty, ops);
+    // CROSSING 1 (Acc -> Vec) via GM. A direct tmov here is A5-only; both
+    // legs below are supported on a2a3 and A5 alike.
+    let scratch_gm = resolve_gm_name(&ctx.resolve_ptr(scratch_arg), func);
+    let tv_scratch = ctx.get_or_make_tv(&scratch_gm, s, s, "f32", ops);
+    let pv_scratch = ctx.make_pv(&tv_scratch, s, s, "f32", 0, ops);
+    let pv_ss = ptv_type(s, s, "f32");
+    ops.push(format!("pto.tstore ins({} : {}) outs({} : {})", scores, acc_ty, pv_scratch, pv_ss));
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_scratch, pv_ss, sv, vec_ty));
+
+    // Step 3: softmax (5-step) — mirrors translate_softmax.
+    // max and sum are row-reductions (rows×1, col_major), so they need the
+    // rowreduce type (tile_buf_type_rowreduce). Other intermediates are
+    // plain S×S vec tiles.
+    let rr_ty = tile_buf_type_rowreduce(s, "f32");
+    let tmp = ctx.alloc_tile(&format!("{}__tmp", result_ssa), s, s, "f32", ops);
+    let mx = ctx.alloc_tile_rowreduce(&format!("{}__mx", result_ssa), s, "f32", ops);
+    let sb = ctx.alloc_tile(&format!("{}__sb", result_ssa), s, s, "f32", ops);
+    let ex = ctx.alloc_tile(&format!("{}__ex", result_ssa), s, s, "f32", ops);
+    let sm = ctx.alloc_tile_rowreduce(&format!("{}__sm", result_ssa), s, "f32", ops);
+    let wt = ctx.alloc_tile(&format!("{}__wt", result_ssa), s, s, "f32", ops);
+
+    ops.push(format!("pto.trowmax ins({}, {} : {}, {}) outs({} : {})", sv, tmp, vec_ty, vec_ty, mx, rr_ty));
+    ops.push(format!("pto.trowexpandsub ins({}, {} : {}, {}) outs({} : {})", sv, mx, vec_ty, rr_ty, sb, vec_ty));
+    ops.push(format!("pto.texp ins({} : {}) outs({} : {})", sb, vec_ty, ex, vec_ty));
+    ops.push(format!("pto.trowsum ins({}, {} : {}, {}) outs({} : {})", ex, tmp, vec_ty, vec_ty, sm, rr_ty));
+    ops.push(format!("pto.trowexpanddiv ins({}, {} : {}, {}) outs({} : {})", ex, sm, vec_ty, rr_ty, wt, vec_ty));
+
+    // Step 4: output = weights(S×S) @ V(S×D) → S×D
+    let mw_ty = mat_tile_type(s, s, "f32");
+    let mv_ty = mat_tile_type(s, d, "f32");
+    let lw_ty = left_tile_type(s, s, "f32");
+    let rv_ty = right_tile_type(s, d, "f32");
+    let out_ty = acc_tile_type(s, d, "f32");
+
+    let mw = ctx.alloc_tile_typed(&format!("{}__mw", result_ssa), s, s, "f32", &mw_ty, ops);
+    let mv = ctx.alloc_tile_typed(&format!("{}__mv", result_ssa), s, d, "f32", &mv_ty, ops);
+    let lw = ctx.alloc_tile_typed(&format!("{}__lw", result_ssa), s, s, "f32", &lw_ty, ops);
+    let rv = ctx.alloc_tile_typed(&format!("{}__rv", result_ssa), s, d, "f32", &rv_ty, ops);
+    let out = ctx.alloc_tile_typed(&result_ssa, s, d, "f32", &out_ty, ops);
+
+    // V: GM partition_view → mat (avoid vec→mat tmov).
+    let pv_sd2 = ptv_type(s, d, "f32");
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_v, pv_sd2, mv, mv_ty));
+    // CROSSING 2 (Vec -> Mat) via the SAME scratch buffer, reused after
+    // crossing 1 has been fully consumed into `sv`. `pto.tinsert` is the
+    // A5-only op the ordinary lowering uses here; GM -> Mat is already the
+    // path V takes below, so this leg is known-good on a2a3.
+    ops.push(format!("pto.tstore ins({} : {}) outs({} : {})", wt, vec_ty, pv_scratch, pv_ss));
+    ops.push(format!("pto.tload ins({} : {}) outs({} : {})", pv_scratch, pv_ss, mw, mw_ty));
+    ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", mw, mw_ty, lw, lw_ty));
+    ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", mv, mv_ty, rv, rv_ty));
+    ops.push(format!("pto.tmatmul ins({}, {} : {}, {}) outs({} : {})", lw, rv, lw_ty, rv_ty, out, out_ty));
+
+    Ok(())
+}
+
 fn translate_attention(
     line: &str,
     ctx: &mut PtoContext,
@@ -8229,5 +8390,23 @@ module {
 }
 "#;
         std::fs::write(format!("{}/attention.pto", dir), convert_mlir_to_pto(attn).unwrap()).unwrap();
+
+        // a2a3-safe attention: same shape, plus a GM scratch pointer.
+        let attn_s = r#"
+module {
+  llvm.func @tile_attn_s(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %s = llvm.mlir.constant(16 : i32) : i32
+    %d = llvm.mlir.constant(16 : i32) : i32
+    %q = llvm.call @__tile_load_f32(%arg0, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %k = llvm.call @__tile_load_f32(%arg1, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %v = llvm.call @__tile_load_f32(%arg2, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
+    %r = llvm.call @__tile_attention_scratch_f32(%q, %q, %k, %v, %arg4, %s, %d) : (i32, i32, i32, i32, !llvm.ptr<1>, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %r, %s, %d) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        std::fs::write(format!("{}/attention_scratch.pto", dir), convert_mlir_to_pto(attn_s).unwrap()).unwrap();
     }
 }
