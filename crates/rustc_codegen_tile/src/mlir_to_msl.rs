@@ -3974,6 +3974,14 @@ pub const MUL_MV_VECS_PER_LANE: usize = 2;
 /// per step.
 pub const MUL_MV_Q4_VECS_PER_LANE: usize = 2;
 
+/// Row-tile depth for Q4_0, separate from Q8_0's.
+///
+/// Q4_0 stages TWO activation vectors per unit -- the low and high nibble
+/// halves pair with slices sixteen elements apart -- so it carries twice the
+/// live activation state of Q8_0 at the same depth, and sits at a different
+/// register-pressure optimum.
+pub const MUL_MV_Q4_ROWS_PER_TG: usize = 4;
+
 /// Fused Q4_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
 ///
 /// The Q8_0 kernel's structure, over half the weight bytes. ggml stores element
@@ -3991,7 +3999,7 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "    const uint QB   = BLK / 2u;            // quant BYTES per block").unwrap();
     writeln!(out, "    const uint UPB  = QB / 4u;             // uchar4 units per block").unwrap();
     writeln!(out, "    const uint VPL  = {}u;                  // units a lane takes per step", MUL_MV_Q4_VECS_PER_LANE).unwrap();
-    writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_ROWS_PER_TG).unwrap();
+    writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_Q4_ROWS_PER_TG).unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint tg = row;").unwrap();
     writeln!(out, "    uint row_tiles = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;").unwrap();
@@ -4022,14 +4030,14 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
     writeln!(out, "            device const uchar4* q4 = (device const uchar4*)(p0 + (ulong)n * row_bytes);").unwrap();
+    // Folding the zero point out as `sum q*x - 8*sum x` was tried and is
+    // SLOWER here (83 us against 75): the extra live activation sum costs more
+    // registers than the per-element subtraction costs arithmetic.
     writeln!(out, "            float sum = 0.0f;").unwrap();
     writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
     writeln!(out, "                uchar4 qq = q4[i + j];").unwrap();
-    writeln!(out, "                float4 lo = float4(qq & (uchar4)0x0F) - 8.0f;").unwrap();
-    writeln!(out, "                float4 hi = float4(qq >> (uchar4)4) - 8.0f;").unwrap();
-    writeln!(out, "                float4 pl = lo * xlo[j];").unwrap();
-    writeln!(out, "                float4 ph = hi * xhi[j];").unwrap();
-    writeln!(out, "                sum += (pl.x + pl.y + pl.z + pl.w) + (ph.x + ph.y + ph.z + ph.w);").unwrap();
+    writeln!(out, "                sum += dot(float4(qq & (uchar4)0x0F) - 8.0f, xlo[j]);").unwrap();
+    writeln!(out, "                sum += dot(float4(qq >> (uchar4)4)   - 8.0f, xhi[j]);").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * sum;").unwrap();
     writeln!(out, "        }}").unwrap();
