@@ -3972,7 +3972,7 @@ pub const MUL_MV_VECS_PER_LANE: usize = 2;
 /// bound and more unpack bound. At VPL = UPB (4) a lane owns exactly one block,
 /// which makes its activation reads contiguous and drops it to one scale load
 /// per step.
-pub const MUL_MV_Q4_VECS_PER_LANE: usize = 1;
+pub const MUL_MV_Q4_VECS_PER_LANE: usize = 2;
 
 /// Row-tile depth for Q4_0, separate from Q8_0's.
 ///
@@ -3980,7 +3980,7 @@ pub const MUL_MV_Q4_VECS_PER_LANE: usize = 1;
 /// halves pair with slices sixteen elements apart -- so it carries twice the
 /// live activation state of Q8_0 at the same depth, and sits at a different
 /// register-pressure optimum.
-pub const MUL_MV_Q4_ROWS_PER_TG: usize = 4;
+pub const MUL_MV_Q4_ROWS_PER_TG: usize = 6;
 
 /// Fused Q4_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
 ///
@@ -3995,6 +3995,23 @@ pub const MUL_MV_Q4_ROWS_PER_TG: usize = 4;
 /// chosen to save. The zero point (`-8`) is applied after unpacking, so the
 /// quant plane is UNSIGNED: signing it would wreck the high half.
 fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
+    // A lane applies ONE scale per step, indexed by the block its first unit
+    // falls in. That is only correct while a step stays inside one block. A
+    // Q4_0 block is 16 quant bytes = 2 ushort4 units, so VPL > 2 makes a lane
+    // straddle two blocks and scale the second by the first's factor --
+    // silently, and only on the quantized path.
+    //
+    // This is a knob PRECONDITION, not a preference, so it is enforced where
+    // the kernel is built rather than left to whoever runs the next sweep.
+    const Q4_UNITS_PER_BLOCK: usize = 2;
+    assert!(
+        MUL_MV_Q4_VECS_PER_LANE <= Q4_UNITS_PER_BLOCK
+            && Q4_UNITS_PER_BLOCK % MUL_MV_Q4_VECS_PER_LANE == 0,
+        "MUL_MV_Q4_VECS_PER_LANE={} straddles a Q4_0 block ({} units): a lane \
+         would apply one block's scale to another block's weights",
+        MUL_MV_Q4_VECS_PER_LANE, Q4_UNITS_PER_BLOCK
+    );
+
     writeln!(out, "    const uint BLK  = 32u;                 // weights per block").unwrap();
     writeln!(out, "    const uint QB   = BLK / 2u;            // quant BYTES per block").unwrap();
     writeln!(out, "    const uint UPB  = QB / 8u;             // ushort4 units per block").unwrap();
@@ -4095,6 +4112,17 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
 /// weight before the sum would be mathematically the same and numerically
 /// different, for no gain.
 fn emit_mul_mv_q8_0_planar_msl(out: &mut String) {
+    // Same precondition as Q4_0: one scale per lane-step means a step must not
+    // cross a block. A Q8_0 block is 32 bytes = 8 char4 units, so this is
+    // slack at any width tried so far -- but it is the same landmine.
+    const Q8_UNITS_PER_BLOCK: usize = 8;
+    assert!(
+        MUL_MV_VECS_PER_LANE <= Q8_UNITS_PER_BLOCK
+            && Q8_UNITS_PER_BLOCK % MUL_MV_VECS_PER_LANE == 0,
+        "MUL_MV_VECS_PER_LANE={} straddles a Q8_0 block ({} units)",
+        MUL_MV_VECS_PER_LANE, Q8_UNITS_PER_BLOCK
+    );
+
     writeln!(out, "    const uint BLK = 32u;").unwrap();
     writeln!(out, "    const uint VEC = 4u;").unwrap();
     writeln!(out, "    const uint VPB = BLK / VEC;            // vectors per block").unwrap();
