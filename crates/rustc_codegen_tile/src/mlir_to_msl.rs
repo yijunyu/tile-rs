@@ -4022,11 +4022,24 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "        uint i = u * VPL;").unwrap();
     writeln!(out, "        uint b = i / UPB;").unwrap();
     writeln!(out, "        float4 xp[VPL][4];").unwrap();
+    // Every plane's zero point collapses to the SAME term. Plane p subtracts
+    // 8*16^p from a value multiplied by an activation pre-scaled by 16^-p, so
+    // each contributes exactly 8 * (that plane's raw activations):
+    //   128*(x/16) == 2048*(x/256) == 32768*(x/4096) == 8x
+    // So the four subtractions per unit PER ROW become one shared sum computed
+    // once per unit, and a single fused multiply-add per row.
+    writeln!(out, "        float xsum = 0.0f;").unwrap();
     writeln!(out, "        for (uint j = 0u; j < VPL; ++j) {{").unwrap();
-    writeln!(out, "            xp[j][0] = x4[4u * (i + j) + 0u];").unwrap();
-    writeln!(out, "            xp[j][1] = x4[4u * (i + j) + 1u] * (1.0f / 16.0f);").unwrap();
-    writeln!(out, "            xp[j][2] = x4[4u * (i + j) + 2u] * (1.0f / 256.0f);").unwrap();
-    writeln!(out, "            xp[j][3] = x4[4u * (i + j) + 3u] * (1.0f / 4096.0f);").unwrap();
+    writeln!(out, "            float4 x0 = x4[4u * (i + j) + 0u];").unwrap();
+    writeln!(out, "            float4 x1 = x4[4u * (i + j) + 1u];").unwrap();
+    writeln!(out, "            float4 x2 = x4[4u * (i + j) + 2u];").unwrap();
+    writeln!(out, "            float4 x3 = x4[4u * (i + j) + 3u];").unwrap();
+    writeln!(out, "            xsum += (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w)").unwrap();
+    writeln!(out, "                  + (x2.x + x2.y + x2.z + x2.w) + (x3.x + x3.y + x3.z + x3.w);").unwrap();
+    writeln!(out, "            xp[j][0] = x0;").unwrap();
+    writeln!(out, "            xp[j][1] = x1 * (1.0f / 16.0f);").unwrap();
+    writeln!(out, "            xp[j][2] = x2 * (1.0f / 256.0f);").unwrap();
+    writeln!(out, "            xp[j][3] = x3 * (1.0f / 4096.0f);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
@@ -4035,12 +4048,12 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "            float sum = 0.0f;").unwrap();
     writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
     writeln!(out, "                ushort4 ww = q16[i + j];").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x000F) -     8.0f, xp[j][0]);").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x00F0) -   128.0f, xp[j][1]);").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x0F00) -  2048.0f, xp[j][2]);").unwrap();
-    writeln!(out, "                sum += dot(float4(ww & (ushort4)0xF000) - 32768.0f, xp[j][3]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x000F), xp[j][0]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x00F0), xp[j][1]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0x0F00), xp[j][2]);").unwrap();
+    writeln!(out, "                sum += dot(float4(ww & (ushort4)0xF000), xp[j][3]);").unwrap();
     writeln!(out, "            }}").unwrap();
-    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * sum;").unwrap();
+    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * (sum - 8.0f * xsum);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
@@ -15790,12 +15803,16 @@ module {
         // Collapse the emitter's column alignment before matching, so the
         // assertions pin the arithmetic rather than the whitespace.
         let flat: String = msl.split_whitespace().collect::<Vec<_>>().join(" ");
-        for (scale, zero) in [("16.0f", "128.0f"), ("256.0f", "2048.0f"), ("4096.0f", "32768.0f")] {
+        for scale in ["16.0f", "256.0f", "4096.0f"] {
             assert!(flat.contains(&format!("(1.0f / {})", scale)),
                 "activation plane must carry 1/{}:\n{}", scale, msl);
-            assert!(flat.contains(&format!("- {}", zero)),
-                "zero point must scale with the plane ({}):\n{}", zero, msl);
         }
+        // Every plane's zero point collapses to 8 * raw activations, so it is
+        // ONE shared term rather than four subtractions per row.
+        assert!(flat.contains("sum - 8.0f * xsum"),
+            "the zero point must collapse to a single shared term:\n{}", msl);
+        assert!(!flat.contains("- 128.0f") && !flat.contains("- 32768.0f"),
+            "no per-plane zero point should survive the collapse:\n{}", msl);
         // The four planes land on four CONSECUTIVE float4s, which is what the
         // repack permutation buys.
         for k in 0..4 {
