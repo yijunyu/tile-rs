@@ -3948,6 +3948,15 @@ fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
 /// columns, not one threadgroup per output element.
 pub const MUL_MV_ROWS_PER_TG: usize = 16;
 
+/// `char4` units each lane consumes per step of the fused mat-vec.
+///
+/// 1 means a lane loads 4 weight bytes per step; ggml's hand-written kernel
+/// takes 8. Wider means fewer loop iterations and fewer scale loads for the
+/// same traffic, but the staged activations (`VPL` float4s) have to stay in
+/// registers, so it stops paying. Must divide the block: VPL*4 <= 32 and
+/// 32 % (VPL*4) == 0, so 1, 2, 4 or 8.
+pub const MUL_MV_VECS_PER_LANE: usize = 2;
+
 /// Fused Q8_0 mat-vec over the repacked planes: `dst[m][n] = sum_k w[n][k]*x[m][k]`.
 ///
 /// One threadgroup per output element, threads striding over the row's blocks,
@@ -3964,6 +3973,10 @@ fn emit_mul_mv_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "    const uint BLK = 32u;").unwrap();
     writeln!(out, "    const uint VEC = 4u;").unwrap();
     writeln!(out, "    const uint VPB = BLK / VEC;            // vectors per block").unwrap();
+    // char4 units each lane consumes per step. Wider is fewer loop iterations,
+    // fewer scale loads, and a wider effective access per lane; too wide and
+    // the staged activations stop fitting in registers.
+    writeln!(out, "    const uint VPL = {}u;", MUL_MV_VECS_PER_LANE).unwrap();
     // Each threadgroup covers ROWS_PER_TG output rows so the activation vector
     // is fetched once and reused across them. With one row per threadgroup the
     // whole vector is re-read for every row -- for a 4096-row projection that
@@ -3991,9 +4004,12 @@ fn emit_mul_mv_q8_0_planar_msl(out: &mut String) {
     writeln!(out).unwrap();
     // Consecutive lanes read consecutive vectors, so a simdgroup covers one
     // contiguous span on every operand it touches.
-    writeln!(out, "    for (uint i = tid; i < n_vec; i += tcount) {{").unwrap();
-    writeln!(out, "        float4 xv = x4[i];          // fetched once for all ROWS_PER_TG rows").unwrap();
+    writeln!(out, "    uint n_unit = n_vec / VPL;").unwrap();
+    writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
+    writeln!(out, "        uint   i  = u * VPL;        // first char4 this lane owns").unwrap();
     writeln!(out, "        uint   b  = i / VPB;").unwrap();
+    writeln!(out, "        float4 xv[VPL];             // fetched once for all ROWS_PER_TG rows").unwrap();
+    writeln!(out, "        for (uint j = 0u; j < VPL; ++j) xv[j] = x4[i + j];").unwrap();
     // The bound MUST stay a compile-time constant. Making it the runtime row
     // count stops the compiler unrolling, and without unrolling acc[] and the
     // pointer arrays are dynamically indexed, so they spill out of registers --
@@ -4003,8 +4019,12 @@ fn emit_mul_mv_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
     writeln!(out, "            device const char4* q4 = (device const char4*)(p0 + (ulong)n * row_stride);").unwrap();
-    writeln!(out, "            float4 p = float4(q4[i]) * xv;").unwrap();
-    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * (p.x + p.y + p.z + p.w);").unwrap();
+    writeln!(out, "            float sum = 0.0f;").unwrap();
+    writeln!(out, "            for (uint j = 0u; j < VPL; ++j) {{").unwrap();
+    writeln!(out, "                float4 p = float4(q4[i + j]) * xv[j];").unwrap();
+    writeln!(out, "                sum += p.x + p.y + p.z + p.w;").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            acc[r] += (float)p1[(ulong)n * blocks_per_row + b] * sum;").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
@@ -15600,7 +15620,13 @@ module {
         // rows. One row per threadgroup re-reads the whole vector for every
         // output row, and at 4096 rows that traffic outweighs the weights.
         assert!(msl.contains("ROWS_PER_TG"), "rows must share their activations:\n{}", msl);
-        assert!(msl.contains("float4 xv = x4[i];"), "one fetch, many rows:\n{}", msl);
+        assert!(msl.contains("for (uint j = 0u; j < VPL; ++j) xv[j] = x4[i + j];"),
+            "activations staged once for all rows:\n{}", msl);
+
+        // Consecutive lanes must own consecutive spans, so the unit index is
+        // the lane's stride and the char4 index is derived from it.
+        assert!(msl.contains("for (uint u = tid; u < n_unit; u += tcount)"),
+            "lanes must stride by unit:\n{}", msl);
 
         // The scale is indexed by the vector's block, so a lane that reads
         // four weights still gets the scale of the block they came from.
@@ -15613,11 +15639,11 @@ module {
         assert!(msl.contains("for (uint r = 0u; r < ROWS_PER_TG; ++r)"),
             "the row loop bound must be constant:\n{}", msl);
 
-        // Consecutive lanes must read consecutive vectors. Striding by BLOCK
-        // instead puts neighbouring lanes 32 bytes apart inside one load,
-        // which halves achievable bandwidth on a bandwidth-bound kernel.
-        assert!(msl.contains("for (uint i = tid; i < n_vec; i += tcount)"),
-            "the stride must be one vector, not one block:\n{}", msl);
+        // The span a lane owns must be smaller than a block. Giving each lane
+        // a whole block puts neighbouring lanes 32 bytes apart inside one load
+        // instruction, which halves achievable bandwidth here.
+        assert!(msl.contains("const uint VPL =") && MUL_MV_VECS_PER_LANE * 4 < 32,
+            "a lane must own less than a block:\n{}", msl);
 
         // Vectorized both sides; a block is 32 quant bytes against 128
         // activation bytes, both naturally aligned, so there is no tail.
