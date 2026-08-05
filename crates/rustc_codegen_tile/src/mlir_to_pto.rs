@@ -1391,6 +1391,11 @@ fn analyze_body(
             translate_binary(line, "f32", "pto.tdiv", ctx, &mut ops)?;
             continue;
         }
+        // tile.unpack_nibbles f32 — packed bytes -> 4-bit halves
+        if line.contains("__tile_unpack_nibbles_f32") {
+            translate_unpack_nibbles(line, "f32", ctx, &mut ops)?;
+            continue;
+        }
         // tile.broadcast_row f32 — dst[r][c] = src[r][0]
         if line.contains("__tile_broadcast_row_f32") {
             translate_broadcast_row(line, "f32", ctx, &mut ops)?;
@@ -2621,6 +2626,72 @@ fn translate_softmax(
         t_exp_ssa, t_sum_ssa, tb_ty, rr_ty, t_out_ssa, tb_ty
     ));
 
+    Ok(())
+}
+
+/// Split packed bytes into 4-bit halves, `R x C` -> `R x 2C`.
+///
+/// PTO has **no bitwise or shift ops**, so this is done arithmetically:
+/// `hi = trunc(b / 16)` via a round-trip `tcast` (f32 -> i32 truncates, then
+/// back), and `lo = b - 16*hi`. The two halves are written to the low and
+/// high column ranges of the destination, matching ggml's Q4 order.
+///
+/// **A5-ONLY as written — do not use on a2a3 (dav-c220).** Composing the
+/// `R x 2C` result from two `R x C` halves uses `pto.tinsert`, which a2a3
+/// does not implement (the same op that forces `target_arch = "a5"` for GQA
+/// attention). The arithmetic above is fine on both generations; it is only
+/// the *composition* that is not, and PTO has no a2a3-safe slice/insert or
+/// concat primitive to replace it.
+///
+/// a2a3 route, when needed: return the two halves as separate `R x C` tiles
+/// and let the caller consume them independently — a `mul_mv` accumulating
+/// over blocks never needs them adjacent, since low nibbles supply elements
+/// `0..C` and high nibbles `C..2C`, which are simply two more block
+/// iterations. That avoids materialising the wide tile at all.
+fn translate_unpack_nibbles(
+    line: &str,
+    dtype: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let args = extract_call_args(line)
+        .ok_or_else(|| format!("unpack_nibbles: cannot parse args: {}", line))?;
+    if args.len() < 4 {
+        return Err(format!(
+            "unpack_nibbles: expected 4 args (dst, src, rows, cols), got {}",
+            args.len()
+        ));
+    }
+    let result_ssa =
+        extract_result_ssa(line).unwrap_or_else(|| "__unpk_out".to_string());
+    let src_arg = args[1].trim();
+    let rows = ctx.resolve_const(args[2].trim());
+    let cols = ctx.resolve_const(args[3].trim());
+
+    ctx.get_tile(src_arg)
+        .ok_or_else(|| format!("unpack_nibbles: unknown src tile {}", src_arg))?;
+
+    let in_ty = tile_buf_type(rows, cols, dtype);
+    let i32_ty = tile_buf_type(rows, cols, "i32");
+    let out_ty = tile_buf_type(rows, 2 * cols, dtype);
+
+    let scaled = ctx.alloc_tile(&format!("{}__div16", result_ssa), rows, cols, dtype, ops);
+    let trunc_i = ctx.alloc_tile_typed(&format!("{}__trunc", result_ssa), rows, cols, "i32", &i32_ty, ops);
+    let hi = ctx.alloc_tile(&format!("{}__hi", result_ssa), rows, cols, dtype, ops);
+    let hi16 = ctx.alloc_tile(&format!("{}__hi16", result_ssa), rows, cols, dtype, ops);
+    let lo = ctx.alloc_tile(&format!("{}__lo", result_ssa), rows, cols, dtype, ops);
+    let dst = ctx.alloc_tile_typed(&result_ssa, rows, 2 * cols, dtype, &out_ty, ops);
+
+    ops.push(format!("pto.tdivs ins({}, 16.0 : {}, f32) outs({} : {})", src_arg, in_ty, scaled, in_ty));
+    // f32 -> i32 truncates toward zero; back to f32 gives floor for non-negatives
+    ops.push(format!("pto.tcast ins({} : {}) outs({} : {})", scaled, in_ty, trunc_i, i32_ty));
+    ops.push(format!("pto.tcast ins({} : {}) outs({} : {})", trunc_i, i32_ty, hi, in_ty));
+    ops.push(format!("pto.tmuls ins({}, 16.0 : {}, f32) outs({} : {})", hi, in_ty, hi16, in_ty));
+    ops.push(format!("pto.tsub ins({}, {} : {}, {}) outs({} : {})", src_arg, hi16, in_ty, in_ty, lo, in_ty));
+    // lo half then hi half, matching ggml Q4 ordering
+    ops.push(format!("pto.tinsert ins({}, %c0, %c0 : {}, index, index) outs({} : {})", lo, in_ty, dst, out_ty));
+    ctx.use_size(cols);
+    ops.push(format!("pto.tinsert ins({}, %c0, %c{} : {}, index, index) outs({} : {})", hi, cols, in_ty, dst, out_ty));
     Ok(())
 }
 

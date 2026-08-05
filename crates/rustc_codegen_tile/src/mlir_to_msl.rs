@@ -128,6 +128,7 @@ enum KernelType {
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
     AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
+    UnpackNibbles, // packed bytes -> 4-bit halves (lo half, then hi half)
     BroadcastRow, // dst[r][c] = src[r][0] — per-row value across columns
     Rope,        // rotary position embeddings
     RopeDsv4,    // DS4 partial-RoPE: copy n_nope prefix, rotate tail with YaRN
@@ -588,6 +589,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention  => 4,    // q, k, v, out
         KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
+        KernelType::UnpackNibbles => 2, // src (R x C bytes), dst (R x 2C f32)
         KernelType::BroadcastRow => 2, // src (R x 1), dst (R x C)
         KernelType::Rope       => 2,    // src, dst
         KernelType::RopeDsv4   => 4,    // src, pos(int), src2_freq(float, optional), dst
@@ -948,6 +950,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             else if (is_matvec_i8_v4 || is_matvec_i8_v4_batched) && i == 1 { "char" }
             else if (is_matvec_i8_v4 || is_matvec_i8_v4_batched) && i == 3 { "half" }
             else if is_matvec_q4k && i == 0 { "uchar" }
+            // nibble unpack reads PACKED BYTES and writes f32 halves
+            else if ctx.kernel_type == KernelType::UnpackNibbles && i == 0 { "uchar" }
             else if is_int_ids_p1 && i == 1 { "int" }
             else if is_int_ids_p0 && i == 0 { "int" }
             else if is_all_int_bufs { "int" }
@@ -1047,6 +1051,10 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& seq          [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& dim          [[ buffer({}) ]],", params_idx + 2).unwrap();
+        }
+        KernelType::UnpackNibbles => {
+            writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
+            writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
         KernelType::BroadcastRow => {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx).unwrap();
@@ -2234,7 +2242,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
                 KernelType::PartitionCell
             | KernelType::PartitionCellStore
     | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
-            | KernelType::BroadcastRow
+            | KernelType::BroadcastRow | KernelType::UnpackNibbles
         | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
@@ -2484,6 +2492,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Attention    => emit_attention_msl(out, msl_type),
         KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
+        KernelType::UnpackNibbles => emit_unpack_nibbles_msl(out, msl_type),
         KernelType::BroadcastRow => emit_broadcast_row_msl(out, msl_type),
         KernelType::Rope         => emit_rope_msl(out, msl_type),
         KernelType::RopeDsv4     => emit_rope_dsv4_msl(out),
@@ -2884,6 +2893,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_attention_f32"     => { ctx.kernel_type = KernelType::Attention; }
                 "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
+                "__tile_unpack_nibbles_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibbles; } }
                 "__tile_broadcast_row_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::BroadcastRow; } }
                 "__tile_rope_f32"          => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Rope; } }
                 "__tile_rope_dsv4_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::RopeDsv4; } }
@@ -3868,6 +3878,19 @@ fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
 /// Rope: rotary position embeddings.
 /// Buffers: p0=src (rows×cols), p1=dst (rows×cols).
 /// Params: rows, cols, pos.
+/// Split packed bytes into 4-bit halves: `R x C` bytes -> `R x 2C` f32.
+/// Low nibbles occupy columns `0..C`, high nibbles `C..2C` — ggml's Q4 order,
+/// where `qs[j]` carries element `j` and element `j + C`.
+fn emit_unpack_nibbles_msl(out: &mut String, msl_type: &str) {
+    writeln!(out, "    uint r = row;").unwrap();
+    writeln!(out, "    if (r >= rows) return;").unwrap();
+    writeln!(out, "    for (uint c = tid; c < cols; c += tcount) {{").unwrap();
+    writeln!(out, "        uint b = (uint)p0[r * cols + c];   // p0 is uchar").unwrap();
+    writeln!(out, "        p1[r * 2u * cols + c]        = ({})(b & 0x0Fu);", msl_type).unwrap();
+    writeln!(out, "        p1[r * 2u * cols + cols + c] = ({})(b >> 4);", msl_type).unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
 /// Broadcast a per-row value across columns: `dst[r][c] = src[r][0]`.
 ///
 /// The scale-application primitive quantised kernels need: a per-block scale
@@ -13415,6 +13438,33 @@ module {
         assert!(!msl.contains("k_end"), "plain attention must not emit a causal bound:\n{}", msl);
     }
 
+    /// Nibble unpack must read PACKED BYTES (uchar, not float — reading bytes
+    /// as float silently produced garbage until the buffer typing was fixed)
+    /// and emit ggml's Q4 order: low nibbles then high.
+    #[test]
+    fn test_msl_unpack_nibbles() {
+        let mlir = r#"
+module {
+  llvm.func @unpk(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(4 : i32) : i32
+    %c = llvm.mlir.constant(16 : i32) : i32
+    %s = llvm.call @__tile_load_i8(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %d = llvm.call @__tile_unpack_nibbles_f32(%s, %r, %c) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %d, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let msl = convert_mlir_to_msl(mlir).unwrap();
+        assert!(msl.contains("device const  uchar* p0"),
+            "input must be typed as bytes, not float:\n{}", msl);
+        assert!(msl.contains("p1[r * 2u * cols + c]        = (float)(b & 0x0Fu);"),
+            "low nibbles must land in the first half:\n{}", msl);
+        assert!(msl.contains("p1[r * 2u * cols + cols + c] = (float)(b >> 4);"),
+            "high nibbles must land in the second half:\n{}", msl);
+    }
+
     /// Broadcast-row is the scale-application primitive for quantised
     /// kernels: it must read ONE value per row and fan it across the columns.
     #[test]
@@ -15128,6 +15178,26 @@ module {
             alt.push_str(&base[end..]);
             std::fs::write(format!("{}/mmt_u{}.metal", dir, f), alt.replace("kernel void mmt(", &format!("kernel void mmt_u{}(", f))).unwrap();
         }
+    }
+
+    /// Dump nibble-unpack for device verification.
+    #[test]
+    fn dump_unpack_nibbles_msl() {
+        let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
+        let mlir = r#"
+module {
+  llvm.func @unpk(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(4 : i32) : i32
+    %c = llvm.mlir.constant(16 : i32) : i32
+    %s = llvm.call @__tile_load_i8(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %d = llvm.call @__tile_unpack_nibbles_f32(%s, %r, %c) : (i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %d, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        std::fs::write(format!("{}/unpk.metal", dir), convert_mlir_to_msl(mlir).unwrap()).unwrap();
     }
 
     /// Dump broadcast_row for device verification.
