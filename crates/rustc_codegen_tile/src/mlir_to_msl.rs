@@ -4087,8 +4087,17 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
 /// `RT + CT` values from the stage instead of `RT*CT`.
 pub const MUL_MM_TN: usize = 128;
 pub const MUL_MM_TM: usize = 32;
-pub const MUL_MM_RT: usize = 4;
-pub const MUL_MM_CT: usize = 2;
+pub const MUL_MM_RT: usize = 8;
+pub const MUL_MM_CT: usize = 4;
+
+/// K-blocks staged per synchronisation round.
+///
+/// The inner loop costs TWO barriers per staged round, so at one block per
+/// round that is 2*blocks_per_row barriers per threadgroup -- 896 for a
+/// K=14336 row. That count is invariant to every other knob here, which is
+/// exactly the invariance three separate sweeps kept reporting. Staging KC
+/// blocks per round divides it by KC, at KC times the threadgroup memory.
+pub const MUL_MM_KC: usize = 1;
 
 /// Fused Q8_0 mat-MAT over the repacked planes: a cooperative GEMM.
 ///
@@ -4102,11 +4111,11 @@ pub const MUL_MM_CT: usize = 2;
 /// inner product is plain f32 and each weight is unpacked once per tile rather
 /// than once per output element.
 fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
-    writeln!(out, "    const uint BLK = 32u;                  // weights per block").unwrap();
-    writeln!(out, "    const uint TN  = {}u;                  // output rows per threadgroup", MUL_MM_TN).unwrap();
-    writeln!(out, "    const uint TM  = {}u;                  // output cols per threadgroup", MUL_MM_TM).unwrap();
-    writeln!(out, "    const uint RT  = {}u;                  // rows per thread", MUL_MM_RT).unwrap();
-    writeln!(out, "    const uint CT  = {}u;                  // cols per thread", MUL_MM_CT).unwrap();
+    writeln!(out, "    constexpr uint BLK = 32u;                  // weights per block").unwrap();
+    writeln!(out, "    constexpr uint TN  = {}u;                  // output rows per threadgroup", MUL_MM_TN).unwrap();
+    writeln!(out, "    constexpr uint TM  = {}u;                  // output cols per threadgroup", MUL_MM_TM).unwrap();
+    writeln!(out, "    constexpr uint RT  = {}u;                  // rows per thread", MUL_MM_RT).unwrap();
+    writeln!(out, "    constexpr uint CT  = {}u;                  // cols per thread", MUL_MM_CT).unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint row_tiles = (n_rows + TN - 1u) / TN;").unwrap();
     writeln!(out, "    uint col_tiles = (n_cols + TM - 1u) / TM;").unwrap();
@@ -4122,7 +4131,7 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     // product has each thread read a DIFFERENT row at the same element -- a
     // 32-way conflict on every access, invariant to the tile size. One float of
     // padding stride-shifts each row into its own bank.
-    writeln!(out, "    const uint PAD = BLK + 1u;").unwrap();
+    writeln!(out, "    constexpr uint PAD = BLK + 1u;").unwrap();
     writeln!(out, "    threadgroup float tgW[TN][PAD];        // dequantized weights").unwrap();
     writeln!(out, "    threadgroup float tgX[TM][PAD];        // activations").unwrap();
     writeln!(out).unwrap();
@@ -4133,22 +4142,38 @@ fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
     writeln!(out, "    for (uint kb = 0u; kb < blocks_per_row; ++kb) {{").unwrap();
     // Both stages are strided by the whole threadgroup, so consecutive lanes
     // read consecutive elements of the same row -- coalesced on both operands.
-    writeln!(out, "        for (uint idx = tid; idx < TN * BLK; idx += tcount) {{").unwrap();
-    writeln!(out, "            uint r = idx / BLK, e = idx % BLK;").unwrap();
+    // Stage FOUR weights per lane, not one. p0 is a byte plane, so a lane that
+    // stages a single char makes a 32-lane simdgroup fetch 32 bytes where the
+    // memory system wants 128 -- ~25% efficiency, and invariant to every tile
+    // knob, which is why three sweeps over tile size, micro-tile and
+    // threadgroup-memory traffic all came back flat.
+    writeln!(out, "        constexpr uint WQ = BLK / 4u;              // char4 units per block row").unwrap();
+    writeln!(out, "        for (uint idx = tid; idx < TN * WQ; idx += tcount) {{").unwrap();
+    writeln!(out, "            uint r = idx / WQ, q = idx % WQ, e = q * 4u;").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n < n_rows) {{").unwrap();
     // The scale is per (row, block), not per element -- reading it inside this
     // loop fetches it BLK times per row.
     writeln!(out, "                float s = (float)p1[(ulong)n * blocks_per_row + kb];").unwrap();
-    writeln!(out, "                tgW[r][e] = (float)p0[(ulong)n * K + kb * BLK + e] * s;").unwrap();
+    writeln!(out, "                device const char4* w4 = (device const char4*)(p0 + (ulong)n * K + kb * BLK);").unwrap();
+    writeln!(out, "                float4 wv = float4(w4[q]) * s;").unwrap();
+    writeln!(out, "                tgW[r][e+0u] = wv.x; tgW[r][e+1u] = wv.y;").unwrap();
+    writeln!(out, "                tgW[r][e+2u] = wv.z; tgW[r][e+3u] = wv.w;").unwrap();
     writeln!(out, "            }} else {{").unwrap();
-    writeln!(out, "                tgW[r][e] = 0.0f;").unwrap();
+    writeln!(out, "                tgW[r][e+0u] = 0.0f; tgW[r][e+1u] = 0.0f;").unwrap();
+    writeln!(out, "                tgW[r][e+2u] = 0.0f; tgW[r][e+3u] = 0.0f;").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "        }}").unwrap();
-    writeln!(out, "        for (uint idx = tid; idx < TM * BLK; idx += tcount) {{").unwrap();
-    writeln!(out, "            uint c = idx / BLK, e = idx % BLK;").unwrap();
+    writeln!(out, "        for (uint idx = tid; idx < TM * WQ; idx += tcount) {{").unwrap();
+    writeln!(out, "            uint c = idx / WQ, q = idx % WQ, e = q * 4u;").unwrap();
     writeln!(out, "            uint m = m0 + c;").unwrap();
-    writeln!(out, "            tgX[c][e] = (m < n_cols) ? p2[(ulong)m * K + kb * BLK + e] : 0.0f;").unwrap();
+    writeln!(out, "            float4 xv = float4(0.0f);").unwrap();
+    writeln!(out, "            if (m < n_cols) {{").unwrap();
+    writeln!(out, "                device const float4* a4 = (device const float4*)(p2 + (ulong)m * K + kb * BLK);").unwrap();
+    writeln!(out, "                xv = a4[q];").unwrap();
+    writeln!(out, "            }}").unwrap();
+    writeln!(out, "            tgX[c][e+0u] = xv.x; tgX[c][e+1u] = xv.y;").unwrap();
+    writeln!(out, "            tgX[c][e+2u] = xv.z; tgX[c][e+3u] = xv.w;").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
     // RT + CT reads from the stage feed RT * CT multiply-adds. That ratio is
@@ -15935,7 +15960,7 @@ module {
         // on the same bank, and the inner product reads a different row per
         // thread -- a 32-way conflict invariant to the tile size. Measured 2.5x
         // at n=8 purely from this one word.
-        assert!(msl.contains("const uint PAD = BLK + 1u;"),
+        assert!(msl.contains("uint PAD = BLK + 1u;"),
             "the stage must be padded against bank conflicts:\n{}", msl);
 
         // TWO barriers per K-block. With only the first, a fast thread can
@@ -15945,8 +15970,12 @@ module {
             "one barrier after staging and one after consuming:\n{}", msl);
 
         // Weights are dequantized once on the way in, not per output element.
-        assert!(msl.contains("tgW[r][e] = (float)p0["),
-            "weights must be dequantized into the stage:\n{}", msl);
+        assert!(msl.contains("float4 wv = float4(w4[q]) * s;"),
+            "weights must be dequantized into the stage, four at a time:\n{}", msl);
+        // One byte per lane makes a simdgroup fetch 32 B where the memory
+        // system wants 128 -- and it is invariant to every tile knob.
+        assert!(msl.contains("device const char4* w4"),
+            "weight staging must be at least 4 bytes per lane:\n{}", msl);
         assert!(msl.contains("acc[i][j] += wf[i] * xf[j];"),
             "the inner product must read the stage, not memory:\n{}", msl);
         // RT + CT stage reads feed RT * CT multiply-adds. One output per thread
