@@ -1194,6 +1194,29 @@ impl PtoContext {
         self.tiles.insert(ssa.to_string(), t);
     }
 
+    /// Run `f` with the row base scaled for an operand of `rows` per head.
+    ///
+    /// The loop publishes `%h_i`; this emits `%h_i * rows` and installs it as
+    /// the base for the duration, so operands with different heights land on
+    /// their own slices.
+    fn with_head_rows<T>(
+        &mut self,
+        rows: u32,
+        f: impl FnOnce(&mut Self, &mut Vec<String>) -> T,
+        ops: &mut Vec<String>,
+    ) -> T {
+        let prev = self.pv_row_base.clone();
+        let b = self.fresh_ssa();
+        self.use_size(rows);
+        ops.push(format!(
+            "  {b} = arith.muli %h_i, %c{rows} : index   // operand head base"
+        ));
+        self.pv_row_base = Some(b);
+        let out = f(self, ops);
+        self.pv_row_base = prev;
+        out
+    }
+
     fn in_batched_loop(&self) -> bool {
         self.pv_row_base.is_some()
     }
@@ -2784,8 +2807,24 @@ fn emit_batched_loop(
     ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
     ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
     ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
+    // KNOWN BUG: one row base is applied to EVERY operand.
+    //
+    // That is only correct when all operands have the same rows-per-head. For
+    // scores = Q @ K^T they do not: Q is [S, D] with S rows per head, while the
+    // pre-transposed K is [D, S] with D rows. At the benchmarked shape S=32 and
+    // D=64, so K is read at half the offset it should be and every head after
+    // the first reads the wrong slice.
+    //
+    // The per-head parity check did not catch this because it exercises the
+    // batched SOFTMAX, whose single operand and output share a shape. The
+    // end-to-end check against model.py did: MERE 2.6e-01 against a 1.221e-4
+    // bar, where the per-head path gives 2.26e-06.
+    //
+    // The fix is a base per operand rather than one shared base, which means
+    // load_deferred_for_head needs to know each operand's rows-per-head instead
+    // of inheriting the loop's. Left explicit rather than papered over.
     ops.push(format!(
-        "  {base} = arith.muli %h_i, %c{} : index   // head row base",
+        "  {base} = arith.muli %h_i, %c{} : index   // head row base (SHARED — see note)",
         p.m
     ));
     ops.extend(inner_body);
@@ -2826,12 +2865,19 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
     // Materialise this head's operands, then fall through to the unblocked
     // path below — the same emission the validated per-head kernels use.
     let (ta, tb) = if ctx.in_batched_loop() {
-        (
-            ctx.load_deferred_for_head(&ta, m, k, ops)
-                .ok_or_else(|| format!("matmul_batched: operand {a_ssa} not deferred"))?,
-            ctx.load_deferred_for_head(&tb, k, n, ops)
-                .ok_or_else(|| format!("matmul_batched: operand {b_ssa} not deferred"))?,
-        )
+        // Each operand advances by ITS OWN rows-per-head, not a shared base.
+        // For scores = Q @ K^T the operands differ: Q is [S,D] with S rows per
+        // head, the pre-transposed K is [D,S] with D. A single base read K at
+        // the wrong offset for every head after the first — caught by the
+        // end-to-end check against model.py (MERE 2.6e-01), not by per-head
+        // parity, whose softmax has one operand shaped like its output.
+        let a_t = ctx
+            .with_head_rows(m, |c, o| c.load_deferred_for_head(&ta, m, k, o), ops)
+            .ok_or_else(|| format!("matmul_batched: operand {a_ssa} not deferred"))?;
+        let b_t = ctx
+            .with_head_rows(k, |c, o| c.load_deferred_for_head(&tb, k, n, o), ops)
+            .ok_or_else(|| format!("matmul_batched: operand {b_ssa} not deferred"))?;
+        (a_t, b_t)
     } else {
         (ta, tb)
     };
