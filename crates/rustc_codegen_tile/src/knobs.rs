@@ -478,8 +478,21 @@ pub const KNOBS: &[Knob] = &[
 /// objective: a wrong kernel is not a trade-off against a fast one, and every
 /// measurement in this workstream that looked like a win without a correctness
 /// gate turned out to be computing less work.
+/// Minimum measurement protocol for any objective below. This is not advice:
+/// a single-shot run of the SAME configuration on this box spread 10.66..14.40
+/// us (1.35x) at 2048x2048 q4_0, which is larger than the gap between most
+/// configurations a search will compare. A joint rows-per-threadgroup x width
+/// sweep run at one shot per cell produced neighbouring cells differing by 60%
+/// with no monotone structure, and its "best" was noise. At 20 iterations x 5
+/// repeats taking medians, the same measurements land within 3%.
+///
+/// So: >= 20 iterations per run, >= 5 repeated runs, compare MEDIANS, and
+/// discard the first run of a series -- it is consistently fast (cold GPU).
+pub const MEASUREMENT_PROTOCOL: (&str, u32, u32) = ("median-of-repeats", 20, 5);
+
 pub const OBJECTIVES: &[(&str, &str)] = &[
-    ("us_per_op", "minimise; per-shape, launch amortised over many ops per graph"),
+    ("us_per_op", "minimise; per-shape, launch amortised over many ops per graph, \
+                   median of >=5 repeats at >=20 iters -- see MEASUREMENT_PROTOCOL"),
     ("threadgroup_bytes", "minimise; frees budget for larger tiles"),
     ("e2e_tokens_per_sec", "maximise; must come from a model large enough to be bandwidth-bound"),
 ];
@@ -524,7 +537,10 @@ pub fn knobs_json() -> String {
             if i + 1 == CONSTRAINTS.len() { "" } else { "," }
         ));
     }
-    s.push_str("  ],\n  \"objectives\": [\n");
+    s.push_str(&format!(
+        "  ],\n  \"measurement_protocol\": {{\"kind\": \"{}\", \"min_iters\": {}, \"min_repeats\": {}, \
+         \"compare\": \"median\", \"drop_first_run\": true}},\n  \"objectives\": [\n",
+        MEASUREMENT_PROTOCOL.0, MEASUREMENT_PROTOCOL.1, MEASUREMENT_PROTOCOL.2));
     for (i, (n, d)) in OBJECTIVES.iter().enumerate() {
         s.push_str(&format!(
             "    {{\"name\": \"{}\", \"sense\": \"{}\"}}{}\n",
@@ -607,6 +623,16 @@ mod tests {
             }
             assert!(!k.kernels.is_empty(), "knob {} affects no kernel", k.name);
         }
+    }
+
+    /// A search that samples one point per configuration on this hardware is
+    /// sampling noise. Encoded so the protocol travels with the registry.
+    #[test]
+    fn test_measurement_protocol_is_declared() {
+        let (kind, iters, repeats) = MEASUREMENT_PROTOCOL;
+        assert_eq!(kind, "median-of-repeats");
+        assert!(iters >= 20, "single-shot runs spread 1.35x on this box");
+        assert!(repeats >= 5, "one run per configuration cannot rank configurations");
     }
 
     #[test]
