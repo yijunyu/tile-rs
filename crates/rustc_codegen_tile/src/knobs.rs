@@ -158,10 +158,17 @@ pub const CONSTRAINTS: &[Constraint] = &[
     Constraint {
         id: "mm_register_cliff",
         kind: "cliff",
-        expr: "tm / (8 * sgm) <= 16",
-        why: "MEASURED, and it is a cliff not a slope: MI=16 runs 4723 us, MI=20 \
-              runs 44013, MI=24 runs 289697. A coarse sweep reads one step past \
-              the ceiling as 'broken' rather than 'too big'.",
+        expr: "UNMODELLED -- see why; do not prune on this",
+        why: "There IS a cliff -- at TN=128 TM=160.. SGM=1 SGN=16, MI=16/20/24 \
+              runs 4723/44013/289697 us -- but 'accumulator count exceeds the \
+              register file' is NOT the mechanism, and a search must not prune \
+              on it. A GA found TN=128 TM=128 SGM=1 SGN=1, which is MI=16 AND \
+              NI=16, i.e. 256 accumulators against that config's 20, and it is \
+              the fastest point known: 0.99x of ggml at 896x4864 where the \
+              hand-tuned tile was 1.68x. Twelve times the accumulators, no \
+              cliff. The real mechanism is unidentified. Listed so the cliff is \
+              not forgotten, with an expression a search cannot use to exclude \
+              anything.",
     },
     Constraint {
         id: "pto_nb_dominates_kb",
@@ -289,8 +296,10 @@ pub const KNOBS: &[Knob] = &[
         kernels: &["mulmm_q8_0_interleaved", "mulmm_q8_0_fused"],
         domain: Domain::Ints(&[32, 64, 96, 128, 192, 256]),
         current: MM_TILE_LARGE.tm as u32,
-        constraints: &["mm_tile_closes", "mm_threadgroup_memory", "mm_register_cliff"],
-        note: "Activation columns per threadgroup.",
+        constraints: &["mm_tile_closes", "mm_threadgroup_memory"],
+        note: "Activation columns per threadgroup. Do NOT prune against the \
+               register-cliff heuristic: the best known point has 256 live \
+               accumulators.",
     },
     Knob {
         name: "MM_TILE_LARGE.kc",
@@ -602,7 +611,8 @@ mod tests {
             let staged = (t.kc * 32 * (t.tn + 1) + t.tm * t.kc * 33) * 2;
             let scratch = t.sgm * t.sgn * 64 * 4;
             assert!(staged + scratch <= 32768, "mm_threadgroup_memory for {:?}", t.name);
-            assert!(t.tm / (8 * t.sgm) <= 16, "mm_register_cliff for {:?}", t.name);
+            // No register-cliff assertion: the shipped tile has MI=16 NI=16,
+            // 256 accumulators, and is the fastest point measured.
         }
         assert_eq!(32 % MUL_MV_ILV_QUANTS_PER_LANE, 0);
         assert_eq!(16 % MUL_MV_ILV_Q4_BYTES_PER_LANE, 0);

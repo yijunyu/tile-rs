@@ -4132,10 +4132,10 @@ pub struct MmTile {
 }
 
 /// For wide outputs -- the FFN and the vocabulary projection.
-pub const MM_TILE_LARGE: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn: 16, name: "" };
+pub const MM_TILE_LARGE: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn: 1, name: "" };
 /// For narrow outputs -- attention and KV projections, where a 128-wide row
 /// tile is mostly waste.
-pub const MM_TILE_SMALL: MmTile = MmTile { tn: 64, tm: 32, kc: 1, sgm: 1, sgn: 8, name: "_small" };
+pub const MM_TILE_SMALL: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn: 1, name: "_small" };
 
 /// The simdgroup grid, SGM along activation columns x SGN along weight rows.
 /// This is what sets the register tile: a simdgroup loads MI `a` tiles and NI
