@@ -8651,22 +8651,28 @@ module {{
 
         // Attention exercises the whole-tile pipeline (tmatmul -> softmax_5ops
         // -> tmatmul) that the causal-rejection change sits next to.
-        let attn = r#"
-module {
-  llvm.func @tile_attn(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+        // Shape parameterized so a realistic attention can be attempted, not
+        // just the 16x16 smoke tile.
+        let (ds, dd) = (dim("PTO_DUMP_S", 16), dim("PTO_DUMP_D", 16));
+        let attn = format!(r#"
+module {{
+  llvm.func @tile_attn(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {{hacc.entry}} {{
     ^bb0:
-    %s = llvm.mlir.constant(16 : i32) : i32
-    %d = llvm.mlir.constant(16 : i32) : i32
+    %s = llvm.mlir.constant({ds} : i32) : i32
+    %d = llvm.mlir.constant({dd} : i32) : i32
     %q = llvm.call @__tile_load_f32(%arg0, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
     %k = llvm.call @__tile_load_f32(%arg1, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
     %v = llvm.call @__tile_load_f32(%arg2, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
     %r = llvm.call @__tile_attention_f32(%q, %q, %k, %v, %s, %d) : (i32, i32, i32, i32, i32, i32) -> i32
     llvm.call @__tile_store_f32(%arg3, %r, %s, %d) : (!llvm.ptr<1>, i32, i32, i32) -> ()
     llvm.return
-  }
-}
-"#;
-        std::fs::write(format!("{}/attention.pto", dir), convert_mlir_to_pto(attn).unwrap()).unwrap();
+  }}
+}}
+"#);
+        match convert_mlir_to_pto(&attn) {
+            Ok(v) => std::fs::write(format!("{}/attention.pto", dir), v).unwrap(),
+            Err(e) => std::fs::write(format!("{}/attention.REJECTED", dir), e).unwrap(),
+        }
 
         // a2a3-safe attention: same shape, plus a GM scratch pointer.
         let attn_s = r#"

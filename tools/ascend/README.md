@@ -126,3 +126,32 @@ regime the kernel no longer runs in and need re-sweeping.
   relative error explodes there -- it flagged correct f32 results as wrong at
   one shape and not another purely from where the cancellation fell. Compare
   against the magnitude of the problem: `max|c-ref| / max|ref|`.
+
+
+## Block-parallelism audit of the generated PTO kernels
+
+After the single-block launch was found, every generated kernel was checked for
+whether it can use more than one AI core.
+
+| kernel | loops | block-parallel | realistic shapes |
+|---|---|---|---|
+| matmul | K and N | yes (`get_block_idx`) | yes |
+| attention | none | no | **no -- UB-rejected past 16x16** |
+
+`emit_blocked_matmul_loops` is the only emitter that emits `get_block_idx`. The
+attention path is fully unrolled straight-line code for one 16x16 tile, so at
+that size one core genuinely is all the work -- but it does not scale:
+
+    S=16  D=16   generated, 0 loops, not block-parallel
+    S=128 D=128  REJECTED: tile of 65536B at offset 262144B would use 327680B
+                 > UB_SIZE 262144B
+    S=512 D=128  REJECTED: 524288B > UB_SIZE 262144B
+
+So attention is a single-tile proof of concept, not a usable kernel. Making it
+one is a different job from the matmul fix: the matmul was already blocked and
+already parallel and merely launched wrong, whereas attention needs tiling over
+the sequence axis with an online softmax so the working set fits UB at all --
+and only then does block parallelism become expressible.
+
+The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
+`attention.REJECTED` instead of panicking, so the UB boundary can be probed.
