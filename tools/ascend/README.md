@@ -257,6 +257,25 @@ The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
 `attention.REJECTED` instead of panicking, so the UB boundary can be probed.
 
 
+### State of the attention run
+
+`-lm` is CONFIRMED: both `asr16` and `asr64` build with zero errors, so the link
+failure is fully resolved and the kernel is type-correct and linkable at 16x16
+and 64x64.
+
+The RUN is not yet verified. A direct run returned `ACL error 507014` in
+`aclrtSynchronizeStream`, but that was taken while all eight devices were held by
+another job, so it is unattributable -- it may be a real kernel fault or may be
+contention. Re-submitting properly through `task-submit --device 0` then timed
+out twice at 300 s without being allocated a device at all.
+
+To finish: resubmit when the queue drains, e.g.
+
+    task-submit --device 0 --timeout 1800 --run "... ./asr16 20"
+
+and if `507014` reproduces on an idle, properly locked device, it is a genuine
+kernel fault worth chasing; if it does not, the attention path runs.
+
 ## Shared-box etiquette on 910c
 
 `/usr/local/bin/task-submit` is a root job queue -- `--device N` locks an NPU for
