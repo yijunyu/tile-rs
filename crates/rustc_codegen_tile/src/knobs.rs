@@ -25,6 +25,7 @@
 //! validity ranges and divisibility preconditions.
 
 use crate::mlir_to_msl::{
+    MM_TILE_PLANAR,
     MM_TILE_LARGE, MM_TILE_SMALL, MUL_MV_ILV_Q4_BYTES_PER_LANE, MUL_MV_ILV_QUANTS_PER_LANE,
     MUL_MV_ILV_ROWS_PER_TG, MUL_MV_Q4_ROWS_PER_TG, MUL_MV_Q4_VECS_PER_LANE, MUL_MV_ROWS_PER_TG,
     MUL_MV_VECS_PER_LANE,
@@ -654,7 +655,7 @@ mod tests {
     /// and both are worth failing over.
     #[test]
     fn test_current_values_satisfy_their_constraints() {
-        for t in [MM_TILE_LARGE, MM_TILE_SMALL] {
+        for t in [MM_TILE_LARGE, MM_TILE_SMALL, MM_TILE_PLANAR] {
             assert_eq!(t.tm % (8 * t.sgm), 0, "mm_tile_closes (tm) for {:?}", t.name);
             assert_eq!(t.tn % (8 * t.sgn), 0, "mm_tile_closes (tn) for {:?}", t.name);
             assert!(t.sgm * t.sgn * 32 <= 1024, "mm_thread_limit for {:?}", t.name);

@@ -4137,6 +4137,16 @@ pub const MM_TILE_LARGE: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn:
 /// tile is mostly waste.
 pub const MM_TILE_SMALL: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn: 1, name: "_small" };
 
+/// The PLANAR GEMM keeps the older tile. At MM_TILE_LARGE's 32 threads with
+/// MI=NI=16 it does not compile -- "Compute function exceeds available stack
+/// space" -- and since the planar kernel is the separate-backend path, that
+/// failure takes the whole backend's initialisation with it rather than
+/// degrading one op. The interleaved kernel compiles fine at the same tile in
+/// ggml-metal, so this is a property of the two kernels' register use, not of
+/// the tile alone. Same tile, two kernels, one compiles: worth remembering
+/// before assuming a tile is portable across variants.
+pub const MM_TILE_PLANAR: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn: 16, name: "" };
+
 /// The simdgroup grid, SGM along activation columns x SGN along weight rows.
 /// This is what sets the register tile: a simdgroup loads MI `a` tiles and NI
 /// `b` tiles to produce MI*NI products, so a SQUARE grid does the fewest loads
@@ -4154,7 +4164,7 @@ pub const MM_TILE_SMALL: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn:
 /// inner product is plain f32 and each weight is unpacked once per tile rather
 /// than once per output element.
 fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
-    emit_mul_mm_q8_0_msl(out, false, MM_TILE_LARGE)
+    emit_mul_mm_q8_0_msl(out, false, MM_TILE_PLANAR)
 }
 
 /// The same GEMM over ggml's NATIVE INTERLEAVED blocks. Only the weight STAGING
@@ -16111,6 +16121,15 @@ module {
             h.push_str("};\n\n");
         }
 
+        // The GEMM tile, so the tilers backend derives its grid from the same
+        // constants the kernel was emitted with. It used to restate them, and
+        // when the emitter tile changed to 32 threads the backend kept
+        // dispatching 512 -- wrong grid, 16/18 correctness.
+        h.push_str(&format!(
+            "#define TILERS_MM_TN      {}\n#define TILERS_MM_TM      {}\n\
+             #define TILERS_MM_THREADS {}\n#define TILERS_MV_ROWS_PER_TG {}\n\n",
+            MM_TILE_PLANAR.tn, MM_TILE_PLANAR.tm,
+            MM_TILE_PLANAR.sgm * MM_TILE_PLANAR.sgn * 32, MUL_MV_ILV_ROWS_PER_TG));
         h.push_str(&format!("#define TILERS_MAX_STEPS {}\n\n", max_steps));
         h.push_str("static const tilers_chain tilers_chains[] = {\n");
         for tag in &fused_names {
@@ -16260,15 +16279,18 @@ module {
             assert!(ilv.contains(line) && planar.contains(line),
                 "both layouts must share the contraction, missing {:?}", line);
         }
-        // The tile constants must AGREE, not equal any particular value --
-        // pinning them here made every sweep of the tile fail to generate,
-        // which reads as "the config is invalid" rather than "the test is".
+        // The two no longer share a TILE -- the planar kernel does not compile
+        // at the interleaved one's 32-thread, MI=NI=16 point ("Compute function
+        // exceeds available stack space"), so it keeps MM_TILE_PLANAR. What
+        // must still be shared is the CONTRACTION and the staging scheme; the
+        // tile is a parameter of it.
         for key in ["constexpr uint TN  =", "constexpr uint TM  =",
                     "constexpr uint SGM =", "constexpr uint SGN ="] {
-            let pick = |m: &str| m[m.find(key).expect(key)..].lines().next().unwrap().to_string();
-            assert_eq!(pick(&ilv), pick(&planar),
-                "both layouts must share the tile, differing at {:?}", key);
+            assert!(ilv.contains(key) && planar.contains(key),
+                "both layouts must be parameterized by {:?}", key);
         }
+        assert!(planar.contains("threadgroup half tgW[KBLK * NBLK * 64u];"),
+            "both layouts must use block-tiled staging:\n{}", planar);
 
         if let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") {
             std::fs::write(format!("{}/mulmm_q8_0_interleaved.metal", dir), &ilv).unwrap();
