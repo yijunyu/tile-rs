@@ -162,10 +162,36 @@ At 64x64 the REAL data is Q+K+V = 48 KB plus a 16 KB score matrix. It fits four
 times over. Both attention paths -- plain and the GM-scratch variant -- fail
 identically, which is the giveaway that this is allocation, not dataflow.
 
-So the first fix is tile liveness/reuse in the emitter, which would benefit
-every kernel rather than just this one. Sequence-axis tiling with an online
-softmax is still needed eventually for long sequences, but it is not what stands
-between here and a working 64x64 or 128x128 attention.
+Two things were wrong here, and a third is the real blocker.
+
+**Wrong 1 -- the budget billed every tile to UB.** `vec` lives in UB, but `mat`
+is L1, `left`/`right` are L0A/L0B and `acc` is L0C: separate physical buffers.
+Charging them all to a 256 KB UB refused a 64x64 attention that uses 130 KB of
+UB. `place_in` now bills each tile to the memory its `loc=` names, and 64x64
+generates.
+
+**Wrong 2 -- nothing is ever freed.** `UbAllocator::free()` is dead code, so a
+16x16 attention's 20 `alloc_tile` ops all stay live. That is not what blocked
+64x64, but it IS what blocks 128x128: eight `vec` tiles at 64 KB each is 512 KB
+against a 256 KB UB. There is now a scratch pool (`acquire_scratch` /
+`release_scratch`) wired into the softmax decomposition; it is inert for a
+kernel containing a single softmax and will matter when the attention path
+reuses its own temporaries.
+
+**The real blocker: the attention kernel has never compiled.** `ptoas` accepts
+it, then `ccec` rejects it at ANY shape, including the 16x16 that has always
+"generated":
+
+    TMov.hpp:160: static assertion failed ... TMov: Invalid TileType
+
+It emits an Acc -> Vec `tmov`, which is not a legal move on a2a3. Verified
+against the pre-change HEAD, so this is long-standing and independent of the
+budget work. **The dump test only ever checked that .pto TEXT is produced --
+nothing compiled it.** The matmul path is unaffected and still correct on device
+(57.00 us at 16x2048x11008, MATCHES-CPU).
+
+So the ordering is: fix the Acc->Vec move first; the budget and reuse work above
+is necessary but was never sufficient.
 
 The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
 `attention.REJECTED` instead of panicking, so the UB boundary can be probed.

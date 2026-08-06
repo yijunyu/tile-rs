@@ -543,6 +543,28 @@ fn validate_tile_shape<A: AscendArch>(logical_rows: u32, logical_cols: u32, dtyp
 /// Linear UB budget (C1 + C5): bump-allocates bank-aligned tile offsets and
 /// rejects allocations that would exceed UB_SIZE. This is the space analogue of
 /// the Pnd/Rdy typestate — allocation consumes budget, `free` returns it.
+/// On-chip memory a tile lives in, taken from its `loc=` in the tile_buf type.
+/// These are SEPARATE physical buffers -- charging them all against UB_SIZE
+/// rejected kernels that fit comfortably: a 64x64 attention uses 130 KB of UB
+/// against a 256 KB budget, and was refused because another 160 KB of L1/L0
+/// tiles had been billed to the same account.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum TileMem { Ub, L1, L0a, L0b, L0c }
+
+impl TileMem {
+    fn of(tb_ty: &str) -> TileMem {
+        if tb_ty.contains("loc=mat") { TileMem::L1 }
+        else if tb_ty.contains("loc=left") { TileMem::L0a }
+        else if tb_ty.contains("loc=right") { TileMem::L0b }
+        else if tb_ty.contains("loc=acc") { TileMem::L0c }
+        else { TileMem::Ub }
+    }
+    fn name(self) -> &'static str {
+        match self { TileMem::Ub=>"UB", TileMem::L1=>"L1", TileMem::L0a=>"L0A",
+                     TileMem::L0b=>"L0B", TileMem::L0c=>"L0C" }
+    }
+}
+
 struct UbAllocator {
     cursor: usize,
     ub_size: usize,
@@ -550,12 +572,50 @@ struct UbAllocator {
     arch: &'static str,
     /// Peak live bytes (for diagnostics / a future budget report).
     peak: usize,
+    /// Per-memory cursors and peaks for everything that is NOT UB.
+    other: std::collections::HashMap<TileMem, (usize, usize)>,
 }
 
 impl UbAllocator {
     fn new<A: AscendArch>() -> Self {
-        UbAllocator { cursor: 0, ub_size: A::UB_SIZE, fractal: A::FRACTAL_BYTES, arch: A::NAME, peak: 0 }
+        UbAllocator { cursor: 0, ub_size: A::UB_SIZE, fractal: A::FRACTAL_BYTES, arch: A::NAME,
+                      peak: 0, other: std::collections::HashMap::new() }
     }
+    /// Capacity of each on-chip buffer. Only UB_SIZE was previously modelled;
+    /// the rest are the published sizes for this class of part and the guard
+    /// stays conservative, so a kernel that passes here is not thereby asserted
+    /// to fit -- it is asserted only that it is not obviously too large.
+    fn capacity(&self, m: TileMem) -> usize {
+        match m {
+            TileMem::Ub  => self.ub_size,
+            TileMem::L1  => 1024 * 1024,
+            TileMem::L0a => 64 * 1024,
+            TileMem::L0b => 64 * 1024,
+            TileMem::L0c => 128 * 1024,
+        }
+    }
+
+    /// Place a tile in the memory its `loc=` names, rather than billing every
+    /// tile to UB.
+    fn place_in(&mut self, m: TileMem, bytes: usize) -> Result<u64, String> {
+        if m == TileMem::Ub {
+            return self.place(bytes);
+        }
+        let cap = self.capacity(m);
+        let e = self.other.entry(m).or_insert((0, 0));
+        let base = (e.0 + self.fractal - 1) / self.fractal * self.fractal;
+        let end = base + bytes;
+        if end > cap {
+            return Err(format!(
+                "NPU {} budget (arch {}): tile of {}B at offset {}B would use {}B > {}B; \
+                 the live tile working set exceeds this on-chip buffer",
+                m.name(), self.arch, bytes, base, end, cap));
+        }
+        e.0 = end;
+        if end > e.1 { e.1 = end; }
+        Ok(base as u64)
+    }
+
     /// Place a tile of `bytes`: bank-align the base, error if it overflows UB.
     /// Returns the (in-bounds, aligned) UB byte offset.
     fn place(&mut self, bytes: usize) -> Result<u64, String> {
@@ -582,6 +642,13 @@ struct PtoContext {
     next_ssa: u32,
     /// NPU tile UB budget allocator (C1 capacity + C5 bank-align).
     ub: UbAllocator,
+    /// Free scratch tiles, keyed by their exact tile_buf type, available for
+    /// reuse. The UB allocator only ever bumped, so every temporary stayed live
+    /// for the whole kernel: a 16x16 attention emitted 20 alloc_tile ops and 0
+    /// frees, which is 19 KB at 16x16 but 305 KB at 64x64 against a 256 KB
+    /// Unified Buffer. Reuse is keyed on the FULL type so a tile is only ever
+    /// handed back for an identical shape, layout and dtype.
+    scratch_pool: HashMap<String, Vec<String>>,
     /// First NPU tile-bound violation seen during analyze_body (C2-C5).
     tile_error: Option<String>,
     /// Map from GM pointer arg name → (tensor_view_ssa, rows, cols, dtype)
@@ -775,6 +842,7 @@ impl PtoContext {
             tiles: HashMap::new(),
             next_ssa: 0,
             ub: UbAllocator::new::<A2A3>(),
+            scratch_pool: HashMap::new(),
             tile_error: None,
             tv_map: HashMap::new(),
             sizes_used: Vec::new(),
@@ -1039,7 +1107,8 @@ impl PtoContext {
         if self.tile_error.is_none() {
             if let Err(e) = validate_tile_shape::<A2A3>(rows, cols, dtype, tb_ty) {
                 self.tile_error = Some(e);
-            } else if let Err(e) = self.ub.place(rows as usize * cols as usize * dtype_bytes_pto(dtype)) {
+            } else if let Err(e) = self.ub.place_in(
+                TileMem::of(tb_ty), rows as usize * cols as usize * dtype_bytes_pto(dtype)) {
                 self.tile_error = Some(e);
             }
         }
@@ -1059,6 +1128,48 @@ impl PtoContext {
             },
         );
         ssa
+    }
+
+    /// Acquire a SCRATCH tile: reuse a released one of the identical type if
+    /// there is one, otherwise allocate. Reused tiles emit no `alloc_tile` and
+    /// charge no budget, which is the point -- ptoas allocates what we emit, so
+    /// budget bookkeeping alone would not have reduced anything.
+    fn acquire_scratch(
+        &mut self,
+        mlir_ssa: &str,
+        rows: u32,
+        cols: u32,
+        dtype: &str,
+        tb_ty: &str,
+        ops: &mut Vec<String>,
+    ) -> String {
+        if let Some(free) = self.scratch_pool.get_mut(tb_ty).and_then(|v| v.pop()) {
+            self.tiles.insert(
+                mlir_ssa.to_string(),
+                TileInfo {
+                    ssa: free.clone(),
+                    rows,
+                    cols,
+                    dtype: dtype.to_string(),
+                    tb_type: tb_ty.to_string(),
+                    pv_ssa: None,
+                    gm_name: None,
+                    deferred: None,
+                },
+            );
+            return free;
+        }
+        self.alloc_tile_typed(mlir_ssa, rows, cols, dtype, tb_ty, ops)
+    }
+
+    /// Return a scratch tile to the pool. The caller asserts it is dead -- this
+    /// is emitter-local knowledge, not a liveness analysis, so it is only used
+    /// where a temporary's last read is in the same translation unit.
+    fn release_scratch(&mut self, mlir_ssa: &str) {
+        if let Some(t) = self.tiles.get(mlir_ssa) {
+            let (ty, ssa) = (t.tb_type.clone(), t.ssa.clone());
+            self.scratch_pool.entry(ty).or_default().push(ssa);
+        }
     }
 
     fn get_tile(&self, mlir_ssa: &str) -> Option<&TileInfo> {
@@ -2612,10 +2723,14 @@ fn translate_softmax(
 
     // t_max and t_sum are row-reduction outputs: rows×1, col_major
     let rr_ty = tile_buf_type_rowreduce(rows, dtype);
+    // These five are internal to the decomposition and dead at its end, so they
+    // come from the scratch pool: a second softmax in the same kernel reuses
+    // them instead of bumping the UB cursor again.
     let t_max_ssa = ctx.alloc_tile_rowreduce(&t_max_key, rows, dtype, ops);
-    let t_tmp_ssa = ctx.alloc_tile(&t_tmp_key, rows, cols, dtype, ops);
-    let t_sub_ssa = ctx.alloc_tile(&t_sub_key, rows, cols, dtype, ops);
-    let t_exp_ssa = ctx.alloc_tile(&t_exp_key, rows, cols, dtype, ops);
+    let vec_ty = tile_buf_type(rows, cols, dtype);
+    let t_tmp_ssa = ctx.acquire_scratch(&t_tmp_key, rows, cols, dtype, &vec_ty, ops);
+    let t_sub_ssa = ctx.acquire_scratch(&t_sub_key, rows, cols, dtype, &vec_ty, ops);
+    let t_exp_ssa = ctx.acquire_scratch(&t_exp_key, rows, cols, dtype, &vec_ty, ops);
     let t_sum_ssa = ctx.alloc_tile_rowreduce(&t_sum_key, rows, dtype, ops);
     // Step 5 destination mapped to result_ssa
     let t_out_ssa = ctx.alloc_tile(&result_ssa, rows, cols, dtype, ops);
@@ -2653,6 +2768,13 @@ fn translate_softmax(
         "pto.trowexpanddiv ins({}, {} : {}, {}) outs({} : {})",
         t_exp_ssa, t_sum_ssa, tb_ty, rr_ty, t_out_ssa, tb_ty
     ));
+
+    // Last read of the temporaries has been emitted; hand them back so a later
+    // softmax (or any same-shaped scratch) reuses them instead of bumping the
+    // UB cursor again.
+    ctx.release_scratch(&t_tmp_key);
+    ctx.release_scratch(&t_sub_key);
+    ctx.release_scratch(&t_exp_key);
 
     Ok(())
 }
