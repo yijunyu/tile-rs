@@ -2155,6 +2155,20 @@ module {
 }
 "#;
 
+/// Q4_0 mul_mv over ggml's NATIVE interleaved blocks. Three buffers.
+pub const MATVEC_Q4_0_INTERLEAVED_MLIR: &str = r#"
+module {
+  llvm.func @mulmv_q4_0_interleaved(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %nrows = llvm.mlir.constant(4096 : i32) : i32
+    %bpr = llvm.mlir.constant(448 : i32) : i32
+    %ncols = llvm.mlir.constant(1 : i32) : i32
+    llvm.call @__tile_mul_mv_q4_0_interleaved_f32(%arg0, %arg1, %arg2, %nrows, %bpr, %ncols) : (!llvm.ptr<1>, !llvm.ptr<1>, !llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+
 /// The FUSED Q4_0 mul_mv. One compute intrinsic, like its Q8_0 sibling.
 pub const MATVEC_Q4_0_FUSED_MLIR: &str = r#"
 module {

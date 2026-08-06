@@ -2052,6 +2052,14 @@ pub fn __tile_mul_mv_q8_0_interleaved_f32(
 }
 
 
+/// Q4_0 mat-vec over ggml's NATIVE block_q4_0 ({half d; uint8 qs[16]}).
+#[unsafe(no_mangle)]
+pub fn __tile_mul_mv_q4_0_interleaved_f32(
+    _w: *const u8, _x: *const f32, _out: *mut f32,
+    _n_rows: i32, _blocks_per_row: i32, _n_cols: i32,
+) {
+}
+
 /// The Q8_0 mat-MAT over ggml's NATIVE INTERLEAVED blocks. Three buffers.
 #[unsafe(no_mangle)]
 pub fn __tile_mul_mm_q8_0_interleaved_f32(
