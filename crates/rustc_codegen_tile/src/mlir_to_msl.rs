@@ -4399,10 +4399,24 @@ fn emit_mul_mv_q4_0_interleaved_msl(out: &mut String) {
     writeln!(out, "        uint o = (u % UPB) * BPL;          // byte offset inside it").unwrap();
     // The two activation spans a byte run touches: o.. and o+16.., fetched once
     // for all ROWS_PER_TG rows.
+    // Two per-element operations are avoidable, and the incumbent kernel avoids
+    // both -- this is its `block_q_n_dot_y` trick.
+    //
+    // (1) The -8 zero point does not belong in the inner loop. Sum_j (n_j-8)x_j
+    //     is Sum_j n_j x_j - 8 Sum_j x_j, and the second term depends only on
+    //     ACTIVATIONS, so it is computed once per unit and reused across every
+    //     row. That is 16 subtractions per unit replaced by one fused term per
+    //     row -- and it is also the association ggml itself uses, so this moves
+    //     the numerics TOWARD the reference rather than away from it.
+    //
+    // (2) The high nibble need not be shifted down. Masking in place with 0xF0
+    //     leaves 16*n_hi, so pre-scaling its activation by 1/16 cancels it
+    //     exactly -- both factors are powers of two, so the rounded product is
+    //     the same one n_hi*x would give.
     writeln!(out, "        float xlo[BPL], xhi[BPL];").unwrap();
     writeln!(out, "        for (uint j = 0u; j < BPL; ++j) {{").unwrap();
     writeln!(out, "            xlo[j] = x[b * BLK + o + j];").unwrap();
-    writeln!(out, "            xhi[j] = x[b * BLK + o + j + 16u];").unwrap();
+    writeln!(out, "            xhi[j] = x[b * BLK + o + j + 16u] * 0.0625f;  // 1/16, exact").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
@@ -4415,7 +4429,7 @@ fn emit_mul_mv_q4_0_interleaved_msl(out: &mut String) {
     writeln!(out, "            for (uint j = 0u; j < BPL; ++j) {{").unwrap();
     writeln!(out, "                uint q = (uint)qs[j];").unwrap();
     writeln!(out, "                sum += ((float)(q & 0x0Fu) - 8.0f) * xlo[j];").unwrap();
-    writeln!(out, "                sum += ((float)(q >> 4u)   - 8.0f) * xhi[j];").unwrap();
+    writeln!(out, "                sum += ((float)(q & 0xF0u) - 128.0f) * xhi[j];  // 16*(n_hi-8) against x/16").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            acc[r] += d * sum;").unwrap();
     writeln!(out, "        }}").unwrap();
@@ -16342,6 +16356,29 @@ module {
                 mv, q4_body, body, small_body);
             std::fs::write(format!("{}/tilers-generated.h", dir), h).unwrap();
         }
+    }
+
+    /// The Q4_0 inner loop must carry neither a shift nor a per-element zero
+    /// point: masking in place leaves 16*n_hi against a 1/16-scaled activation.
+    /// Its sibling idea -- factoring the -8 out into a row-level term over a
+    /// hoisted activation sum -- was tried, measured worse, and reverted.
+    #[test]
+    fn test_msl_q4_0_interleaved_inner_loop_is_lean() {
+        let msl = convert_mlir_to_msl(crate::mlir_parse::MATVEC_Q4_0_INTERLEAVED_MLIR)
+            .expect("the interleaved Q4_0 mat-vec must lower");
+        assert!(msl.contains("sum += ((float)(q & 0xF0u) - 128.0f) * xhi[j];"),
+            "the high nibble must be masked in place, not shifted:\n{}", msl);
+        assert!(!msl.contains("q >> 4u"),
+            "no shift belongs in the inner loop:\n{}", msl);
+        // The zero point STAYS per element. Factoring it into a row-level
+        // term over a hoisted activation sum -- which is what ggml does and
+        // which removes 16 subtractions per unit -- measured 1.18x against
+        // 1.09x end-to-end on Qwen2.5-3B q4_0. That is the THIRD time hoisting
+        // arithmetic out of this row loop has measured neutral-or-worse here.
+        assert!(msl.contains("acc[r] += d * sum;"),
+            "the zero point stays per element -- hoisting it measured worse:\n{}", msl);
+        assert!(!msl.contains("sumy"),
+            "no hoisted activation sum; it was measured and reverted:\n{}", msl);
     }
 
     #[test]
