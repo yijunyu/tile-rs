@@ -4108,15 +4108,6 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
     writeln!(out, "    }}").unwrap();
 }
 
-/// Output tile of the Q8_0 GEMM, and the micro-tile each thread owns within it.
-///
-/// A thread computes `RT x CT` outputs, not one. With one output per thread the
-/// inner product is only `BLK` multiply-adds between two barriers, and the
-/// kernel is barrier-bound rather than compute-bound -- measured 13x slower
-/// than ggml. A micro-tile raises the work per barrier by `RT*CT` while reading
-/// `RT + CT` values from the stage instead of `RT*CT`.
-pub const MUL_MM_RT: usize = 4;
-pub const MUL_MM_CT: usize = 2;
 
 /// K-blocks staged per synchronisation round.
 ///

@@ -27,6 +27,8 @@ mod mlir_parse;
 mod mlir_to_aie;
 #[path = "../../rustc_codegen_tile/src/mlir_to_bang.rs"]
 mod mlir_to_bang;
+#[path = "../../rustc_codegen_tile/src/knobs.rs"]
+mod knobs;
 #[path = "../../rustc_codegen_tile/src/mlir_to_csl.rs"]
 mod mlir_to_csl;
 #[path = "../../rustc_codegen_tile/src/mlir_to_gaudi.rs"]
