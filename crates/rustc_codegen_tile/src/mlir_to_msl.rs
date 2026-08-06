@@ -4188,14 +4188,14 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     const TG_LIMIT: usize = 32768;
     // The weight stage is [k][n] so its pad is on n, the activation stage is
     // [m][k] so its pad is on k. Both are half.
-    let staged = (t.kc * 32 * (t.tn + 1) + t.tm * t.kc * 33) * 2;
+    // Block-tiled staging is exact -- no pad, since 8x8 blocks are contiguous.
+    let staged = (t.kc * 32 * t.tn + t.tm * t.kc * 32) * 2;
     let scratch = nsg * 64 * 4;
     assert!(staged + scratch <= TG_LIMIT,
         "GEMM needs {} B staged + {} B result scratch (TN={} TM={} KC={}), limit {}",
         staged, scratch, t.tn, t.tm, t.kc, TG_LIMIT);
 
     writeln!(out, "    constexpr uint BLK = 32u;              // weights per block").unwrap();
-    writeln!(out, "    constexpr uint PAD = BLK + 1u;         // pad: bank conflicts").unwrap();
     writeln!(out, "    constexpr uint WQ  = BLK / 4u;         // char4 units per block row").unwrap();
     if interleaved {
         writeln!(out, "    constexpr uint BLKB = 34u;             // BYTES per block: half d + int8 qs[32]").unwrap();
@@ -4228,8 +4228,16 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     // matrix load's transpose flag made the transposed operand the expensive
     // one -- which is why a 16x1 register tile beat a square 4x4 one. Doing it
     // once at staging time instead makes both loads direct.
-    writeln!(out, "    threadgroup half tgW[KC * BLK][TN + 1u];  // weights [k][n], pre-transposed").unwrap();
-    writeln!(out, "    threadgroup half tgX[TM][KC * PAD];       // activations [m][k]").unwrap();
+    // BLOCK-TILED staging: both operands are stored as a sequence of
+    // contiguous 8x8 tiles, so simdgroup_load reads 64 consecutive elements at
+    // stride 8 instead of striding across a padded row. This is what the
+    // incumbent kernel does, and it also drops the bank-conflict pad -- with
+    // 64-element blocks there is no row stride to collide on.
+    writeln!(out, "    constexpr uint KBLK = (KC * BLK) / 8u;   // 8-blocks along k").unwrap();
+    writeln!(out, "    constexpr uint NBLK = TN / 8u;           // 8-blocks along n").unwrap();
+    writeln!(out, "    constexpr uint MBLK = TM / 8u;           // 8-blocks along m").unwrap();
+    writeln!(out, "    threadgroup half tgW[KBLK * NBLK * 64u]; // weights, 8x8 blocks of [k][n]").unwrap();
+    writeln!(out, "    threadgroup half tgX[MBLK * KBLK * 64u]; // activations, 8x8 blocks of [m][k]").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint K = blocks_per_row * BLK;").unwrap();
     writeln!(out, "    simdgroup_float8x8 acc[MI * NI];").unwrap();
@@ -4240,7 +4248,6 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     writeln!(out, "        for (uint idx = tid; idx < TN * WQ * KC; idx += tcount) {{").unwrap();
     writeln!(out, "            uint kk = idx / (TN * WQ), rem = idx % (TN * WQ);").unwrap();
     writeln!(out, "            uint r = rem / WQ, q = rem % WQ;").unwrap();
-    writeln!(out, "            uint eo = kk * PAD + q * 4u;").unwrap();
     writeln!(out, "            uint n = n0 + r, kb = kb0 + kk;").unwrap();
     writeln!(out, "            float4 wv = float4(0.0f);").unwrap();
     writeln!(out, "            if (n < n_rows && kb < blocks_per_row) {{").unwrap();
@@ -4259,13 +4266,15 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     }
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            uint ko = kk * BLK + q * 4u;").unwrap();
-    writeln!(out, "            tgW[ko+0u][r] = (half)wv.x; tgW[ko+1u][r] = (half)wv.y;").unwrap();
-    writeln!(out, "            tgW[ko+2u][r] = (half)wv.z; tgW[ko+3u][r] = (half)wv.w;").unwrap();
+    writeln!(out, "            for (uint e = 0u; e < 4u; ++e) {{").unwrap();
+    writeln!(out, "                uint kx = ko + e;").unwrap();
+    writeln!(out, "                uint blk = (kx / 8u) * NBLK + (r / 8u);").unwrap();
+    writeln!(out, "                tgW[blk * 64u + (kx % 8u) * 8u + (r % 8u)] = (half)wv[e];").unwrap();
+    writeln!(out, "            }}").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint idx = tid; idx < TM * WQ * KC; idx += tcount) {{").unwrap();
     writeln!(out, "            uint kk = idx / (TM * WQ), rem = idx % (TM * WQ);").unwrap();
     writeln!(out, "            uint c = rem / WQ, q = rem % WQ;").unwrap();
-    writeln!(out, "            uint eo = kk * PAD + q * 4u;").unwrap();
     writeln!(out, "            uint m = m0 + c, kb = kb0 + kk;").unwrap();
     writeln!(out, "            float4 xv = float4(0.0f);").unwrap();
     writeln!(out, "            if (m < n_cols && kb < blocks_per_row) {{").unwrap();
@@ -4273,8 +4282,11 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     writeln!(out, "                device const float4* a4 = (device const float4*)({} + (ulong)m * K + kb * BLK);", act).unwrap();
     writeln!(out, "                xv = a4[q];").unwrap();
     writeln!(out, "            }}").unwrap();
-    writeln!(out, "            tgX[c][eo+0u] = (half)xv.x; tgX[c][eo+1u] = (half)xv.y;").unwrap();
-    writeln!(out, "            tgX[c][eo+2u] = (half)xv.z; tgX[c][eo+3u] = (half)xv.w;").unwrap();
+    writeln!(out, "            for (uint e = 0u; e < 4u; ++e) {{").unwrap();
+    writeln!(out, "                uint kx = kk * BLK + q * 4u + e;").unwrap();
+    writeln!(out, "                uint blk = (c / 8u) * KBLK + (kx / 8u);").unwrap();
+    writeln!(out, "                tgX[blk * 64u + (c % 8u) * 8u + (kx % 8u)] = (half)xv[e];").unwrap();
+    writeln!(out, "            }}").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
     // C[m][n] = sum_k X[m][k] * W[n][k]. The activation tile is used as-is; the
@@ -4283,12 +4295,12 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     // does not need a separate transposed copy.
     writeln!(out, "        for (uint kk = 0u; kk < KC; ++kk) {{").unwrap();
     writeln!(out, "            for (uint k0 = 0u; k0 < BLK; k0 += 8u) {{").unwrap();
-    writeln!(out, "                uint off = kk * PAD + k0;").unwrap();
+    writeln!(out, "                uint kblk = (kk * BLK + k0) / 8u;").unwrap();
     writeln!(out, "                simdgroup_half8x8 ma[MI], mb[NI];").unwrap();
     writeln!(out, "                for (uint i = 0u; i < MI; ++i)").unwrap();
-    writeln!(out, "                    simdgroup_load(ma[i], &tgX[mo + i * 8u][off], KC * PAD);").unwrap();
+    writeln!(out, "                    simdgroup_load(ma[i], &tgX[(((mo / 8u) + i) * KBLK + kblk) * 64u], 8u);").unwrap();
     writeln!(out, "                for (uint j = 0u; j < NI; ++j)").unwrap();
-    writeln!(out, "                    simdgroup_load(mb[j], &tgW[kk * BLK + k0][no + j * 8u], TN + 1u);").unwrap();
+    writeln!(out, "                    simdgroup_load(mb[j], &tgW[(kblk * NBLK + (no / 8u) + j) * 64u], 8u);").unwrap();
     writeln!(out, "                for (uint i = 0u; i < MI; ++i)").unwrap();
     writeln!(out, "                    for (uint j = 0u; j < NI; ++j)").unwrap();
     writeln!(out, "                        simdgroup_multiply_accumulate(acc[i * NI + j], ma[i], mb[j], acc[i * NI + j]);").unwrap();
@@ -16354,28 +16366,18 @@ module {
         assert!(msl.contains("kernel void mulmm_q8_0_fused"), "{}", msl);
 
         // Both operands staged, so a weight load serves the whole tile.
-        assert!(msl.contains("threadgroup half tgW[KC * BLK][TN + 1u]")
-             && msl.contains("threadgroup half tgX[TM][KC * PAD]"),
-            "both operands must be staged in threadgroup memory:\n{}", msl);
-        // The pad is load-bearing: a row of exactly BLK elements puts every row
-        // on the same bank, and the inner product reads a different row per
-        // thread -- a 32-way conflict invariant to the tile size. Measured 2.5x
-        // at n=8 purely from this one word.
-        // Staged as half, accumulated in float. The half matrix instruction
-        // measured FLAT against the float one on M1 Ultra (6921 vs 6838 us at
-        // n=512), so this is not here for arithmetic rate -- it is here because
-        // halving the stage bought the budget for the 128x128 tile, which was
-        // worth 1.61x -> 1.42x. The accumulator stays float so the reduction
-        // over K is not what loses precision.
-        assert!(msl.contains("threadgroup half tgW[KC * BLK][TN + 1u];")
-            && msl.contains("simdgroup_half8x8 ma[MI], mb[NI];"),
-            "half operands, float accumulator:\n{}", msl);
-        assert!(msl.contains("constexpr uint PAD = BLK + 1u;"),
-            "the stage must be padded against bank conflicts:\n{}", msl);
-
-        // TWO barriers per K-block. With only the first, a fast thread can
-        // overwrite the staging buffers for the next block while a slow one is
-        // still reading this one -- a race that shows up as rare wrong answers.
+        assert!(msl.contains("threadgroup half tgW[KBLK * NBLK * 64u];")
+             && msl.contains("threadgroup half tgX[MBLK * KBLK * 64u];"),
+            "both operands must be staged as 8x8 blocks:\n{}", msl);
+        // Stride 8 on a contiguous 64-element block, no transpose flag: the
+        // staging already put each 8x8 tile where the matrix load wants it.
+        assert!(msl.contains("simdgroup_load(mb[j], &tgW[(kblk * NBLK + (no / 8u) + j) * 64u], 8u);")
+             && !msl.contains(", 0, true)"),
+            "matrix loads must read contiguous blocks at stride 8:\n{}", msl);
+        // The bank-conflict PAD is gone with block staging: 8x8 blocks are
+        // contiguous, so there is no row stride left to collide on.
+        assert!(!msl.contains("PAD = BLK + 1u"),
+            "block staging should have retired the pad:\n{}", msl);
         assert_eq!(msl.matches("threadgroup_barrier").count(), 2,
             "one barrier after staging and one after consuming, per ROUND:\n{}", msl);
         // The result tile goes out through an 8x8 scratch PER SIMDGROUP, not a
@@ -16396,15 +16398,15 @@ module {
         // system wants 128 -- and it is invariant to every tile knob.
         assert!(msl.contains("device const char4* w4"),
             "weight staging must be at least 4 bytes per lane:\n{}", msl);
-        // The contraction runs on the hardware matrix units, and the weight
-        // tile is loaded TRANSPOSED -- stored [n][k], wanted [k][n] -- which
-        // the matrix load does for free, so the stage needs no second copy.
         assert!(msl.contains("simdgroup_multiply_accumulate(acc[i * NI + j], ma[i], mb[j], acc[i * NI + j]);"),
             "the contraction must use the matrix units:\n{}", msl);
-        // No transpose flag anywhere: the stage already wrote [k][n].
-        assert!(msl.contains("simdgroup_load(mb[j], &tgW[kk * BLK + k0][no + j * 8u], TN + 1u);")
+        // The staging writes each 8x8 tile contiguously, so the matrix load is
+        // a stride-8 read of 64 consecutive elements with no transpose flag --
+        // the layout work happens once at staging, not on every load.
+        assert!(msl.contains("simdgroup_load(mb[j], &tgW[(kblk * NBLK + (no / 8u) + j) * 64u], 8u);")
+            && msl.contains("simdgroup_load(ma[i], &tgX[(((mo / 8u) + i) * KBLK + kblk) * 64u], 8u);")
             && !msl.contains(", 0, true)"),
-            "the weight stage must be pre-transposed, not loaded transposed:\n{}", msl);
+            "matrix loads must read contiguous 8x8 blocks:\n{}", msl);
         // The register tile is 2-D: MI+NI loads feed MI*NI products, where a
         // 1-D tile needs MI*NI+1 loads for the same products.
         assert!(msl.contains("simdgroup_half8x8 ma[MI], mb[NI];")
