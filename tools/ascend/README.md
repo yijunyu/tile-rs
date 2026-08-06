@@ -87,16 +87,29 @@ discarded, every result checked against numpy:
 
 | M x K x N | tile-rs PTO | aclnn KEEP_DTYPE | ratio |
 |---|---|---|---|
-| 16 x 896 x 4864 | 207.98 us / 85.6 GB/s | 33.96 us / 524 GB/s | 6.1x |
-| 16 x 1536 x 1536 | 116.04 us / 83.0 GB/s | 30.71 us / 314 GB/s | 3.8x |
-| 16 x 2048 x 11008 | 1036.34 us / 87.8 GB/s | 81.97 us / 1110 GB/s | 12.6x |
+| 16 x 896 x 4864 | 17.28 us / 1030 GB/s | 33.96 us / 524 GB/s | **1.97x faster** |
+| 16 x 1536 x 1536 | 22.38 us / 430 GB/s | 30.71 us / 314 GB/s | **1.37x faster** |
+| 16 x 2048 x 11008 | 56.64 us / 1607 GB/s | 81.97 us / 1110 GB/s | **1.45x faster** |
 
-Two things this settles. The generated matmul is **4-13x off the vendor**, so
-the Kb/Nb tuning that gained 1.16-1.28x was moving inside a regime an order of
-magnitude from the achievable. And aclnn reaching **1110 GB/s** replaces the
-spec-sheet number the earlier roofline used -- the achievable bandwidth on this
-box is *at least* that, so the generated kernel is nearer 8% of achievable than
-the 11% previously estimated against a published ~800 GB/s.
+### The single-block trap -- read this before trusting any older PTO number
+
+`pto_run` launched `<<<1>>>`. The generated kernel's outer N-loop has ALWAYS
+been block-parallel -- it strides
+`for n_i = get_block_idx(); n_i < n_iters; n_i += get_block_num()` -- so one
+block ran the entire matmul on ONE AI core. Launching one block per N-tile is
+worth **5.2x to 18.3x**:
+
+| M x K x N | 1 block | N blocks | speedup |
+|---|---|---|---|
+| 16 x 896 x 4864 | 207.98 us | 17.28 us | 12.0x |
+| 16 x 1536 x 1536 | 116.04 us | 22.38 us | 5.2x |
+| 16 x 2048 x 11008 | 1036.34 us | 56.64 us | 18.3x |
+
+Every PTO measurement taken before this was a single-core number. That includes
+the "bandwidth-pinned at ~85 GB/s" reading -- which was simply one core's share
+of the chip, and whose shape-independence was the giveaway I read as a kernel
+property. It also includes the Kb/Nb sweep, so those constants were tuned in a
+regime the kernel no longer runs in and need re-sweeping.
 
 ### Three traps, each of which cost a debugging round
 

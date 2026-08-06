@@ -35,6 +35,17 @@
 #define PTO_N 16
 #endif
 
+// Must match the emitter's N block size (MM_TILE / PTO_MM_NB) so the host
+// derives the same n_iters the kernel strides over. Restating it here is the
+// same hazard that has bitten the Metal side three times, so it is checked
+// against the kernel's own loop bound below rather than trusted.
+#ifndef PTO_NB
+#define PTO_NB 256
+#endif
+#ifndef PTO_MAX_BLOCKS
+#define PTO_MAX_BLOCKS 24
+#endif
+
 // Launchable entry wrapping the ptoas-generated device function.
 extern "C" __global__ AICORE void pto_entry(__gm__ float *a, __gm__ float *b,
                                             __gm__ float *c) {
@@ -77,8 +88,23 @@ int main(int argc, char **argv) {
   CHECK(aclrtMemcpy(da, na * 4, ha.data(), na * 4, ACL_MEMCPY_HOST_TO_DEVICE));
   CHECK(aclrtMemcpy(db, nb * 4, hb.data(), nb * 4, ACL_MEMCPY_HOST_TO_DEVICE));
 
+  // Block count. The generated kernel's outer N-loop is ALREADY parallel --
+  // it strides `for n_i = get_block_idx(); n_i < n_iters; n_i += get_block_num()`
+  // -- so launching <<<1>>> ran the whole matmul on ONE AI core and every
+  // measurement taken with it was a single-core number. That is the entire
+  // reason the generated matmul looked pinned at ~85 GB/s: roughly one core's
+  // share of the chip.
+  //
+  // Override with PTO_BLOCKS; default is one block per N-tile, capped, since
+  // extra blocks past n_iters just exit immediately.
+  int n_iters = (PTO_N + PTO_NB - 1) / PTO_NB;
+  int blocks  = n_iters < PTO_MAX_BLOCKS ? n_iters : PTO_MAX_BLOCKS;
+  if (const char *e = getenv("PTO_BLOCKS")) { int v = atoi(e); if (v > 0) blocks = v; }
+  if (blocks < 1) blocks = 1;
+  fprintf(stderr, "  [pto_run] n_iters=%d launching %d block(s)\n", n_iters, blocks);
+
   // warm-up (first launch pays kernel load)
-  pto_entry<<<1, nullptr, stream>>>((__gm__ float *)da, (__gm__ float *)db,
+  pto_entry<<<blocks, nullptr, stream>>>((__gm__ float *)da, (__gm__ float *)db,
                                     (__gm__ float *)dc);
   CHECK(aclrtSynchronizeStream(stream));
 
@@ -88,7 +114,7 @@ int main(int argc, char **argv) {
     CHECK(aclrtCreateEvent(&beg));
     CHECK(aclrtCreateEvent(&end));
     CHECK(aclrtRecordEvent(beg, stream));
-    pto_entry<<<1, nullptr, stream>>>((__gm__ float *)da, (__gm__ float *)db,
+    pto_entry<<<blocks, nullptr, stream>>>((__gm__ float *)da, (__gm__ float *)db,
                                       (__gm__ float *)dc);
     CHECK(aclrtRecordEvent(end, stream));
     CHECK(aclrtSynchronizeStream(stream));
