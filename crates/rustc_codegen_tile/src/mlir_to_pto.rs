@@ -3458,35 +3458,56 @@ fn translate_silu(
 /// Block size constants used by the K/N-blocked matmul emission.
 /// See comment above `detect_blocked_matmul_loads` for the rationale.
 ///
-/// **Measured on hardware (910c, Ascend910, CANN 9.0.0, 2026-08-05)** with a
-/// decode-shaped projection M=16 K=1536 N=1536 — the shape a 1.5B model's
-/// q/k/v/o projection actually runs at. All variants produced identical
-/// checksums and matched a CPU reference (max_rel_err 1.12e-06), so these are
-/// pure scheduling choices:
+/// **Measured on hardware (910c, Ascend910, CANN 9.0.0).** Every variant below
+/// produced an identical checksum and matched a CPU reference, so these are
+/// pure scheduling choices, not accuracy trade-offs.
+///
+/// An earlier sweep at ONE shape (M=16 K=1536 N=1536) concluded that the
+/// invariant was the **product** `Kb * Nb` — that any pair saturating L0B
+/// (16384 f32 = 64 KB) sat on the same ~134 us plateau, so "the pair is really
+/// one knob and 256x64 is already on the optimum; there is nothing to reclaim".
+///
+/// **That was an artifact of the single shape.** Re-run at a real FFN
+/// projection (M=16 K=896 N=4864), the product-16384 pairs spread over 2.9x:
 ///
 /// ```text
-///   Kb x Nb      product   median
-///   64  x 64       4096    173.4 us
-///   128 x 64       8192    148.2 us
-///   256 x 64      16384    134.7 us   <- shipped
-///   512 x 32      16384    134.0 us
-///   1024 x 16     16384    133.9 us
-///   128 x 128     16384    133.9 us
+///   Kb x Nb    product   median      Kb x Nb   product   median
+///   128 x 128    16384   210.5 us    128 x 64     8192   267.4 us
+///   256 x 64     16384   265.7 us    256 x 32     8192   433.8 us
+///   512 x 32     16384   432.2 us    64  x 64     4096   315.7 us
+///   1024 x 16    16384   620.3 us    128 x 32     4096   431.2 us
 /// ```
 ///
-/// The invariant is the **product**, not either dimension: every pair whose
-/// `Kb * Nb` saturates L0B (16384 f32 = 64 KB) lands on the same ~134 us
-/// plateau within noise, while smaller products degrade proportionally. So
-/// the pair is really one knob — "fill L0B" — and 256x64 is already on the
-/// optimum. Unlike the Metal K-unroll default (which was leaving ~40% on the
-/// table until measured), there is nothing to reclaim here.
+/// The ordering is by **Nb alone** — 128/64/32/16 gives 210/266/432/620 us and
+/// Kb barely matters within a band. Larger N makes the N-loop trip count, not
+/// L0B occupancy, the thing that binds: at N=4864 an Nb of 32 runs 152 blocks
+/// against 38 for Nb=128.
+///
+/// Confirmed across three shapes, all checksums identical:
+///
+/// ```text
+///   shape (M x K x N)     256x64 (was)   128x128    64x256   gain
+///   16 x 1536 x 1536         134.5 us     118.5     116.0    1.16x
+///   16 x  896 x 4864         266.0        210.2     207.4    1.28x
+///   16 x 2048 x 11008       1204.7       1046.2    1036.3    1.16x
+/// ```
+///
+/// So there WAS something to reclaim: 16-28%. Shipped is now Kb=64 Nb=256,
+/// which wins at every shape measured. `Kb=128 Nb=256` is rejected by the UB
+/// guard while `Kb=64 Nb=256` passes, so the pair is still jointly constrained
+/// even though Nb is what pays.
+///
+/// The lesson generalizes past this knob: a plateau observed at one shape is
+/// not an invariant. The first sweep's own data contained the hint -- 128x128
+/// tied 256x64 there -- and a second shape turned that tie into 1.26x.
 ///
 /// Note `Nb=128` did **not** reproduce the "aicore execution exception"
 /// recorded below for 910B2: at Kb=128 it ran correctly on this
 /// Ascend910/CANN 9.0.0 box. Treat that crash as box/CANN-specific rather
-/// than a universal cap.
-const PTO_MM_KB: u32 = 256;
-const PTO_MM_NB: u32 = 64;
+/// than a universal cap. Nb=256 is likewise unverified on 910B2, which cannot
+/// build these kernels at all (CANN 8.5.2 lacks CompactMode).
+const PTO_MM_KB: u32 = 64;
+const PTO_MM_NB: u32 = 256;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
 /// BLayout based on the companion `Right` tile width. At Nb=64 with i8 Left,
 /// ptoas silently emits `BLayout::ColMajor` (wrong) instead of RowMajor.
@@ -6547,20 +6568,22 @@ mod tests {
 
     #[test]
     fn test_pick_kb_for_n_clamps_on_outer_stride_overflow() {
-        // Default Kb=256 stands when N is small (Kb*N <= 2^23).
-        assert_eq!(pick_kb_for_n(1536, 1536), 256); // q/o_proj
-        assert_eq!(pick_kb_for_n(1536, 256), 256); // kv_proj
-        assert_eq!(pick_kb_for_n(1536, 8960), 256); // gate/up_proj
-        assert_eq!(pick_kb_for_n(8960, 1536), 256); // down_proj
-        // lm_head: N=151936 forces Kb down so that Kb*N < 2^24. With our
-        // 2^23 threshold, Kb ≤ (2^23)/151936 ≈ 55 → aligned to 48.
-        // 1536 % 48 == 0, so expect Kb=48.
+        // The default Kb is now 64 (measured: Nb is what pays, Kb is nearly
+        // free), so the clamp only bites at much larger N than it used to --
+        // 2^23 / 64 = 131072, where it was 2^23 / 256 = 32768.
+        assert_eq!(pick_kb_for_n(1536, 1536), PTO_MM_KB); // q/o_proj
+        assert_eq!(pick_kb_for_n(1536, 256), PTO_MM_KB); // kv_proj
+        assert_eq!(pick_kb_for_n(1536, 8960), PTO_MM_KB); // gate/up_proj
+        assert_eq!(pick_kb_for_n(8960, 1536), PTO_MM_KB); // down_proj
+        // lm_head: N=151936 still forces Kb down. Cap = 2^23/151936 ≈ 55 →
+        // aligned to 48, and 1536 % 48 == 0, so 48 -- below the default, so
+        // this case is unchanged by the new default.
         assert_eq!(pick_kb_for_n(1536, 151936), 48);
-        // N=65536 exactly at old failure boundary: 2^23/65536 = 128. 1536%128=0.
-        assert_eq!(pick_kb_for_n(1536, 65536), 128);
-        // N=32768 safe at full Kb=256: 256*32768 = 2^23 (equal to threshold,
-        // cap = 2^23/32768 = 256, so we get Kb=256).
-        assert_eq!(pick_kb_for_n(1536, 32768), 256);
+        // N=65536: cap = 2^23/65536 = 128, above the default, so the default
+        // stands rather than the cap. Under the old Kb=256 this returned 128.
+        assert_eq!(pick_kb_for_n(1536, 65536), PTO_MM_KB);
+        // N=32768: cap = 256, well above the default.
+        assert_eq!(pick_kb_for_n(1536, 32768), PTO_MM_KB);
         // Degenerate / small K that's still > kb_cap.
         // K=128 (base=128), cap=48: 128%48!=0 → fallback halving to 32 (divides 128, ≤48).
         assert_eq!(pick_kb_for_n(128, 151936), 32);
@@ -8553,22 +8576,29 @@ mod pto_toolchain_dump {
     #[test]
     fn dump_pto_for_toolchain_check() {
         let Ok(dir) = std::env::var("TILERS_PTO_DUMP_DIR") else { return };
-        let mm = r#"
-module {
-  llvm.func @tile_matmul(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+        // Shape is parameterized. At the original fixed 16x16x16 the blocking
+        // knobs (PTO_MM_KB=256, PTO_MM_NB=64) never engage -- a sweep of them
+        // would emit identical kernels and report that the knobs do nothing.
+        let dim = |v: &str, d: u32| -> u32 {
+            std::env::var(v).ok().and_then(|x| x.parse().ok()).unwrap_or(d)
+        };
+        let (dm, dk, dn) = (dim("PTO_DUMP_M", 16), dim("PTO_DUMP_K", 16), dim("PTO_DUMP_N", 16));
+        let mm = format!(r#"
+module {{
+  llvm.func @tile_matmul(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {{hacc.entry}} {{
     ^bb0:
-    %m = llvm.mlir.constant(16 : i32) : i32
-    %k = llvm.mlir.constant(16 : i32) : i32
-    %n = llvm.mlir.constant(16 : i32) : i32
+    %m = llvm.mlir.constant({dm} : i32) : i32
+    %k = llvm.mlir.constant({dk} : i32) : i32
+    %n = llvm.mlir.constant({dn} : i32) : i32
     %a = llvm.call @__tile_load_f32(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32
     %b = llvm.call @__tile_load_f32(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32
     %c = llvm.call @__tile_matmul_f32(%a, %a, %b, %m, %k, %n) : (i32, i32, i32, i32, i32, i32) -> i32
     llvm.call @__tile_store_f32(%arg2, %c, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
     llvm.return
-  }
-}
-"#;
-        std::fs::write(format!("{}/matmul.pto", dir), convert_mlir_to_pto(mm).unwrap()).unwrap();
+  }}
+}}
+"#);
+        std::fs::write(format!("{}/matmul.pto", dir), convert_mlir_to_pto(&mm).unwrap()).unwrap();
 
         // Attention exercises the whole-tile pipeline (tmatmul -> softmax_5ops
         // -> tmatmul) that the causal-rejection change sits next to.

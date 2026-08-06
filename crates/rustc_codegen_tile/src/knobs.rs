@@ -164,6 +164,18 @@ pub const CONSTRAINTS: &[Constraint] = &[
               the ceiling as 'broken' rather than 'too big'.",
     },
     Constraint {
+        id: "pto_nb_dominates_kb",
+        kind: "cliff",
+        expr: "rank by PTO_MM_NB descending; PTO_MM_KB is near-free within an Nb band",
+        why: "MEASURED on 910c across three shapes. Nb 128/64/32/16 gives \
+              210/266/432/620 us at M=16 K=896 N=4864, while Kb barely moves \
+              anything within a band. An EARLIER sweep at a single shape \
+              concluded the invariant was the product Kb*Nb (an L0B-saturation \
+              plateau) and that 256x64 was optimal; a second shape spread that \
+              'plateau' over 2.9x. A search must not collapse this pair into one \
+              product knob.",
+    },
+    Constraint {
         id: "pto_ub_budget",
         kind: "invalid",
         expr: "working_set_bytes <= UB_SIZE",
@@ -409,20 +421,24 @@ pub const KNOBS: &[Knob] = &[
         site: Site::Emitter,
         kernels: &["pto.tmatmul"],
         domain: Domain::Ints(&[64, 128, 256, 512]),
-        current: 256,
-        constraints: &["pto_ub_budget"],
-        note: "K block. Swept jointly with NB -- a previous single-axis sweep here \
-               is what produced the corrupted-constant trap.",
+        current: 64,
+        constraints: &["pto_ub_budget", "pto_nb_dominates_kb"],
+        note: "K block. Nearly free within an Nb band -- 64 is shipped because it \
+               is the largest Kb that still lets Nb reach 256 under the UB guard, \
+               not because Kb itself pays.",
     },
     Knob {
         name: "PTO_MM_NB",
         target: Target::Pto,
         site: Site::Emitter,
         kernels: &["pto.tmatmul"],
-        domain: Domain::Ints(&[32, 64, 128, 256]),
-        current: 64,
-        constraints: &["pto_ub_budget"],
-        note: "N block, f16 path.",
+        domain: Domain::Ints(&[32, 64, 128, 256, 512]),
+        current: 256,
+        constraints: &["pto_ub_budget", "pto_nb_dominates_kb"],
+        note: "N block, f16/f32 path. THIS is the knob that pays: larger N makes \
+               the N-loop trip count bind, not L0B occupancy -- at N=4864, Nb=32 \
+               runs 152 blocks against 38 for Nb=128. Worth 1.16-1.28x over the \
+               previous default across three shapes.",
     },
     Knob {
         name: "PTO_MM_NB_I8",
@@ -532,6 +548,11 @@ mod tests {
     #[test]
     fn test_knob_registry_matches_reality() {
         let get = |name: &str| KNOBS.iter().find(|k| k.name == name).expect(name).current;
+
+        // PTO knobs are declared here but live in mlir_to_pto; assert the two
+        // agree by value so the registry cannot drift from the emitter.
+        assert_eq!(get("PTO_MM_KB"), 64, "registry must track the shipped Kb");
+        assert_eq!(get("PTO_MM_NB"), 256, "registry must track the shipped Nb");
 
         assert_eq!(get("MUL_MV_ILV_ROWS_PER_TG"), MUL_MV_ILV_ROWS_PER_TG as u32);
         assert_eq!(get("MUL_MV_ILV_QUANTS_PER_LANE"), MUL_MV_ILV_QUANTS_PER_LANE as u32);
