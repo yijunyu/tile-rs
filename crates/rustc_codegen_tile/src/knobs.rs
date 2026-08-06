@@ -499,6 +499,50 @@ pub const KNOBS: &[Knob] = &[
 /// discard the first run of a series -- it is consistently fast (cold GPU).
 pub const MEASUREMENT_PROTOCOL: (&str, u32, u32) = ("median-of-repeats", 20, 5);
 
+/// Which knobs the ISOLATED benchmark may be used to score, and which it may
+/// not. This is not a caveat, it is a validity boundary, and crossing it
+/// produced a configuration 40% slower in a real engine while its own objective
+/// said it had improved.
+///
+/// The isolated benchmark amortises launch by putting many identical ops in one
+/// graph. That is what makes it valid for arithmetic-side knobs -- without it
+/// the measurement is launch overhead. But it also SATURATES the GPU with work
+/// that a real decode never has queued, so any knob that trades threadgroup
+/// count for per-threadgroup work is scored as if the occupancy it gives up
+/// were free.
+///
+/// Measured: rows-per-threadgroup 8 beat 4 in isolation and ran 88 t/s against
+/// 138 end-to-end. Width was misranked the same way -- isolation preferred
+/// 32-64, models give 118/134/138 t/s for 32/64/128.
+///
+/// So: score `arithmetic` knobs in isolation, and `occupancy` knobs ONLY on a
+/// model large enough to be bandwidth-bound.
+pub const ORACLE_VALIDITY: &[(&str, &str)] = &[
+    ("MUL_MV_ILV_ROWS_PER_TG", "occupancy -- score end-to-end only"),
+    ("MUL_MV_ROWS_PER_TG",     "occupancy -- score end-to-end only"),
+    ("MUL_MV_Q4_ROWS_PER_TG",  "occupancy -- score end-to-end only"),
+    ("TILERS_MV_WIDTH",        "occupancy -- score end-to-end only"),
+    ("MM_TILE_LARGE.sgm",      "occupancy -- score end-to-end only"),
+    ("MM_TILE_LARGE.sgn",      "occupancy -- score end-to-end only"),
+    ("MM_TILE_SMALL.sgm",      "occupancy -- score end-to-end only"),
+    ("MM_TILE_SMALL.sgn",      "occupancy -- score end-to-end only"),
+    ("MUL_MV_ILV_QUANTS_PER_LANE",   "arithmetic -- isolation is valid"),
+    ("MUL_MV_ILV_Q4_BYTES_PER_LANE", "arithmetic -- isolation is valid"),
+    ("MUL_MV_VECS_PER_LANE",         "arithmetic -- isolation is valid"),
+    ("MUL_MV_Q4_VECS_PER_LANE",      "arithmetic -- isolation is valid"),
+    ("MM_TILE_LARGE.kc",             "arithmetic -- isolation is valid"),
+    ("MM_TILE_SMALL.kc",             "arithmetic -- isolation is valid"),
+    // Tile extents change both the work per threadgroup AND how many there
+    // are, so they sit on both sides and must be scored end-to-end.
+    ("MM_TILE_LARGE.tn", "occupancy -- score end-to-end only"),
+    ("MM_TILE_LARGE.tm", "occupancy -- score end-to-end only"),
+    ("MM_TILE_SMALL.tn", "occupancy -- score end-to-end only"),
+    ("MM_TILE_SMALL.tm", "occupancy -- score end-to-end only"),
+    // Selection knobs pick between genomes rather than tuning one.
+    ("TILERS_MM_NARROW_ROWS", "selection -- score end-to-end only"),
+    ("TILERS_MM_MIN_COLS",    "selection -- score end-to-end only"),
+];
+
 pub const OBJECTIVES: &[(&str, &str)] = &[
     ("us_per_op", "minimise; per-shape, launch amortised over many ops per graph, \
                    median of >=5 repeats at >=20 iters -- see MEASUREMENT_PROTOCOL"),
@@ -546,8 +590,14 @@ pub fn knobs_json() -> String {
             if i + 1 == CONSTRAINTS.len() { "" } else { "," }
         ));
     }
+    s.push_str("  ],\n  \"oracle_validity\": {\n");
+    for (i, (n, d)) in ORACLE_VALIDITY.iter().enumerate() {
+        s.push_str(&format!("    \"{}\": \"{}\"{}\n", n, d,
+            if i + 1 == ORACLE_VALIDITY.len() { "" } else { "," }));
+    }
+    s.push_str("  },\n");
     s.push_str(&format!(
-        "  ],\n  \"measurement_protocol\": {{\"kind\": \"{}\", \"min_iters\": {}, \"min_repeats\": {}, \
+        "  \"measurement_protocol\": {{\"kind\": \"{}\", \"min_iters\": {}, \"min_repeats\": {}, \
          \"compare\": \"median\", \"drop_first_run\": true}},\n  \"objectives\": [\n",
         MEASUREMENT_PROTOCOL.0, MEASUREMENT_PROTOCOL.1, MEASUREMENT_PROTOCOL.2));
     for (i, (n, d)) in OBJECTIVES.iter().enumerate() {
@@ -643,6 +693,18 @@ mod tests {
         assert_eq!(kind, "median-of-repeats");
         assert!(iters >= 20, "single-shot runs spread 1.35x on this box");
         assert!(repeats >= 5, "one run per configuration cannot rank configurations");
+    }
+
+    /// Every knob must say which oracle may score it, or a search will score
+    /// an occupancy knob in isolation and be confidently wrong.
+    #[test]
+    fn test_every_knob_declares_its_oracle() {
+        for k in KNOBS {
+            let base = k.name;
+            assert!(ORACLE_VALIDITY.iter().any(|(n, _)| *n == base)
+                    || k.target == Target::Pto,
+                "knob {} does not declare which oracle may score it", base);
+        }
     }
 
     #[test]
