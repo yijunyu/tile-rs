@@ -1369,6 +1369,12 @@ fn analyze_body(
     // tload and only stashes tv_ssa + elem_offset in a `deferred` record
     // on the TileInfo, and translate_matmul emits the scf.for nest.
     let mut blocked_mm_loads = detect_blocked_matmul_loads(body_lines);
+    // ── batched-stage operand pre-pass ──
+    // Same deferral, same reason: the load has to happen per head, inside the
+    // batched loop, not once above it.
+    for (idx, role) in detect_batched_loads(body_lines) {
+        blocked_mm_loads.entry(idx).or_insert(role);
+    }
     // ── N-blocked silu_mul operand pre-pass (#67) ──
     // Same shape as the matmul pre-pass: identify tile_load lines that
     // feed a silu_mul whose 5-tile fused emit overflows the UB budget,
@@ -2698,24 +2704,31 @@ fn emit_batched_loop(
             "%__batched".to_string()
         }
         BatchedKind::Softmax => {
-            // The operand's view was built by an earlier tile_load, OUTSIDE the
-            // loop and therefore at a fixed offset. Re-partition it here so
-            // each head reads its own slice; without this every iteration reads
-            // head 0 and writes it to head h — all heads written, all wrong,
-            // which is exactly what the device check reported.
+            // Load head h's slice HERE, inside the loop. The operand's load was
+            // deferred by detect_batched_loads precisely so this can happen:
+            // a pre-loop load fills the tile with head 0 once, and every
+            // iteration then softmaxes head 0's data into head h's slot.
+            let head_src = format!("{}__headsrc", p.a);
             let t = ctx
                 .get_tile(&p.a)
                 .ok_or_else(|| format!("softmax_batched: unknown tile {}", p.a))?
                 .clone();
-            let t = ctx.repartition_for_head(&t, p.m, p.n, &mut body).ok_or_else(|| {
+            let d = t.deferred.clone().ok_or_else(|| {
                 format!(
-                    "softmax_batched: operand {} has no GM view to re-partition per \
-                     head — it was not loaded from global memory",
+                    "softmax_batched: operand {} was not deferred — its load is \
+                     outside the loop, so every head would read head 0",
                     p.a
                 )
             })?;
-            let head_src = format!("{}__headsrc", p.a);
-            ctx.insert_tile(&head_src, t);
+            let pv = ctx.make_pv(&d.tv_ssa, p.m, p.n, "f32", d.elem_offset, &mut body);
+            let tile = ctx.alloc_tile(&head_src, p.m, p.n, "f32", &mut body);
+            body.push(format!(
+                "pto.tload ins({} : {}) outs({} : {})",
+                pv,
+                ptv_type(p.m, p.n, "f32"),
+                tile,
+                tile_buf_type(p.m, p.n, "f32")
+            ));
             ctx.set_inline_consts(&[("%__r", p.m), ("%__c", p.n)]);
             let inner = format!(
                 "%__batched = llvm.call @__tile_softmax_f32({}, {}, %__r, %__c) : \
@@ -3757,6 +3770,57 @@ fn matmul_needs_blocking(m: u32, k: u32, n: u32, dtypes: &MatmulDtypes) -> bool 
 /// (`"A"` or `"B"`). translate_load uses this to skip emitting the
 /// full-shape pto.tload / alloc_tile for those loads; translate_matmul
 /// later rebuilds per-block loads inside its scf.for nest.
+/// tile_load lines whose result is consumed by a batched stage.
+///
+/// Those loads must NOT emit a full-shape tload at top level: the batched
+/// loop needs to load head `h`'s slice on each iteration, and a pre-loop load
+/// fills the tile with head 0 once. Deferring them reuses exactly the
+/// mechanism the blocked matmul uses — skip the load, stash tv_ssa +
+/// elem_offset, let the consumer emit partition_view + tload inside its loop.
+///
+/// Without this the emitted PTO carries a head-relative partition_view that
+/// nothing reads, and every head computes head 0's data — verified on device
+/// as heads 1..N written but wrong, byte-identically with and without the view.
+fn detect_batched_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
+    let mut out: HashMap<usize, &'static str> = HashMap::new();
+
+    // Operand SSAs of every batched call in the body.
+    let mut wanted: Vec<(String, &'static str)> = Vec::new();
+    for line in body_lines {
+        let t = line.trim();
+        let batched_mm = t.contains("__tile_matmul_batched_f32");
+        let batched_sm = t.contains("__tile_softmax_batched_f32");
+        if !batched_mm && !batched_sm {
+            continue;
+        }
+        if let Some(args) = extract_call_args(t) {
+            if let Some(a) = args.get(1) {
+                wanted.push((a.trim().to_string(), "A"));
+            }
+            if batched_mm {
+                if let Some(b) = args.get(2) {
+                    wanted.push((b.trim().to_string(), "B"));
+                }
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return out;
+    }
+
+    for (i, line) in body_lines.iter().enumerate() {
+        if !line.contains("__tile_load_f32") {
+            continue;
+        }
+        if let Some(res) = extract_result_ssa(line.trim()) {
+            if let Some((_, role)) = wanted.iter().find(|(w, _)| *w == res) {
+                out.insert(i, role);
+            }
+        }
+    }
+    out
+}
+
 fn detect_blocked_matmul_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
     let mut result: HashMap<usize, &'static str> = HashMap::new();
 
