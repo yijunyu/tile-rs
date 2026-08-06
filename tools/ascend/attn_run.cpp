@@ -5,6 +5,10 @@
 // runs it from the host with ACL, timing N iterations on a stream.
 //
 // Build (on a 910B box):
+// NOTE: link with -lm. This file's CPU reference softmax calls std::exp, and
+// the CCE link does not pull libm -- the failure surfaces as a device-looking
+// `ld.lld: undefined symbol: exp` when it is an ordinary host call.
+//
 //   ccec -O2 -std=c++17 -DMEMORY_BASE --cce-aicore-arch=dav-c220-cube -x cce \
 //        -I<cann>/include -L<cann>/lib64 -lascendcl -lruntime
 // The kernel .cpp from ptoas is #included so the device function is visible.

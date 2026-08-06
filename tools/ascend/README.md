@@ -207,7 +207,25 @@ entry `tile_attn_s(q,k,v,o,scratch)` and allocates the S x S GM scratch buffer.
 The two variants do NOT share a signature, which is why running the plain
 harness against the scratch kernel silently built nothing.
 
-### Chasing `undefined symbol: exp` -- what it is NOT
+### `undefined symbol: exp` -- it was HOST code all along
+
+`llvm-objdump -dr` on the object shows the relocation is **`R_AARCH64_CALL26`**,
+an AArch64 *host* relocation -- not device code at all. The call is
+`attn_run.cpp:153`, `std::exp(row[j] - mx)`, in the harness's own CPU reference
+softmax. The CCE link does not pull libm, so **`-lm` is the fix**.
+
+`pto_run.cpp` (matmul) links fine because its CPU reference is multiply-add and
+contains no `exp` -- which is exactly why matmul never hit this.
+
+The device side was never implicated: preprocessing shows exactly ONE
+`TEXP_IMPL` surviving, the a2a3 one, which calls the `vexp` hardware intrinsic.
+
+Getting there took three wrong device-side hypotheses, recorded below because
+each cost a round trip. The lesson is that a link error naming a libc symbol
+should have been checked against the HOST object first -- `nm` and one
+relocation dump answered in seconds what three rebuild cycles did not.
+
+### The three device-side explanations that were wrong
 
 Three plausible explanations, all falsified on device, recorded so nobody spends
 the rounds again:
@@ -237,3 +255,15 @@ and reuse work above is necessary but was never sufficient.
 
 The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
 `attention.REJECTED` instead of panicking, so the UB boundary can be probed.
+
+
+## Shared-box etiquette on 910c
+
+`/usr/local/bin/task-submit` is a root job queue -- `--device N` locks an NPU for
+the job, and other users submit through it. Work run directly, as everything
+above was, contends with them.
+
+Check `npu-smi` before timing anything: AICore has been observed at 0% (clean,
+timings stable to ~1%) and at 100% with all eight devices held by another job.
+A measurement taken during the latter is worthless and the run interferes with
+whoever holds the device.
