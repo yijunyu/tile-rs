@@ -70,3 +70,46 @@ on either available box, and the reason is structural, not a build problem:
 Consequence for the causal-attention work (P1): it cannot be measured on
 Ascend today. Its prerequisite is not the causal elision itself but an
 a2a3-compatible attention lowering (avoiding acc→vec tmov), or a5 hardware.
+
+
+## The vendor reference: `bench_matmul_ascend.py`
+
+Times `aclnnMatmul` on the same shapes as `pto_run`, so the generated kernel has
+a yardstick rather than a spec sheet. It calls the vendor library only -- it does
+NOT hand-write an AscendC kernel, since generated kernels are the point and
+hand-written AscendC is not a fallback we want.
+
+    source /usr/local/Ascend/cann-9.0.0/set_env.sh
+    python3 bench_matmul_ascend.py 20
+
+Measured on 910c (Ascend910, CANN 9.0.0), f32, median of 20 with the first
+discarded, every result checked against numpy:
+
+| M x K x N | tile-rs PTO | aclnn KEEP_DTYPE | ratio |
+|---|---|---|---|
+| 16 x 896 x 4864 | 207.98 us / 85.6 GB/s | 33.96 us / 524 GB/s | 6.1x |
+| 16 x 1536 x 1536 | 116.04 us / 83.0 GB/s | 30.71 us / 314 GB/s | 3.8x |
+| 16 x 2048 x 11008 | 1036.34 us / 87.8 GB/s | 81.97 us / 1110 GB/s | 12.6x |
+
+Two things this settles. The generated matmul is **4-13x off the vendor**, so
+the Kb/Nb tuning that gained 1.16-1.28x was moving inside a regime an order of
+magnitude from the achievable. And aclnn reaching **1110 GB/s** replaces the
+spec-sheet number the earlier roofline used -- the achievable bandwidth on this
+box is *at least* that, so the generated kernel is nearer 8% of achievable than
+the 11% previously estimated against a published ~800 GB/s.
+
+### Three traps, each of which cost a debugging round
+
+* **An unsourced CANN environment fails as 561103 "Inner Error!"** and nothing
+  more. `aclGetRecentErrMsg` spells it out: "ASCEND_OPP_PATH is null", "opp
+  kernel real path can not be found". Setting `ASCEND_HOME_PATH` and
+  `LD_LIBRARY_PATH` is NOT enough -- `set_env.sh` must be sourced. The bench now
+  prints `aclGetRecentErrMsg` on every failure, because the numeric code alone
+  sent me chasing a tensor-layout bug that did not exist.
+* **An aclnn executor is single-use.** Calling `aclnnMatmul` twice with the same
+  executor segfaults; timing needs `aclSetAclOpExecutorRepeatable`.
+* **An elementwise relative error metric is wrong for GEMM.** These inputs are
+  signed and sum with cancellation, so outputs land near zero and elementwise
+  relative error explodes there -- it flagged correct f32 results as wrong at
+  one shape and not another purely from where the cancellation fell. Compare
+  against the magnitude of the problem: `max|c-ref| / max|ref|`.
