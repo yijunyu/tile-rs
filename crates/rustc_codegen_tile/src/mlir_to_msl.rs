@@ -4353,7 +4353,7 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
 pub const MUL_MV_ILV_QUANTS_PER_LANE: usize = 8;
 /// Output rows per threadgroup, so the activation span is fetched once and
 /// reused across them.
-pub const MUL_MV_ILV_ROWS_PER_TG: usize = 4;
+pub const MUL_MV_ILV_ROWS_PER_TG: usize = 2;
 
 /// Bytes of quants each lane consumes per step. A Q4_0 byte carries TWO
 /// elements -- j in its low nibble and j+16 in its high one -- so 8 bytes is 16
@@ -4378,23 +4378,26 @@ fn emit_mul_mv_q4_0_interleaved_msl(out: &mut String) {
     writeln!(out, "    const uint BLKB = 18u;                 // total bytes: half d + uint8 qs[16]").unwrap();
     writeln!(out, "    const uint BPL  = {}u;                  // quant bytes per lane step", MUL_MV_ILV_Q4_BYTES_PER_LANE).unwrap();
     writeln!(out, "    const uint UPB  = BLKQ / BPL;          // lane steps per block").unwrap();
-    writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_ILV_ROWS_PER_TG).unwrap();
+    writeln!(out, "    const uint ROWS_PER_SG = {}u;   // rows owned by ONE simdgroup", MUL_MV_ILV_ROWS_PER_TG).unwrap();
     writeln!(out).unwrap();
+    writeln!(out, "    uint lane = tid % 32u, sg = tid / 32u;").unwrap();
+    writeln!(out, "    uint nsg  = (tcount + 31u) / 32u;").unwrap();
+    writeln!(out, "    uint rows_per_tg = ROWS_PER_SG * nsg;").unwrap();
     writeln!(out, "    uint tg = row;").unwrap();
-    writeln!(out, "    uint row_tiles = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;").unwrap();
+    writeln!(out, "    uint row_tiles = (n_rows + rows_per_tg - 1u) / rows_per_tg;").unwrap();
     writeln!(out, "    if (tg >= row_tiles * n_cols) return;").unwrap();
     writeln!(out, "    uint m  = tg / row_tiles;").unwrap();
-    writeln!(out, "    uint n0 = (tg % row_tiles) * ROWS_PER_TG;").unwrap();
+    writeln!(out, "    uint n0 = (tg % row_tiles) * rows_per_tg + sg * ROWS_PER_SG;").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint K = blocks_per_row * BLK;").unwrap();
     writeln!(out, "    device const float* x = (device const float*)(p1 + (ulong)m * K);").unwrap();
     writeln!(out, "    uint row_bytes = blocks_per_row * BLKB;").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
-    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
+    writeln!(out, "    float acc[ROWS_PER_SG];").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_SG; ++r) acc[r] = 0.0f;").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint n_unit = blocks_per_row * UPB;").unwrap();
-    writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
+    writeln!(out, "    for (uint u = lane; u < n_unit; u += 32u) {{").unwrap();
     writeln!(out, "        uint b = u / UPB;                  // block").unwrap();
     writeln!(out, "        uint o = (u % UPB) * BPL;          // byte offset inside it").unwrap();
     // The two activation spans a byte run touches: o.. and o+16.., fetched once
@@ -4413,23 +4416,33 @@ fn emit_mul_mv_q4_0_interleaved_msl(out: &mut String) {
     //     leaves 16*n_hi, so pre-scaling its activation by 1/16 cancels it
     //     exactly -- both factors are powers of two, so the rounded product is
     //     the same one n_hi*x would give.
-    writeln!(out, "        float xlo[BPL], xhi[BPL];").unwrap();
-    writeln!(out, "        for (uint j = 0u; j < BPL; ++j) {{").unwrap();
-    writeln!(out, "            xlo[j] = x[b * BLK + o + j];").unwrap();
-    writeln!(out, "            xhi[j] = x[b * BLK + o + j + 16u] * 0.0625f;  // 1/16, exact").unwrap();
+    // FOUR nibbles per load. A ushort spans two quant bytes -- elements j,
+    // j+1, j+16, j+17 -- each at a different bit position, so masking in place
+    // with 000F/00F0/0F00/F000 leaves them scaled by 1/16/256/4096 and the
+    // activations are pre-divided to cancel it. All powers of two, so every
+    // rounded product is the one the unscaled operands would have given.
+    writeln!(out, "        float x0[BPL/2u], x1[BPL/2u], x2[BPL/2u], x3[BPL/2u];").unwrap();
+    writeln!(out, "        for (uint j = 0u; j < BPL / 2u; ++j) {{").unwrap();
+    writeln!(out, "            uint e = b * BLK + o + j * 2u;").unwrap();
+    writeln!(out, "            x0[j] = x[e];").unwrap();
+    writeln!(out, "            x1[j] = x[e + 16u]      * 0.0625f;").unwrap();
+    writeln!(out, "            x2[j] = x[e + 1u]       * 0.00390625f;").unwrap();
+    writeln!(out, "            x3[j] = x[e + 1u + 16u] * 0.000244140625f;").unwrap();
     writeln!(out, "        }}").unwrap();
-    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_SG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
     writeln!(out, "            device const uchar* blk = (device const uchar*)(p0 + (ulong)n * row_bytes + (ulong)b * BLKB);").unwrap();
     // 18b is even, so the half scale is 2-byte aligned and legal to load.
     writeln!(out, "            float d = (float)(*(device const half*)blk);").unwrap();
-    writeln!(out, "            device const uchar* qs = blk + 2u + o;").unwrap();
+    writeln!(out, "            device const ushort* qs = (device const ushort*)(blk + 2u + o);").unwrap();
     writeln!(out, "            float sum = 0.0f;").unwrap();
-    writeln!(out, "            for (uint j = 0u; j < BPL; ++j) {{").unwrap();
-    writeln!(out, "                uint q = (uint)qs[j];").unwrap();
-    writeln!(out, "                sum += ((float)(q & 0x0Fu) - 8.0f) * xlo[j];").unwrap();
-    writeln!(out, "                sum += ((float)(q & 0xF0u) - 128.0f) * xhi[j];  // 16*(n_hi-8) against x/16").unwrap();
+    writeln!(out, "            for (uint j = 0u; j < BPL / 2u; ++j) {{").unwrap();
+    writeln!(out, "                uint v = (uint)qs[j];").unwrap();
+    writeln!(out, "                sum += ((float)(v & 0x000Fu) -     8.0f) * x0[j];").unwrap();
+    writeln!(out, "                sum += ((float)(v & 0x00F0u) -   128.0f) * x1[j];").unwrap();
+    writeln!(out, "                sum += ((float)(v & 0x0F00u) -  2048.0f) * x2[j];").unwrap();
+    writeln!(out, "                sum += ((float)(v & 0xF000u) - 32768.0f) * x3[j];").unwrap();
     writeln!(out, "            }}").unwrap();
     writeln!(out, "            acc[r] += d * sum;").unwrap();
     writeln!(out, "        }}").unwrap();
@@ -4451,30 +4464,33 @@ fn emit_mul_mv_q8_0_interleaved_msl(out: &mut String) {
     writeln!(out, "    const uint BLKB = 34u;                 // BYTES per block: half d + int8 qs[32]").unwrap();
     writeln!(out, "    const uint QPL  = {}u;                  // quants per lane step", MUL_MV_ILV_QUANTS_PER_LANE).unwrap();
     writeln!(out, "    const uint UPB  = BLK / QPL;           // lane steps per block").unwrap();
-    writeln!(out, "    const uint ROWS_PER_TG = {}u;", MUL_MV_ILV_ROWS_PER_TG).unwrap();
+    writeln!(out, "    const uint ROWS_PER_SG = {}u;   // rows owned by ONE simdgroup", MUL_MV_ILV_ROWS_PER_TG).unwrap();
     writeln!(out).unwrap();
+    writeln!(out, "    uint lane = tid % 32u, sg = tid / 32u;").unwrap();
+    writeln!(out, "    uint nsg  = (tcount + 31u) / 32u;").unwrap();
+    writeln!(out, "    uint rows_per_tg = ROWS_PER_SG * nsg;").unwrap();
     writeln!(out, "    uint tg = row;").unwrap();
-    writeln!(out, "    uint row_tiles = (n_rows + ROWS_PER_TG - 1u) / ROWS_PER_TG;").unwrap();
+    writeln!(out, "    uint row_tiles = (n_rows + rows_per_tg - 1u) / rows_per_tg;").unwrap();
     writeln!(out, "    if (tg >= row_tiles * n_cols) return;").unwrap();
     writeln!(out, "    uint m  = tg / row_tiles;              // activation column").unwrap();
-    writeln!(out, "    uint n0 = (tg % row_tiles) * ROWS_PER_TG;").unwrap();
+    writeln!(out, "    uint n0 = (tg % row_tiles) * rows_per_tg + sg * ROWS_PER_SG;").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint K = blocks_per_row * BLK;").unwrap();
     writeln!(out, "    device const float* x = (device const float*)(p1 + (ulong)m * K);").unwrap();
     writeln!(out, "    uint row_bytes = blocks_per_row * BLKB;").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "    float acc[ROWS_PER_TG];").unwrap();
-    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) acc[r] = 0.0f;").unwrap();
+    writeln!(out, "    float acc[ROWS_PER_SG];").unwrap();
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_SG; ++r) acc[r] = 0.0f;").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "    uint n_unit = blocks_per_row * UPB;").unwrap();
-    writeln!(out, "    for (uint u = tid; u < n_unit; u += tcount) {{").unwrap();
+    writeln!(out, "    for (uint u = lane; u < n_unit; u += 32u) {{").unwrap();
     writeln!(out, "        uint b = u / UPB;                  // block").unwrap();
     writeln!(out, "        uint o = (u % UPB) * QPL;          // quant offset inside it").unwrap();
     writeln!(out, "        float xv[QPL];                     // fetched once for all rows").unwrap();
     writeln!(out, "        for (uint j = 0u; j < QPL; ++j) xv[j] = x[b * BLK + o + j];").unwrap();
     // Same compile-time-bound rule as the planar kernel: a runtime bound stops
     // the unroll, acc[] goes dynamically indexed and spills, and that cost 3x.
-    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
+    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_SG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
     writeln!(out, "            if (n >= n_rows) break;").unwrap();
     writeln!(out, "            device const char* blk = p0 + (ulong)n * row_bytes + (ulong)b * BLKB;").unwrap();
@@ -4495,29 +4511,19 @@ fn emit_mul_mv_q8_0_interleaved_msl(out: &mut String) {
 /// Shared by both interleaved mat-vecs: reduce acc[] within each simdgroup,
 /// then across simdgroups through threadgroup memory, then write back.
 fn emit_mul_mv_reduce_msl(out: &mut String) {
-    writeln!(out, "    // simdgroup reduction, then across simdgroups through shared memory").unwrap();
-    writeln!(out, "    constexpr uint MAX_SG = 1024u / 32u;").unwrap();
-    writeln!(out, "    threadgroup float mv_shared[ROWS_PER_TG][MAX_SG];").unwrap();
-    writeln!(out, "    uint lane = tid % 32u;").unwrap();
-    writeln!(out, "    uint sg   = tid / 32u;").unwrap();
-    writeln!(out, "    uint n_sg = (tcount + 31u) / 32u;").unwrap();
-    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
-    writeln!(out, "        if (sg == 0u && lane < MAX_SG) mv_shared[r][lane] = 0.0f;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
-    writeln!(out, "        float v = simd_sum(acc[r]);").unwrap();
-    writeln!(out, "        if (lane == 0u) mv_shared[r][sg] = v;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    if (sg == 0u) {{").unwrap();
-    writeln!(out, "        for (uint r = 0u; r < ROWS_PER_TG; ++r) {{").unwrap();
-    writeln!(out, "            uint n = n0 + r;").unwrap();
-    writeln!(out, "            if (n >= n_rows) break;").unwrap();
-    writeln!(out, "            float t = 0.0f;").unwrap();
-    writeln!(out, "            for (uint i = 0u; i < n_sg; ++i) t += mv_shared[r][i];").unwrap();
-    writeln!(out, "            if (lane == 0u) p2[(ulong)m * n_rows + n] = t;").unwrap();
-    writeln!(out, "        }}").unwrap();
+    // Rows belong to a SIMDGROUP, so simd_sum finishes one. Nothing crosses
+    // simdgroups: no threadgroup memory, no barriers.
+    //
+    // The previous form split every row across ALL simdgroups and reduced
+    // through shared memory -- two barriers and a round trip per tile. It is
+    // also why this kernel used ~4x ggml's threads for the same work while
+    // running slower: each thread carried a quarter of the useful work and all
+    // of the reduction overhead.
+    writeln!(out, "    for (uint r = 0u; r < ROWS_PER_SG; ++r) {{").unwrap();
+    writeln!(out, "        uint n = n0 + r;").unwrap();
+    writeln!(out, "        if (n >= n_rows) break;").unwrap();
+    writeln!(out, "        float t = simd_sum(acc[r]);").unwrap();
+    writeln!(out, "        if (lane == 0u) p2[(ulong)m * n_rows + n] = t;").unwrap();
     writeln!(out, "    }}").unwrap();
 }
 
@@ -16366,9 +16372,13 @@ module {
     fn test_msl_q4_0_interleaved_inner_loop_is_lean() {
         let msl = convert_mlir_to_msl(crate::mlir_parse::MATVEC_Q4_0_INTERLEAVED_MLIR)
             .expect("the interleaved Q4_0 mat-vec must lower");
-        assert!(msl.contains("sum += ((float)(q & 0xF0u) - 128.0f) * xhi[j];"),
-            "the high nibble must be masked in place, not shifted:\n{}", msl);
-        assert!(!msl.contains("q >> 4u"),
+        // FOUR nibbles per ushort load, each masked at its own bit position.
+        assert!(msl.contains("device const ushort* qs = (device const ushort*)(blk + 2u + o);"),
+            "quants must be read two bytes at a time:\n{}", msl);
+        for m in ["0x000Fu", "0x00F0u", "0x0F00u", "0xF000u"] {
+            assert!(msl.contains(m), "missing in-place mask {}:\n{}", m, msl);
+        }
+        assert!(!msl.contains("q >> 4u") && !msl.contains(">> 8u"),
             "no shift belongs in the inner loop:\n{}", msl);
         // The zero point STAYS per element. Factoring it into a row-level
         // term over a hoisted activation sum -- which is what ggml does and
@@ -16379,6 +16389,10 @@ module {
             "the zero point stays per element -- hoisting it measured worse:\n{}", msl);
         assert!(!msl.contains("sumy"),
             "no hoisted activation sum; it was measured and reverted:\n{}", msl);
+        // Rows belong to a simdgroup, so simd_sum finishes one and nothing
+        // crosses simdgroups.
+        assert!(!msl.contains("threadgroup_barrier") && !msl.contains("mv_shared"),
+            "the mat-vec must not reduce across simdgroups:\n{}", msl);
     }
 
     #[test]
@@ -16407,8 +16421,10 @@ module {
             "a char4 load off the weight buffer is misaligned on odd blocks:\n{}", msl);
 
         // Same compile-time-bound rule as every other mat-vec here.
-        assert!(msl.contains("for (uint r = 0u; r < ROWS_PER_TG; ++r)"),
+        assert!(msl.contains("for (uint r = 0u; r < ROWS_PER_SG; ++r)"),
             "the row bound must stay a constant or acc[] spills:\n{}", msl);
+        assert!(!msl.contains("threadgroup_barrier") && !msl.contains("mv_shared"),
+            "the mat-vec must not reduce across simdgroups:\n{}", msl);
 
         // Dump for the ggml-metal integration, which has to bind these buffers
         // by hand rather than through the tilers backend's chain runner.
