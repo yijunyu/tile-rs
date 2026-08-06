@@ -207,9 +207,33 @@ entry `tile_attn_s(q,k,v,o,scratch)` and allocates the S x S GM scratch buffer.
 The two variants do NOT share a signature, which is why running the plain
 harness against the scratch kernel silently built nothing.
 
-So the ordering is: resolve `exp` in the device link, then the plain variant's
-Acc->Vec move (or retire it in favour of the scratch path). The budget and reuse
-work above is necessary but was never sufficient.
+### Chasing `undefined symbol: exp` -- what it is NOT
+
+Three plausible explanations, all falsified on device, recorded so nobody spends
+the rounds again:
+
+* **Not the CPU fallback.** `pto/cpu/TExp.hpp` calls libm `exp`, but the whole
+  CPU section of `pto_instr_impl.hpp` is behind `#ifdef __CPU_SIM`, which this
+  build does not define.
+* **Not a missing arch macro.** The a2a3 section is behind
+  `#ifdef PTO_NPU_ARCH_A2A3` and does include `npu/a2a3/TUnaryOp.hpp` (line 91),
+  whose `TEXP_IMPL` uses the `vexp` hardware intrinsic -- no libm. Adding
+  `-DPTO_NPU_ARCH_A2A3` changes nothing, and matmul builds and runs correctly
+  WITHOUT it, which proves the a2a3 branch is already active by some other
+  route.
+* **Not cube-vs-vector core.** `vexp` is a vector intrinsic and attention mixes
+  cube (`tmatmul`) with vector (softmax) work, so `--cce-aicore-arch` looked
+  like the answer. Both `dav-c220-cube` and `dav-c220-vec` fail identically.
+
+`ptoas` emits `TEXP(v72, v69)`; `TEXP` -> `MAP_INSTR_IMPL(TEXP, ...)` ->
+`TEXP_IMPL`. Somewhere in that chain a `TEXP_IMPL` that calls scalar `exp` is
+being selected over the `vexp` one. **The next diagnostic is to preprocess
+(`ccec -E`) and see which `TEXP_IMPL` actually survives, or `nm` the object for
+the referencing symbol** -- rather than guessing at another cause.
+
+So the ordering is: identify which `TEXP_IMPL` is selected, then the plain
+variant's Acc->Vec move (or retire it in favour of the scratch path). The budget
+and reuse work above is necessary but was never sufficient.
 
 The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
 `attention.REJECTED` instead of panicking, so the UB boundary can be probed.
