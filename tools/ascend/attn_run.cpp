@@ -36,10 +36,24 @@
 #endif
 
 // Launchable entry wrapping the ptoas-generated device function.
+//
+// Two attention variants exist and they do NOT have the same signature. The
+// plain one is tile_attn(q,k,v,o); the scratch one is
+// tile_attn_s(q,k,v,o,scratch) and routes the score matrix through GM instead
+// of an Acc->Vec tmov -- which a2a3 rejects, so the plain variant does not
+// compile at any shape. Build with -DPTO_ATTN_SCRATCH for the working one.
+#ifdef PTO_ATTN_SCRATCH
+extern "C" __global__ AICORE void pto_entry(__gm__ float *q, __gm__ float *k,
+                                            __gm__ float *v, __gm__ float *o,
+                                            __gm__ float *scr) {
+  tile_attn_s(q, k, v, o, scr);
+}
+#else
 extern "C" __global__ AICORE void pto_entry(__gm__ float *q, __gm__ float *k,
                                             __gm__ float *v, __gm__ float *o) {
   tile_attn(q, k, v, o);
 }
+#endif
 
 #define CHECK(expr)                                                            \
   do {                                                                         \
@@ -56,6 +70,8 @@ int main(int argc, char **argv) {
   const size_t na = (size_t)PTO_M * PTO_K, nb = (size_t)PTO_M * PTO_K,
                nc = (size_t)PTO_M * PTO_K;
   const size_t nv = (size_t)PTO_M * PTO_K;
+  // Score matrix staged in GM: S x S.
+  const size_t nscr = (size_t)PTO_M * PTO_M;
 
   CHECK(aclInit(nullptr));
   CHECK(aclrtSetDevice(0));
@@ -73,18 +89,26 @@ int main(int argc, char **argv) {
 
   std::vector<float> hv(nv);
   for (auto &x : hv) x = rnd();
+  void *dscr = nullptr;
   void *da, *db, *dc, *dv;
   CHECK(aclrtMalloc(&da, na * 4, ACL_MEM_MALLOC_HUGE_FIRST));
   CHECK(aclrtMalloc(&db, nb * 4, ACL_MEM_MALLOC_HUGE_FIRST));
   CHECK(aclrtMalloc(&dc, nc * 4, ACL_MEM_MALLOC_HUGE_FIRST));
   CHECK(aclrtMalloc(&dv, nv * 4, ACL_MEM_MALLOC_HUGE_FIRST));
+#ifdef PTO_ATTN_SCRATCH
+  CHECK(aclrtMalloc(&dscr, nscr * 4, ACL_MEM_MALLOC_HUGE_FIRST));
+#endif
   CHECK(aclrtMemcpy(dv, nv * 4, hv.data(), nv * 4, ACL_MEMCPY_HOST_TO_DEVICE));
   CHECK(aclrtMemcpy(da, na * 4, ha.data(), na * 4, ACL_MEMCPY_HOST_TO_DEVICE));
   CHECK(aclrtMemcpy(db, nb * 4, hb.data(), nb * 4, ACL_MEMCPY_HOST_TO_DEVICE));
 
   // warm-up (first launch pays kernel load)
   pto_entry<<<1, nullptr, stream>>>((__gm__ float *)da, (__gm__ float *)db,
-                                    (__gm__ float *)dv, (__gm__ float *)dc);
+                                    (__gm__ float *)dv, (__gm__ float *)dc
+#ifdef PTO_ATTN_SCRATCH
+                                    , (__gm__ float *)dscr
+#endif
+                                    );
   CHECK(aclrtSynchronizeStream(stream));
 
   std::vector<double> us;
@@ -94,7 +118,11 @@ int main(int argc, char **argv) {
     CHECK(aclrtCreateEvent(&end));
     CHECK(aclrtRecordEvent(beg, stream));
     pto_entry<<<1, nullptr, stream>>>((__gm__ float *)da, (__gm__ float *)db,
-                                      (__gm__ float *)dv, (__gm__ float *)dc);
+                                      (__gm__ float *)dv, (__gm__ float *)dc
+#ifdef PTO_ATTN_SCRATCH
+                                      , (__gm__ float *)dscr
+#endif
+                                      );
     CHECK(aclrtRecordEvent(end, stream));
     CHECK(aclrtSynchronizeStream(stream));
     float ms = 0.f;

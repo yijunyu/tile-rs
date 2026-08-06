@@ -190,8 +190,26 @@ budget work. **The dump test only ever checked that .pto TEXT is produced --
 nothing compiled it.** The matmul path is unaffected and still correct on device
 (57.00 us at 16x2048x11008, MATCHES-CPU).
 
-So the ordering is: fix the Acc->Vec move first; the budget and reuse work above
-is necessary but was never sufficient.
+**The scratch variant is the one that works -- and it was never compiled either.**
+`attention_scratch` routes the score matrix through GM (`tstore` then `tload`)
+instead of an `Acc -> Vec` `tmov`, so it emits only the legal `mat->left` /
+`mat->right` moves. It type-checks at both 16x16 and 64x64 where the plain
+variant fails the static assert. It then stops one step later:
+
+    ld.lld: error: undefined symbol: exp
+
+`pto.texp` lowers to a call to `exp` that nothing provides in the CCE device
+link. That is the current frontier: the kernel is type-correct and the remaining
+gap is a math symbol, not a structural one.
+
+`attn_run.cpp` builds either variant -- `-DPTO_ATTN_SCRATCH` selects the 5-arg
+entry `tile_attn_s(q,k,v,o,scratch)` and allocates the S x S GM scratch buffer.
+The two variants do NOT share a signature, which is why running the plain
+harness against the scratch kernel silently built nothing.
+
+So the ordering is: resolve `exp` in the device link, then the plain variant's
+Acc->Vec move (or retire it in favour of the scratch path). The budget and reuse
+work above is necessary but was never sufficient.
 
 The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
 `attention.REJECTED` instead of panicking, so the UB boundary can be probed.
