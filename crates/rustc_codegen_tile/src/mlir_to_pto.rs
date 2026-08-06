@@ -2549,6 +2549,24 @@ fn translate_batched(
         return Err(format!("{name}: head count is 0 or unresolved in: {line}"));
     }
 
+    // KNOWN LIMIT, verified on device: the STORE is not inside this loop.
+    //
+    // The batched call and the `__tile_store_f32` that consumes its result are
+    // separate MLIR calls, so the store is translated after this function
+    // returns and lands after the loop closes. The loop then computes every
+    // head but only the last survives, and it goes to a fixed address.
+    //
+    // Measured on 910B2 (bin/batched_heads.rs + a per-head parity check): head 0
+    // correct at 3.7e-09, heads 1..5 completely untouched — 1024/1024 elements
+    // still holding the poison sentinel. A timing run would NOT have caught
+    // this: the launches collapse either way, so the speedup looks real while
+    // five sixths of the output is missing.
+    //
+    // Closing it means the batched stage must own its store — either by taking
+    // the destination as an argument and emitting tstore inside the loop, or by
+    // fusing the following tile_store into this translation. Both are more
+    // invasive than the offset plumbing below, which is done and correct.
+    //
     // Rows each head advances by. The partition_view row offset is what
     // `make_pv` derives from a flat element offset, so a head's slice is
     // `h * (stride / cols)` rows down — expressed against the loop induction
