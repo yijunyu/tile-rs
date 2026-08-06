@@ -138,6 +138,8 @@ enum KernelType {
     MulMvQ8_0Interleaved,
     /// The GEMM over the same native interleaved blocks. Three buffers.
     MulMmQ8_0Interleaved,
+    /// The same GEMM at MM_TILE_SMALL, for narrow outputs.
+    MulMmQ8_0InterleavedSmall,
     MulMmQ8_0Planar, // FUSED Q8_0 mat-MAT over repacked planes: a cooperative
                      // GEMM. Each THREADGROUP owns a tile and stages both
                      // operands in threadgroup memory, so a weight load serves
@@ -622,7 +624,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::AttentionGqa => 4,  // q, k, v, out
         KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar => 4, // quants, scales, activations, out
         // Interleaved carries its scales inside the weight buffer, so three.
-        KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved => 3, // weights, activations, out
+        KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved
+        | KernelType::MulMmQ8_0InterleavedSmall => 3, // weights, activations, out
         KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi => 2, // src bytes, dst f32
         KernelType::BroadcastRow => 2, // src (R x 1), dst (R x C)
         KernelType::Rope       => 2,    // src, dst
@@ -990,7 +993,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // negative weight into a large positive one.
             else if ctx.kernel_type == KernelType::MulMvQ8_0Planar && i == 0 { "char" }
             else if ctx.kernel_type == KernelType::MulMmQ8_0Planar && i == 0 { "char" }
-            else if matches!(ctx.kernel_type, KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved) && i == 0 { "char" }
+            else if matches!(ctx.kernel_type, KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved | KernelType::MulMmQ8_0InterleavedSmall) && i == 0 { "char" }
             // Q4_0 nibbles are UNSIGNED bytes; the zero point is subtracted
             // after unpacking, so signing them here would corrupt the high half.
             else if ctx.kernel_type == KernelType::MulMvQ4_0Planar && i == 0 { "uint" }
@@ -1109,7 +1112,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 1).unwrap();
         }
         KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar
-        | KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved => {
+        | KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved
+        | KernelType::MulMmQ8_0InterleavedSmall => {
             writeln!(out, "    constant uint& n_rows         [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& blocks_per_row [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& n_cols         [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2303,6 +2307,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::BroadcastRow | KernelType::UnpackNibblesLo | KernelType::UnpackNibblesHi
             | KernelType::MulMvQ8_0Planar | KernelType::MulMvQ4_0Planar | KernelType::MulMmQ8_0Planar
             | KernelType::MulMvQ8_0Interleaved | KernelType::MulMmQ8_0Interleaved
+            | KernelType::MulMmQ8_0InterleavedSmall
         | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
             | KernelType::RopeDsv4
             | KernelType::Dsv4RopeTailF32
@@ -2557,6 +2562,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::MulMmQ8_0Planar => emit_mul_mm_q8_0_planar_msl(out),
         KernelType::MulMvQ8_0Interleaved => emit_mul_mv_q8_0_interleaved_msl(out),
         KernelType::MulMmQ8_0Interleaved => emit_mul_mm_q8_0_interleaved_msl(out),
+        KernelType::MulMmQ8_0InterleavedSmall => emit_mul_mm_q8_0_interleaved_small_msl(out),
         KernelType::UnpackNibblesLo => emit_unpack_nibbles_msl(out, msl_type, false),
         KernelType::UnpackNibblesHi => emit_unpack_nibbles_msl(out, msl_type, true),
         KernelType::BroadcastRow => emit_broadcast_row_msl(out, msl_type),
@@ -2967,6 +2973,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) -> Result<(), Stri
                 "__tile_mul_mm_q8_0_planar_f32" => { ctx.kernel_type = KernelType::MulMmQ8_0Planar; }
                 "__tile_mul_mv_q8_0_interleaved_f32" => { ctx.kernel_type = KernelType::MulMvQ8_0Interleaved; }
                 "__tile_mul_mm_q8_0_interleaved_f32" => { ctx.kernel_type = KernelType::MulMmQ8_0Interleaved; }
+                "__tile_mul_mm_q8_0_interleaved_small_f32" => { ctx.kernel_type = KernelType::MulMmQ8_0InterleavedSmall; }
                 "__tile_unpack_nibbles_lo_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesLo; } }
                 "__tile_unpack_nibbles_hi_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::UnpackNibblesHi; } }
                 "__tile_broadcast_row_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::BroadcastRow; } }
@@ -4104,8 +4111,6 @@ fn emit_mul_mv_q4_0_planar_msl(out: &mut String) {
 /// kernel is barrier-bound rather than compute-bound -- measured 13x slower
 /// than ggml. A micro-tile raises the work per barrier by `RT*CT` while reading
 /// `RT + CT` values from the stage instead of `RT*CT`.
-pub const MUL_MM_TN: usize = 128;
-pub const MUL_MM_TM: usize = 128;
 pub const MUL_MM_RT: usize = 4;
 pub const MUL_MM_CT: usize = 2;
 
@@ -4116,13 +4121,31 @@ pub const MUL_MM_CT: usize = 2;
 /// K=14336 row. That count is invariant to every other knob here, which is
 /// exactly the invariance three separate sweeps kept reporting. Staging KC
 /// blocks per round divides it by KC, at KC times the threadgroup memory.
-pub const MUL_MM_KC: usize = 1;
+/// A GEMM tile. No single one wins across shapes -- measured against
+/// ggml-metal's mul_mm, the 128x128 tile is 1.16x at 4096x14336 but 1.94x at
+/// 128 output rows, while 64x32 is 1.28x at 128 rows and 1.66x at 4096x14336.
+/// So the emitter produces both and the dispatch picks by output row count.
+#[derive(Clone, Copy)]
+pub struct MmTile {
+    pub tn: usize,
+    pub tm: usize,
+    pub kc: usize,
+    pub sgm: usize,
+    pub sgn: usize,
+    /// Suffix on the kernel name, so both live in one library.
+    pub name: &'static str,
+}
+
+/// For wide outputs -- the FFN and the vocabulary projection.
+pub const MM_TILE_LARGE: MmTile = MmTile { tn: 128, tm: 128, kc: 1, sgm: 1, sgn: 16, name: "" };
+/// For narrow outputs -- attention and KV projections, where a 128-wide row
+/// tile is mostly waste.
+pub const MM_TILE_SMALL: MmTile = MmTile { tn: 64, tm: 32, kc: 1, sgm: 1, sgn: 8, name: "_small" };
+
 /// The simdgroup grid, SGM along activation columns x SGN along weight rows.
 /// This is what sets the register tile: a simdgroup loads MI `a` tiles and NI
 /// `b` tiles to produce MI*NI products, so a SQUARE grid does the fewest loads
 /// per product. A 1-D grid (SGN=1) does MI*NI + 1.
-pub const MUL_MM_SGM: usize = 1;
-pub const MUL_MM_SGN: usize = 16;
 
 /// Fused Q8_0 mat-MAT over the repacked planes: a cooperative GEMM.
 ///
@@ -4136,41 +4159,45 @@ pub const MUL_MM_SGN: usize = 16;
 /// inner product is plain f32 and each weight is unpacked once per tile rather
 /// than once per output element.
 fn emit_mul_mm_q8_0_planar_msl(out: &mut String) {
-    emit_mul_mm_q8_0_msl(out, false)
+    emit_mul_mm_q8_0_msl(out, false, MM_TILE_LARGE)
 }
 
 /// The same GEMM over ggml's NATIVE INTERLEAVED blocks. Only the weight STAGING
 /// differs -- once staged as half in threadgroup memory the contraction is
 /// byte-for-byte the same code, so both layouts share every tuned constant.
 fn emit_mul_mm_q8_0_interleaved_msl(out: &mut String) {
-    emit_mul_mm_q8_0_msl(out, true)
+    emit_mul_mm_q8_0_msl(out, true, MM_TILE_LARGE)
 }
 
-fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool) {
+fn emit_mul_mm_q8_0_interleaved_small_msl(out: &mut String) {
+    emit_mul_mm_q8_0_msl(out, true, MM_TILE_SMALL)
+}
+
+fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool, t: MmTile) {
     // Hardware matrix tiles are 8x8. TM sets the simdgroup count (one per 8
     // output columns of the activation side), TN the accumulators per
     // simdgroup. Both must be multiples of 8 or the tiling does not close.
-    assert!(MUL_MM_TM % 8 == 0 && MUL_MM_TN % 8 == 0,
+    assert!(t.tm % 8 == 0 && t.tn % 8 == 0,
         "simdgroup tiles are 8x8: TN={} TM={} must both be multiples of 8",
-        MUL_MM_TN, MUL_MM_TM);
-    let nsg = MUL_MM_SGM * MUL_MM_SGN;
+        t.tn, t.tm);
+    let nsg = t.sgm * t.sgn;
     assert!(nsg * 32 <= 1024,
         "SGM={} x SGN={} needs {} threads, over the 1024 limit",
-        MUL_MM_SGM, MUL_MM_SGN, nsg * 32);
-    assert!(MUL_MM_TM % (8 * MUL_MM_SGM) == 0 && MUL_MM_TN % (8 * MUL_MM_SGN) == 0,
+        t.sgm, t.sgn, nsg * 32);
+    assert!(t.tm % (8 * t.sgm) == 0 && t.tn % (8 * t.sgn) == 0,
         "the simdgroup grid must tile the output in whole 8x8 blocks: \
          TM={} % (8*SGM={}) and TN={} % (8*SGN={})",
-        MUL_MM_TM, MUL_MM_SGM, MUL_MM_TN, MUL_MM_SGN);
+        t.tm, t.sgm, t.tn, t.sgn);
     // Both stages AND the result scratch are live at once, so the scratch is
     // part of the budget -- it is what ruled out a full TM x TN result buffer.
     const TG_LIMIT: usize = 32768;
     // The weight stage is [k][n] so its pad is on n, the activation stage is
     // [m][k] so its pad is on k. Both are half.
-    let staged = (MUL_MM_KC * 32 * (MUL_MM_TN + 1) + MUL_MM_TM * MUL_MM_KC * 33) * 2;
+    let staged = (t.kc * 32 * (t.tn + 1) + t.tm * t.kc * 33) * 2;
     let scratch = nsg * 64 * 4;
     assert!(staged + scratch <= TG_LIMIT,
         "GEMM needs {} B staged + {} B result scratch (TN={} TM={} KC={}), limit {}",
-        staged, scratch, MUL_MM_TN, MUL_MM_TM, MUL_MM_KC, TG_LIMIT);
+        staged, scratch, t.tn, t.tm, t.kc, TG_LIMIT);
 
     writeln!(out, "    constexpr uint BLK = 32u;              // weights per block").unwrap();
     writeln!(out, "    constexpr uint PAD = BLK + 1u;         // pad: bank conflicts").unwrap();
@@ -4178,11 +4205,11 @@ fn emit_mul_mm_q8_0_msl(out: &mut String, interleaved: bool) {
     if interleaved {
         writeln!(out, "    constexpr uint BLKB = 34u;             // BYTES per block: half d + int8 qs[32]").unwrap();
     }
-    writeln!(out, "    constexpr uint TN  = {}u;              // weight rows per threadgroup", MUL_MM_TN).unwrap();
-    writeln!(out, "    constexpr uint TM  = {}u;              // activation cols per threadgroup", MUL_MM_TM).unwrap();
-    writeln!(out, "    constexpr uint KC  = {}u;              // K-blocks per barrier round", MUL_MM_KC).unwrap();
-    writeln!(out, "    constexpr uint SGM = {}u;              // simdgroups along columns", MUL_MM_SGM).unwrap();
-    writeln!(out, "    constexpr uint SGN = {}u;              // simdgroups along rows", MUL_MM_SGN).unwrap();
+    writeln!(out, "    constexpr uint TN  = {}u;              // weight rows per threadgroup", t.tn).unwrap();
+    writeln!(out, "    constexpr uint TM  = {}u;              // activation cols per threadgroup", t.tm).unwrap();
+    writeln!(out, "    constexpr uint KC  = {}u;              // K-blocks per barrier round", t.kc).unwrap();
+    writeln!(out, "    constexpr uint SGM = {}u;              // simdgroups along columns", t.sgm).unwrap();
+    writeln!(out, "    constexpr uint SGN = {}u;              // simdgroups along rows", t.sgn).unwrap();
     writeln!(out, "    constexpr uint NSG = SGM * SGN;").unwrap();
     writeln!(out, "    constexpr uint MI  = TM / (8u * SGM);  // a-tiles per simdgroup").unwrap();
     writeln!(out, "    constexpr uint NI  = TN / (8u * SGN);  // b-tiles per simdgroup").unwrap();
@@ -16147,11 +16174,18 @@ module {
 
         // The contraction is shared, not reimplemented.
         for line in ["simdgroup_half8x8 ma[MI], mb[NI];",
-                     "simdgroup_multiply_accumulate(acc[i * NI + j], ma[i], mb[j], acc[i * NI + j]);",
-                     "constexpr uint TN  = 128u;",
-                     "constexpr uint TM  = 128u;"] {
+                     "simdgroup_multiply_accumulate(acc[i * NI + j], ma[i], mb[j], acc[i * NI + j]);"] {
             assert!(ilv.contains(line) && planar.contains(line),
                 "both layouts must share the contraction, missing {:?}", line);
+        }
+        // The tile constants must AGREE, not equal any particular value --
+        // pinning them here made every sweep of the tile fail to generate,
+        // which reads as "the config is invalid" rather than "the test is".
+        for key in ["constexpr uint TN  =", "constexpr uint TM  =",
+                    "constexpr uint SGM =", "constexpr uint SGN ="] {
+            let pick = |m: &str| m[m.find(key).expect(key)..].lines().next().unwrap().to_string();
+            assert_eq!(pick(&ilv), pick(&planar),
+                "both layouts must share the tile, differing at {:?}", key);
         }
 
         if let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") {
@@ -16169,17 +16203,36 @@ module {
         if let Ok(dir) = std::env::var("TILERS_METAL_HEADER_DIR") {
             let mv = convert_mlir_to_msl(crate::mlir_parse::MATVEC_Q8_0_INTERLEAVED_MLIR)
                 .expect("the interleaved mat-vec must lower");
-            let body = match ilv.find("kernel void") {
-                Some(i) => &ilv[i..],
-                None => panic!("no kernel in the generated GEMM:\n{}", ilv),
+            let strip = |m: &str| match m.find("kernel void") {
+                Some(i) => m[i..].to_string(),
+                None => panic!("no kernel in the generated source:\n{}", m),
             };
+            let body = strip(&ilv);
+            let small = convert_mlir_to_msl(crate::mlir_parse::MATMAT_Q8_0_INTERLEAVED_SMALL_MLIR)
+                .expect("the small interleaved GEMM must lower");
+            let small_body = strip(&small);
+            // The GRID must be derived from the same constants the kernel was
+            // emitted with. Hardcoding them on the dispatch side let a tile
+            // sweep silently run the wrong grid -- fewer threadgroups than the
+            // output needs -- which measured 2x FASTER than ggml because it was
+            // computing a fraction of the work.
             let h = format!(
                 "// Generated by tile-rs mlir_to_msl -- DO NOT EDIT\n\
                  // MATVEC_Q8_0_INTERLEAVED_MLIR -> KernelType::MulMvQ8_0Interleaved\n\
                  // MATMAT_Q8_0_INTERLEAVED_MLIR -> KernelType::MulMmQ8_0Interleaved\n\
                  #pragma once\n\n\
-                 static const char * TILERS_MSL_SRC = R\"TILERS(\n{}\n\n{}\n)TILERS\";\n",
-                mv, body);
+                 #define TILERS_MV_ROWS_PER_TG   {}\n\
+                 #define TILERS_MM_TN            {}\n\
+                 #define TILERS_MM_TM            {}\n\
+                 #define TILERS_MM_THREADS       {}\n\
+                 #define TILERS_MM_S_TN          {}\n\
+                 #define TILERS_MM_S_TM          {}\n\
+                 #define TILERS_MM_S_THREADS     {}\n\n\
+                 static const char * TILERS_MSL_SRC = R\"TILERS(\n{}\n\n{}\n\n{}\n)TILERS\";\n",
+                MUL_MV_ILV_ROWS_PER_TG,
+                MM_TILE_LARGE.tn, MM_TILE_LARGE.tm, MM_TILE_LARGE.sgm * MM_TILE_LARGE.sgn * 32,
+                MM_TILE_SMALL.tn, MM_TILE_SMALL.tm, MM_TILE_SMALL.sgm * MM_TILE_SMALL.sgn * 32,
+                mv, body, small_body);
             std::fs::write(format!("{}/tilers-generated.h", dir), h).unwrap();
         }
     }

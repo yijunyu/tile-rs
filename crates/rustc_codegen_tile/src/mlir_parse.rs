@@ -2141,6 +2141,20 @@ module {
 }
 "#;
 
+/// The same interleaved GEMM at MM_TILE_SMALL, for narrow outputs.
+pub const MATMAT_Q8_0_INTERLEAVED_SMALL_MLIR: &str = r#"
+module {
+  llvm.func @mulmm_q8_0_interleaved_small(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %nrows = llvm.mlir.constant(128 : i32) : i32
+    %bpr = llvm.mlir.constant(28 : i32) : i32
+    %ncols = llvm.mlir.constant(512 : i32) : i32
+    llvm.call @__tile_mul_mm_q8_0_interleaved_small_f32(%arg0, %arg1, %arg2, %nrows, %bpr, %ncols) : (!llvm.ptr<1>, !llvm.ptr<1>, !llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+
 /// The FUSED Q4_0 mul_mv. One compute intrinsic, like its Q8_0 sibling.
 pub const MATVEC_Q4_0_FUSED_MLIR: &str = r#"
 module {

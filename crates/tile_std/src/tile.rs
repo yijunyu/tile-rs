@@ -2059,7 +2059,15 @@ pub fn __tile_mul_mm_q8_0_interleaved_f32(
     _n_rows: i32, _blocks_per_row: i32, _n_cols: i32,
 ) {
 }
-    /// Low 4 bits of each packed byte, as f32 in `0..=15`. `R x C -> R x C`.
+
+
+/// The same interleaved GEMM at MM_TILE_SMALL, for narrow outputs.
+#[unsafe(no_mangle)]
+pub fn __tile_mul_mm_q8_0_interleaved_small_f32(
+    _w: *const u8, _x: *const f32, _out: *mut f32,
+    _n_rows: i32, _blocks_per_row: i32, _n_cols: i32,
+) {
+}    /// Low 4 bits of each packed byte, as f32 in `0..=15`. `R x C -> R x C`.
     ///
     /// Paired with [`__tile_unpack_nibbles_hi_f32`]. Deliberately TWO ops
     /// returning same-shaped halves rather than one `R x 2C` op: composing a
