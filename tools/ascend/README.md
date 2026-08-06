@@ -147,11 +147,25 @@ that size one core genuinely is all the work -- but it does not scale:
                  > UB_SIZE 262144B
     S=512 D=128  REJECTED: 524288B > UB_SIZE 262144B
 
-So attention is a single-tile proof of concept, not a usable kernel. Making it
-one is a different job from the matmul fix: the matmul was already blocked and
-already parallel and merely launched wrong, whereas attention needs tiling over
-the sequence axis with an online softmax so the working set fits UB at all --
-and only then does block parallelism become expressible.
+So attention is a single-tile proof of concept, not a usable kernel -- but the
+reason is NOT what it first looked like.
+
+**The blocker is the UB allocator, not the algorithm.** `UbAllocator` bump-
+allocates and never frees: its `free()` exists but is `#[allow(dead_code)]` and
+is called from nowhere. The 16x16 attention emits **20 `alloc_tile` ops and zero
+frees**, so every intermediate stays live for the whole kernel. That is
+harmless at 16x16 (~20 KB) and fatal at 64x64, where each tile is 16 KB:
+20 x 16 KB = 320 KB against a 256 KB Unified Buffer, and it dies at exactly the
+offset the error reports (246784 B live before the last 16 KB tile).
+
+At 64x64 the REAL data is Q+K+V = 48 KB plus a 16 KB score matrix. It fits four
+times over. Both attention paths -- plain and the GM-scratch variant -- fail
+identically, which is the giveaway that this is allocation, not dataflow.
+
+So the first fix is tile liveness/reuse in the emitter, which would benefit
+every kernel rather than just this one. Sequence-axis tiling with an online
+softmax is still needed eventually for long sequences, but it is not what stands
+between here and a working 64x64 or 128x128 attention.
 
 The dump test takes `PTO_DUMP_S` / `PTO_DUMP_D` and records a rejection to
 `attention.REJECTED` instead of panicking, so the UB boundary can be probed.

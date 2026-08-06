@@ -8675,21 +8675,24 @@ module {{
         }
 
         // a2a3-safe attention: same shape, plus a GM scratch pointer.
-        let attn_s = r#"
-module {
-  llvm.func @tile_attn_s(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>) attributes {hacc.entry} {
+        let attn_s = format!(r#"
+module {{
+  llvm.func @tile_attn_s(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>) attributes {{hacc.entry}} {{
     ^bb0:
-    %s = llvm.mlir.constant(16 : i32) : i32
-    %d = llvm.mlir.constant(16 : i32) : i32
+    %s = llvm.mlir.constant({ds} : i32) : i32
+    %d = llvm.mlir.constant({dd} : i32) : i32
     %q = llvm.call @__tile_load_f32(%arg0, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
     %k = llvm.call @__tile_load_f32(%arg1, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
     %v = llvm.call @__tile_load_f32(%arg2, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
     %r = llvm.call @__tile_attention_scratch_f32(%q, %q, %k, %v, %arg4, %s, %d) : (i32, i32, i32, i32, !llvm.ptr<1>, i32, i32) -> i32
     llvm.call @__tile_store_f32(%arg3, %r, %s, %d) : (!llvm.ptr<1>, i32, i32, i32) -> ()
     llvm.return
-  }
-}
-"#;
-        std::fs::write(format!("{}/attention_scratch.pto", dir), convert_mlir_to_pto(attn_s).unwrap()).unwrap();
+  }}
+}}
+"#);
+        match convert_mlir_to_pto(&attn_s) {
+            Ok(v) => std::fs::write(format!("{}/attention_scratch.pto", dir), v).unwrap(),
+            Err(e) => std::fs::write(format!("{}/attention_scratch.REJECTED", dir), e).unwrap(),
+        }
     }
 }
