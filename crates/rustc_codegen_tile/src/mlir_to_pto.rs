@@ -1198,23 +1198,31 @@ impl PtoContext {
         self.pv_row_base.is_some()
     }
 
-    /// Rebuild a tile's partition view at the current head base.
+    /// Load a deferred operand's slice for the head the loop is on.
     ///
-    /// Returns `None` when the tile has no recorded GM view — a tile computed
-    /// on-chip has nothing to re-slice, and silently reusing its fixed view
-    /// would be the head-0 bug this exists to prevent.
-    fn repartition_for_head(
+    /// Emits partition_view + alloc + tload at the current row base, so the
+    /// tile holds head h's data. Returns `None` if the operand was not deferred
+    /// — its load would then be outside the loop, and every head would read
+    /// head 0, which is the bug this whole mechanism exists to prevent.
+    fn load_deferred_for_head(
         &mut self,
         t: &TileInfo,
         rows: u32,
         cols: u32,
         ops: &mut Vec<String>,
     ) -> Option<TileInfo> {
-        let gm = t.gm_name.clone()?;
-        let (tv, _, _, dtype) = self.tv_map.get(&gm)?.clone();
-        let pv = self.make_pv(&tv, rows, cols, &dtype, 0, ops);
+        let d = t.deferred.clone()?;
+        let dtype = t.dtype.clone();
+        // Only the per-head partition_view is emitted here. The tile itself is
+        // allocated by the matmul path that consumes this, which knows the
+        // operand needs a MAT tile (and then left/right/acc) — allocating a vec
+        // tile here made the kernel span both engines, and a Mix kernel cannot
+        // be built on this CANN at all. That is what the emitter's
+        // single-engine assertion caught.
+        let pv = self.make_pv(&d.tv_ssa, rows, cols, &dtype, d.elem_offset, ops);
         let mut out = t.clone();
         out.pv_ssa = Some(pv);
+        out.deferred = None;
         Some(out)
     }
 
@@ -2808,33 +2816,31 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
     // Pre-pass decides blocking based on the matmul shape. If both operand
     // loads were deferred, we emit the K/N-blocked path. Otherwise fall
     // through to the single-tmatmul path for small shapes that fit L0.
+    // Inside a batched loop the operands are deferred for a DIFFERENT reason
+    // than blocking: their loads must happen per head, here, rather than being
+    // hoisted into a K/N-block nest. Taking the blocked path would emit that
+    // nest instead of this head's body, leaving the loop with only a store —
+    // observed as a scores_batched kernel containing one tstore and nothing
+    // else. Load the operands for this head and fall through to the inline
+    // path, which is the one the per-head kernels already validate.
+    // Materialise this head's operands, then fall through to the unblocked
+    // path below — the same emission the validated per-head kernels use.
+    let (ta, tb) = if ctx.in_batched_loop() {
+        (
+            ctx.load_deferred_for_head(&ta, m, k, ops)
+                .ok_or_else(|| format!("matmul_batched: operand {a_ssa} not deferred"))?,
+            ctx.load_deferred_for_head(&tb, k, n, ops)
+                .ok_or_else(|| format!("matmul_batched: operand {b_ssa} not deferred"))?,
+        )
+    } else {
+        (ta, tb)
+    };
+
     if let (Some(da), Some(db)) = (ta.deferred.clone(), tb.deferred.clone()) {
         return translate_matmul_blocked(
             &result_ssa, m, k, n, MatmulDtypes::f32(), &da, &db, ctx, ops,
         );
     }
-
-    // Inside a batched loop the cached partition views were built OUTSIDE it,
-    // at a fixed offset, so reusing them would make every iteration read head 0.
-    // Rebuild them here from the recorded GM view, which picks up the loop's
-    // row base via make_pv. This is why the batched path needs the tiles to
-    // remember where they came from rather than only their view SSA.
-    let (ta, tb) = if ctx.in_batched_loop() {
-        (
-            ctx.repartition_for_head(&ta, m, k, ops)
-                .ok_or_else(|| format!(
-                    "matmul_batched: operand {a_ssa} has no GM view to re-partition \
-                     per head — it was not loaded from global memory"
-                ))?,
-            ctx.repartition_for_head(&tb, k, n, ops)
-                .ok_or_else(|| format!(
-                    "matmul_batched: operand {b_ssa} has no GM view to re-partition \
-                     per head — it was not loaded from global memory"
-                ))?,
-        )
-    } else {
-        (ta, tb)
-    };
 
     // --- Unblocked path (original emission) ---
     let pv_a = ta.pv_ssa.clone().ok_or_else(|| {
