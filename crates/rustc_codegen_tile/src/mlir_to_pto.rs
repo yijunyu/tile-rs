@@ -754,6 +754,15 @@ struct PtoContext {
     /// (operand a, operand b, output). `None` outside one — batching must not
     /// silently shift addresses in the ordinary path.
     head_offsets: Option<(u32, u32, u32)>,
+    /// SSA of a row offset to ADD to every partition_view emitted while it is
+    /// set, and the element stride it was built from.
+    ///
+    /// This is how a batched stage makes its loop body address head `h`:
+    /// `make_pv`/`make_pv_at` are the single choke point through which every
+    /// view is emitted, so setting this once around the body shifts them all
+    /// without changing any translator's signature. Outside a batched loop it
+    /// is `None` and the emitted offsets are exactly as before.
+    pv_row_base: Option<String>,
     /// Constants injected for a synthesised call, so a re-emitted per-head line
     /// can carry its dimensions without inventing MLIR constant declarations.
     inline_consts: HashMap<String, u32>,
@@ -950,6 +959,7 @@ impl PtoContext {
             ub: UbAllocator::new::<A2A3>(),
             tile_error: None,
             head_offsets: None,
+            pv_row_base: None,
             inline_consts: HashMap::new(),
             tv_map: HashMap::new(),
             sizes_used: Vec::new(),
@@ -1140,11 +1150,58 @@ impl PtoContext {
         let ssa = self.fresh_ssa();
         let tv_ty = tv_type(rows, cols, dtype);
         let ptv_ty = ptv_type(rows, cols, dtype);
+
+        // Inside a batched loop the row offset is the constant plus the loop's
+        // per-head base, so each iteration reads its own head's slice. This is
+        // the only place partition_view offsets are written, which is why
+        // batching needs no change to any translator.
+        let row_expr = match &self.pv_row_base {
+            Some(base) => {
+                let sum = format!("%pto_r{}", self.next_ssa);
+                self.next_ssa += 1;
+                ops.push(format!(
+                    "{} = arith.addi {}, %c{} : index",
+                    sum, base, row_off
+                ));
+                sum
+            }
+            None => format!("%c{}", row_off),
+        };
         ops.push(format!(
-            "{} = pto.partition_view {}, offsets = [%c{}, %c{}], sizes = [%c{}, %c{}] : {} -> {}",
-            ssa, tv_ssa, row_off, col_off, rows, cols, tv_ty, ptv_ty
+            "{} = pto.partition_view {}, offsets = [{}, %c{}], sizes = [%c{}, %c{}] : {} -> {}",
+            ssa, tv_ssa, row_expr, col_off, rows, cols, tv_ty, ptv_ty
         ));
         ssa
+    }
+
+    /// Shift every partition_view emitted from here until cleared by `base`
+    /// rows. Used by batched stages to address the head the loop is on.
+    fn set_pv_row_base(&mut self, base: Option<String>) {
+        self.pv_row_base = base;
+    }
+
+    fn in_batched_loop(&self) -> bool {
+        self.pv_row_base.is_some()
+    }
+
+    /// Rebuild a tile's partition view at the current head base.
+    ///
+    /// Returns `None` when the tile has no recorded GM view — a tile computed
+    /// on-chip has nothing to re-slice, and silently reusing its fixed view
+    /// would be the head-0 bug this exists to prevent.
+    fn repartition_for_head(
+        &mut self,
+        t: &TileInfo,
+        rows: u32,
+        cols: u32,
+        ops: &mut Vec<String>,
+    ) -> Option<TileInfo> {
+        let gm = t.gm_name.clone()?;
+        let (tv, _, _, dtype) = self.tv_map.get(&gm)?.clone();
+        let pv = self.make_pv(&tv, rows, cols, &dtype, 0, ops);
+        let mut out = t.clone();
+        out.pv_ssa = Some(pv);
+        Some(out)
     }
 
     /// Create a partition_view from a tensor_view SSA.
@@ -1163,18 +1220,9 @@ impl PtoContext {
     ) -> String {
         let row_off = if cols > 0 { elem_offset / cols } else { 0 };
         let col_off = if cols > 0 { elem_offset % cols } else { 0 };
-        self.use_size(row_off);
-        self.use_size(col_off);
-        self.use_size(rows);
-        self.use_size(cols);
-        let ssa = self.fresh_ssa();
-        let tv_ty = tv_type(rows, cols, dtype);
-        let ptv_ty = ptv_type(rows, cols, dtype);
-        ops.push(format!(
-            "{} = pto.partition_view {}, offsets = [%c{}, %c{}], sizes = [%c{}, %c{}] : {} -> {}",
-            ssa, tv_ssa, row_off, col_off, rows, cols, tv_ty, ptv_ty
-        ));
-        ssa
+        // Delegate so the batched-loop row base is applied in exactly one
+        // place; duplicating the emission here is how the two would drift.
+        self.make_pv_at(tv_ssa, rows, cols, dtype, row_off, col_off, ops)
     }
 
     /// Allocate a row-reduction output tile (rows×1, col_major).
@@ -2501,21 +2549,53 @@ fn translate_batched(
         return Err(format!("{name}: head count is 0 or unresolved in: {line}"));
     }
 
-    // Emit ONE head's body, then wrap it in a grid-strided loop whose induction
-    // variable shifts each partition_view to that head's slice.
-    //
-    // The tiles are allocated by the inner translator BEFORE the loop opens, so
-    // they are reused across heads rather than allocated per head. That is the
-    // whole point of the loop form: unrolling allocated 36 KB per head at
-    // S=32 D=64 and hit the 184 KB C1 budget at 5 heads, which is one short of
-    // MQA's 6. Reusing them removes that ceiling entirely.
-    //
-    // Safe for f32: `bin/blayout_probe.rs` confirms on 910B2 that an outer
-    // scf.for does not change the Left tile's BLayout and gives bit-identical
-    // results (2.98e-08 vs a host reference, both with and without the loop).
-    // The caution in emit_blocked_matmul_loops is i8-specific.
+    // Rows each head advances by. The partition_view row offset is what
+    // `make_pv` derives from a flat element offset, so a head's slice is
+    // `h * (stride / cols)` rows down — expressed against the loop induction
+    // variable rather than as a constant.
+    let (rows_per_head, out_rows_per_head) = match kind {
+        BatchedKind::Matmul => {
+            let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
+            (m, m)
+        }
+        BatchedKind::Softmax => {
+            let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
+            (rows, rows)
+        }
+    };
+    let _ = out_rows_per_head;
+
+    ops.push(format!(
+        "// --- {name}: {heads} heads in one launch, tiles reused across heads ---"
+    ));
+
+    // Open the grid-strided loop. blockDim = min(heads, aicores) at launch, so
+    // each core takes a strided subset and the loop degenerates to one
+    // iteration per core in the common case.
+    let bi64 = ctx.fresh_ssa();
+    let bn64 = ctx.fresh_ssa();
+    let bi = ctx.fresh_ssa();
+    let bn = ctx.fresh_ssa();
+    ops.push(format!("{bi64} = \"pto.get_block_idx\"() : () -> i64"));
+    ops.push(format!("{bn64} = \"pto.get_block_num\"() : () -> i64"));
+    ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
+    ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
+    ctx.use_size(heads);
+    ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
+
+    // The head's row base, and the state that makes every partition_view in the
+    // body pick it up. This is the piece that was missing: without it the body
+    // reads fixed views and every iteration recomputes head 0.
+    let base = ctx.fresh_ssa();
+    ctx.use_size(rows_per_head);
+    ops.push(format!(
+        "  {base} = arith.muli %h_i, %c{rows_per_head} : index   // head row base"
+    ));
+    ctx.set_pv_row_base(Some(base));
+
+    // Emit one head's body. Every view it creates is shifted by the base above.
     let mut body: Vec<String> = Vec::new();
-    let (stride_a, stride_b, stride_out) = match kind {
+    match kind {
         BatchedKind::Matmul => {
             let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
             let k = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
@@ -2528,7 +2608,6 @@ fn translate_batched(
                  %__m, %__k, %__n) : (i32, i32, i32, i32, i32, i32) -> i32"
             );
             translate_matmul(&inner, ctx, &mut body)?;
-            (m * k, k * n, m * n)
         }
         BatchedKind::Softmax => {
             let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
@@ -2540,72 +2619,35 @@ fn translate_batched(
                  (i32, i32, i32, i32) -> i32"
             );
             translate_softmax(&inner, "f32", ctx, &mut body)?;
-            (rows * cols, 0, rows * cols)
         }
-    };
+    }
+    ctx.set_pv_row_base(None);
     ctx.clear_head_offsets();
 
-    // Split the body three ways:
-    //   * alloc_tile / make_tensor_view  -> hoist ABOVE the loop, so the tiles
-    //     and the GM views are created once and reused across heads. This is
-    //     the whole point of the loop form; an alloc inside the loop would
-    //     reintroduce the per-head cost that capped unrolling at 4 heads.
-    //   * partition_view                 -> stay INSIDE, rewritten to offset by
-    //     the induction variable. A hoisted partition_view is a FIXED window,
-    //     so every iteration would reread head 0 — the loop would run `heads`
-    //     times and compute the same product each time.
-    //   * everything else                -> inside, unchanged.
-    let (allocs, work): (Vec<&String>, Vec<&String>) = body.iter().partition(|l| {
-        (l.contains("pto.alloc_tile") || l.contains("pto.make_tensor_view"))
-            && !l.contains("pto.partition_view")
-    });
-
-    ops.push(format!(
-        "// --- {name}: {heads} heads in one launch, tiles reused across heads ---"
-    ));
-    for l in allocs {
-        ops.push(l.clone());
+    // alloc_tile is loop-invariant and must NOT be re-run per iteration; hoist
+    // it above the loop. Everything else — including the partition_views, which
+    // now carry the head base — stays inside.
+    let mut hoisted: Vec<String> = Vec::new();
+    let mut inner_body: Vec<String> = Vec::new();
+    for l in body {
+        if l.contains("pto.alloc_tile") {
+            hoisted.push(l);
+        } else {
+            inner_body.push(format!("  {l}"));
+        }
     }
 
-    let bi64 = ctx.fresh_ssa();
-    let bn64 = ctx.fresh_ssa();
-    let bi = ctx.fresh_ssa();
-    let bn = ctx.fresh_ssa();
-    ops.push(format!("{bi64} = \"pto.get_block_idx\"() : () -> i64"));
-    ops.push(format!("{bn64} = \"pto.get_block_num\"() : () -> i64"));
-    ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
-    ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
-    ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
-
-    // The loop body must address head `h_i`, and it does not yet.
-    //
-    // translate_matmul / translate_softmax build their partition_views from the
-    // tile_load that produced their operands, at a FIXED offset — they have no
-    // notion of an enclosing loop. Emitting `arith.muli %h_i, stride` here and
-    // hoping the body picks it up does not work: the body references the
-    // pre-existing view SSAs, so every iteration recomputes head 0 while the
-    // offsets sit unused. That is silently wrong output, which is worse than no
-    // batching at all, so it is refused rather than emitted.
-    //
-    // Making it work needs the inner translators to accept a base-offset SSA
-    // and thread it into their partition_view offsets — a change to their
-    // signatures and to every caller, not something that can be bolted on from
-    // out here. `bin/batched_heads.rs` records the measurement that says it is
-    // worth doing (MQA 0.87x -> 1.25-1.70x).
-    let _ = (stride_a, stride_b, stride_out);
-    return Err(format!(
-        "{name}: the loop form needs per-head partition_view offsets, which the \
-         inner translators cannot yet express — they build views at a fixed \
-         offset with no notion of an enclosing loop. Emitting it anyway would \
-         run the loop {heads} times over head 0. See translate_batched."
-    ));
-
-    #[allow(unreachable_code)]
-    for l in work {
-        ops.push(format!("  {l}"));
+    // Splice the hoisted allocations above the loop header we already pushed.
+    let loop_header_at = ops
+        .iter()
+        .rposition(|l| l.starts_with("scf.for %h_i"))
+        .expect("loop header just pushed");
+    for (i, l) in hoisted.into_iter().enumerate() {
+        ops.insert(loop_header_at + i, l);
     }
+
+    ops.extend(inner_body);
     ops.push("}".to_string());
-
     Ok(())
 }
 
@@ -2637,6 +2679,28 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
             &result_ssa, m, k, n, MatmulDtypes::f32(), &da, &db, ctx, ops,
         );
     }
+
+    // Inside a batched loop the cached partition views were built OUTSIDE it,
+    // at a fixed offset, so reusing them would make every iteration read head 0.
+    // Rebuild them here from the recorded GM view, which picks up the loop's
+    // row base via make_pv. This is why the batched path needs the tiles to
+    // remember where they came from rather than only their view SSA.
+    let (ta, tb) = if ctx.in_batched_loop() {
+        (
+            ctx.repartition_for_head(&ta, m, k, ops)
+                .ok_or_else(|| format!(
+                    "matmul_batched: operand {a_ssa} has no GM view to re-partition \
+                     per head — it was not loaded from global memory"
+                ))?,
+            ctx.repartition_for_head(&tb, k, n, ops)
+                .ok_or_else(|| format!(
+                    "matmul_batched: operand {b_ssa} has no GM view to re-partition \
+                     per head — it was not loaded from global memory"
+                ))?,
+        )
+    } else {
+        (ta, tb)
+    };
 
     // --- Unblocked path (original emission) ---
     let pv_a = ta.pv_ssa.clone().ok_or_else(|| {
