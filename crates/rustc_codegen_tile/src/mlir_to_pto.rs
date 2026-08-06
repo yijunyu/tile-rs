@@ -3492,6 +3492,24 @@ fn translate_silu(
 ///   16 x 2048 x 11008       1204.7       1046.2    1036.3    1.16x
 /// ```
 ///
+/// **Read the size of this win against the roofline before spending more on
+/// the same knob.** The kernel is BANDWIDTH-PINNED at ~85 GB/s, and stays there
+/// across a 9x range of both bytes and FLOPs:
+///
+/// ```text
+///   M x K x N            median us      MB    GB/s   TFLOPS
+///   16 x 896 x 4864        207.98     17.8    85.6     0.67
+///   16 x 1536 x 1536       116.04      9.6    83.0     0.65
+///   16 x 2048 x 11008     1036.34     91.0    87.8     0.70
+/// ```
+///
+/// Time tracks BYTES, not FLOPs. These are skinny GEMMs -- at M=16 the B matrix
+/// is ~98% of the traffic -- so being memory-bound is expected; sitting at
+/// roughly a tenth of an Ascend 910's HBM is not. The Kb/Nb sweep below moved
+/// things WITHIN that ceiling. (The ~800 GB/s figure is the part's published
+/// bandwidth, not something measured on this box; npu-smi does not report it.
+/// The ~85 GB/s is measured, and its shape-independence is the solid part.)
+///
 /// So there WAS something to reclaim: 16-28%. Shipped is now Kb=64 Nb=256,
 /// which wins at every shape measured. `Kb=128 Nb=256` is rejected by the UB
 /// guard while `Kb=64 Nb=256` passes, so the pair is still jointly constrained
