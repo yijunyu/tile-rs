@@ -4360,6 +4360,24 @@ pub const MUL_MV_ILV_ROWS_PER_TG: usize = 2;
 /// elements. Must divide 16 (bytes per block) or a step would straddle a scale.
 pub const MUL_MV_ILV_Q4_BYTES_PER_LANE: usize = 8;
 
+/// Fold the -8 zero point out of the inner loop into one row-level term over a
+/// hoisted activation sum, as ggml's `block_q_n_dot_y` does.
+///
+/// Measured ALONE at ROWS_PER_SG=4 under the previous cross-simdgroup structure
+/// it was worse (1.18x vs 1.09x) and was reverted. But the saving scales with
+/// how many rows reuse the hoisted sum, and the row count was swept separately
+/// with the per-element form -- the two were never varied together, which is
+/// exactly the joint-sweep trap. ggml uses hoisted AND a larger NR0.
+/// MEASURED at ROWS_PER_SG 2/4/8 x width 32/64/128, jointly, against the
+/// per-element form. The hypothesis was that the hoist pays once enough rows
+/// reuse the sum -- ggml hoists AND uses a larger NR0. It does not: rows 4 and
+/// 8 are far worse in BOTH forms (97-127 t/s against 138), so the amortization
+/// never arrives, and at rows=2 the two forms are indistinguishable (139.75 vs
+/// 140.24 over three interleaved rounds, individual rounds disagreeing on
+/// sign). Kept as a flag because the corner is now measured rather than
+/// assumed, and the balance may differ on other silicon.
+pub const MUL_MV_ILV_Q4_HOIST_ZP: bool = false;
+
 /// Q4_0 mat-vec over ggml's NATIVE block_q4_0: {half d; uint8 qs[16]}, 18
 /// bytes. Element j is the LOW nibble of byte j, element j+16 the HIGH nibble,
 /// and the value is (nibble - 8) * d -- so one byte feeds two positions 16
@@ -4422,12 +4440,18 @@ fn emit_mul_mv_q4_0_interleaved_msl(out: &mut String) {
     // activations are pre-divided to cancel it. All powers of two, so every
     // rounded product is the one the unscaled operands would have given.
     writeln!(out, "        float x0[BPL/2u], x1[BPL/2u], x2[BPL/2u], x3[BPL/2u];").unwrap();
+    if MUL_MV_ILV_Q4_HOIST_ZP {
+        writeln!(out, "        float sumy = 0.0f;   // row-independent; amortized over ROWS_PER_SG").unwrap();
+    }
     writeln!(out, "        for (uint j = 0u; j < BPL / 2u; ++j) {{").unwrap();
     writeln!(out, "            uint e = b * BLK + o + j * 2u;").unwrap();
     writeln!(out, "            x0[j] = x[e];").unwrap();
     writeln!(out, "            x1[j] = x[e + 16u]      * 0.0625f;").unwrap();
     writeln!(out, "            x2[j] = x[e + 1u]       * 0.00390625f;").unwrap();
     writeln!(out, "            x3[j] = x[e + 1u + 16u] * 0.000244140625f;").unwrap();
+    if MUL_MV_ILV_Q4_HOIST_ZP {
+        writeln!(out, "            sumy += x[e] + x[e + 16u] + x[e + 1u] + x[e + 1u + 16u];").unwrap();
+    }
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        for (uint r = 0u; r < ROWS_PER_SG; ++r) {{").unwrap();
     writeln!(out, "            uint n = n0 + r;").unwrap();
@@ -4439,12 +4463,23 @@ fn emit_mul_mv_q4_0_interleaved_msl(out: &mut String) {
     writeln!(out, "            float sum = 0.0f;").unwrap();
     writeln!(out, "            for (uint j = 0u; j < BPL / 2u; ++j) {{").unwrap();
     writeln!(out, "                uint v = (uint)qs[j];").unwrap();
-    writeln!(out, "                sum += ((float)(v & 0x000Fu) -     8.0f) * x0[j];").unwrap();
-    writeln!(out, "                sum += ((float)(v & 0x00F0u) -   128.0f) * x1[j];").unwrap();
-    writeln!(out, "                sum += ((float)(v & 0x0F00u) -  2048.0f) * x2[j];").unwrap();
-    writeln!(out, "                sum += ((float)(v & 0xF000u) - 32768.0f) * x3[j];").unwrap();
+    if MUL_MV_ILV_Q4_HOIST_ZP {
+        writeln!(out, "                sum += (float)(v & 0x000Fu) * x0[j];").unwrap();
+        writeln!(out, "                sum += (float)(v & 0x00F0u) * x1[j];").unwrap();
+        writeln!(out, "                sum += (float)(v & 0x0F00u) * x2[j];").unwrap();
+        writeln!(out, "                sum += (float)(v & 0xF000u) * x3[j];").unwrap();
+    } else {
+        writeln!(out, "                sum += ((float)(v & 0x000Fu) -     8.0f) * x0[j];").unwrap();
+        writeln!(out, "                sum += ((float)(v & 0x00F0u) -   128.0f) * x1[j];").unwrap();
+        writeln!(out, "                sum += ((float)(v & 0x0F00u) -  2048.0f) * x2[j];").unwrap();
+        writeln!(out, "                sum += ((float)(v & 0xF000u) - 32768.0f) * x3[j];").unwrap();
+    }
     writeln!(out, "            }}").unwrap();
-    writeln!(out, "            acc[r] += d * sum;").unwrap();
+    if MUL_MV_ILV_Q4_HOIST_ZP {
+        writeln!(out, "            acc[r] += d * (sum - 8.0f * sumy);").unwrap();
+    } else {
+        writeln!(out, "            acc[r] += d * sum;").unwrap();
+    }
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
@@ -16385,10 +16420,16 @@ module {
         // which removes 16 subtractions per unit -- measured 1.18x against
         // 1.09x end-to-end on Qwen2.5-3B q4_0. That is the THIRD time hoisting
         // arithmetic out of this row loop has measured neutral-or-worse here.
-        assert!(msl.contains("acc[r] += d * sum;"),
-            "the zero point stays per element -- hoisting it measured worse:\n{}", msl);
-        assert!(!msl.contains("sumy"),
-            "no hoisted activation sum; it was measured and reverted:\n{}", msl);
+        // MUL_MV_ILV_Q4_HOIST_ZP selects between the two forms; assert the
+        // emitted kernel matches whichever is compiled in, so the flag cannot
+        // silently disagree with the code.
+        if MUL_MV_ILV_Q4_HOIST_ZP {
+            assert!(msl.contains("acc[r] += d * (sum - 8.0f * sumy);") && msl.contains("sumy +="),
+                "hoisted form must emit a row-level zero point:\n{}", msl);
+        } else {
+            assert!(msl.contains("acc[r] += d * sum;") && !msl.contains("sumy"),
+                "per-element form must not emit a hoisted sum:\n{}", msl);
+        }
         // Rows belong to a simdgroup, so simd_sum finishes one and nothing
         // crosses simdgroups.
         assert!(!msl.contains("threadgroup_barrier") && !msl.contains("mv_shared"),
