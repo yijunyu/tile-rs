@@ -793,6 +793,14 @@ struct PtoContext {
     /// scf.for nest is actually emitted in translate_store once it knows
     /// the output tensor_view. See translate_matmul_blocked's design note.
     pending_blocked_matmuls: HashMap<String, PendingBlockedMatmul>,
+    /// Batched-stage result SSAs whose loop is emitted at the store, for the
+    /// same reason the blocked-matmul one is: the loop must CONTAIN the store,
+    /// and the output GM view is only known once the store is seen. Emitting
+    /// the loop early produced a kernel that computed every head and stored
+    /// only the last — verified wrong on device.
+    batched_result_stored_inline: std::collections::HashSet<String>,
+    /// Pending batched emissions keyed by result SSA.
+    pending_batched: HashMap<String, PendingBatched>,
     /// silu_mul result SSAs whose store is emitted inline (per-N-block) by
     /// the blocked-silu_mul path (#67). Mirrors `matmul_result_stored_inline`.
     silu_mul_result_stored_inline: std::collections::HashSet<String>,
@@ -960,6 +968,8 @@ impl PtoContext {
             tile_error: None,
             head_offsets: None,
             pv_row_base: None,
+            batched_result_stored_inline: std::collections::HashSet::new(),
+            pending_batched: HashMap::new(),
             inline_consts: HashMap::new(),
             tv_map: HashMap::new(),
             sizes_used: Vec::new(),
@@ -1178,6 +1188,10 @@ impl PtoContext {
     /// rows. Used by batched stages to address the head the loop is on.
     fn set_pv_row_base(&mut self, base: Option<String>) {
         self.pv_row_base = base;
+    }
+
+    fn insert_tile(&mut self, ssa: &str, t: TileInfo) {
+        self.tiles.insert(ssa.to_string(), t);
     }
 
     fn in_batched_loop(&self) -> bool {
@@ -2034,6 +2048,17 @@ fn translate_store(
         return Ok(());
     }
 
+    // Batched-stage intercept: the loop must enclose this store, so it is
+    // emitted here rather than where the batched call appeared.
+    if ctx.batched_result_stored_inline.contains(buf_ssa) {
+        let pending = ctx
+            .pending_batched
+            .remove(buf_ssa)
+            .ok_or_else(|| format!("tile_store: pending batched stage for {} missing", buf_ssa))?;
+        let out_tv_ssa = ctx.get_or_make_tv(&gm_name, rows, cols, dtype, ops);
+        return emit_batched_loop(&out_tv_ssa, elem_offset, dtype, &pending, ctx, ops);
+    }
+
     // Blocked-silu_mul intercept (#67): same shape as the matmul one — the
     // per-chunk scf.for is emitted here once we know the output GM view.
     if ctx.silu_mul_result_stored_inline.contains(buf_ssa) {
@@ -2502,6 +2527,19 @@ fn translate_unary(
 /// | left  | row_major | row_major | 512     |
 /// | right | row_major | col_major | 512     |
 /// | acc   | col_major | row_major | 1024    |
+/// A batched stage awaiting its store, so the loop can enclose it.
+struct PendingBatched {
+    kind: BatchedKind,
+    heads: u32,
+    /// Operand SSAs, as named in the original call.
+    a: String,
+    b: Option<String>,
+    /// Shape: (m, k, n) for matmul; (rows, _, cols) for softmax.
+    m: u32,
+    k: u32,
+    n: u32,
+}
+
 /// Which batched stage `translate_batched` is emitting.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchedKind {
@@ -2529,11 +2567,18 @@ enum BatchedKind {
 /// Why this exists: on the benchmarked MQA shape 72% of measured time is the
 /// fixed ~4.17 us per-launch cost and 18 of 22 launches are per-head attention
 /// stages. This trades launches for code size; the arithmetic is unchanged.
+/// Record a batched stage; the loop is emitted at its store.
+///
+/// Nothing is emitted here. The loop has to CONTAIN the store — a loop that
+/// ends before it computes every head and keeps only the last, which was
+/// verified wrong on device (head 0 correct, heads 1..5 untouched). The output
+/// GM view is only known when the store is translated, so this defers exactly
+/// as `translate_matmul_blocked` does for the same reason.
 fn translate_batched(
     line: &str,
     kind: BatchedKind,
     ctx: &mut PtoContext,
-    ops: &mut Vec<String>,
+    _ops: &mut Vec<String>,
 ) -> Result<(), String> {
     let name = match kind {
         BatchedKind::Matmul => "matmul_batched",
@@ -2549,102 +2594,157 @@ fn translate_batched(
         return Err(format!("{name}: head count is 0 or unresolved in: {line}"));
     }
 
-    // KNOWN LIMIT, verified on device: the STORE is not inside this loop.
-    //
-    // The batched call and the `__tile_store_f32` that consumes its result are
-    // separate MLIR calls, so the store is translated after this function
-    // returns and lands after the loop closes. The loop then computes every
-    // head but only the last survives, and it goes to a fixed address.
-    //
-    // Measured on 910B2 (bin/batched_heads.rs + a per-head parity check): head 0
-    // correct at 3.7e-09, heads 1..5 completely untouched — 1024/1024 elements
-    // still holding the poison sentinel. A timing run would NOT have caught
-    // this: the launches collapse either way, so the speedup looks real while
-    // five sixths of the output is missing.
-    //
-    // Closing it means the batched stage must own its store — either by taking
-    // the destination as an argument and emitting tstore inside the loop, or by
-    // fusing the following tile_store into this translation. Both are more
-    // invasive than the offset plumbing below, which is done and correct.
-    //
-    // Rows each head advances by. The partition_view row offset is what
-    // `make_pv` derives from a flat element offset, so a head's slice is
-    // `h * (stride / cols)` rows down — expressed against the loop induction
-    // variable rather than as a constant.
-    let (rows_per_head, out_rows_per_head) = match kind {
-        BatchedKind::Matmul => {
-            let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
-            (m, m)
-        }
-        BatchedKind::Softmax => {
-            let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
-            (rows, rows)
-        }
+    let pending = match kind {
+        BatchedKind::Matmul => PendingBatched {
+            kind,
+            heads,
+            a: args.get(1).ok_or("matmul_batched: missing a")?.trim().to_string(),
+            b: Some(args.get(2).ok_or("matmul_batched: missing b")?.trim().to_string()),
+            m: ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0")),
+            k: ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0")),
+            n: ctx.resolve_const(args.get(5).map(|s| s.as_str()).unwrap_or("0")),
+        },
+        BatchedKind::Softmax => PendingBatched {
+            kind,
+            heads,
+            a: args.get(1).ok_or("softmax_batched: missing src")?.trim().to_string(),
+            b: None,
+            m: ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0")),
+            k: 0,
+            n: ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0")),
+        },
     };
-    let _ = out_rows_per_head;
+
+    ctx.batched_result_stored_inline.insert(result_ssa.clone());
+    ctx.pending_batched.insert(result_ssa, pending);
+    Ok(())
+}
+
+/// Emit a batched stage's loop, with its store inside.
+///
+/// # Status: the STORE is fixed, the LOAD is not. Still wrong on device.
+///
+/// Verified on 910B2 with a per-head parity check, heads given distinct inputs:
+///
+///   before this change: head 0 ok, heads 1..5 UNTOUCHED (store outside loop)
+///   after  this change: head 0 ok, heads 1..5 written but WRONG (~5e-03)
+///
+/// So the store now runs per head — real progress, and the untouched-output bug
+/// is gone. What remains is the mirror image on the input side: the operand's
+/// `tload` is emitted by an earlier `__tile_load_f32`, once, before the loop.
+/// The per-head `partition_view` this function creates is therefore never read,
+/// and every iteration softmaxes head 0's data into head h's slot. The emitted
+/// PTO shows it: a head-relative view at the top of the loop with no `tload`
+/// consuming it.
+///
+/// Closing it means the batched stage owning its LOAD as well as its store —
+/// intercepting the preceding tile_load the way `translate_store` intercepts
+/// the following store, so the load moves inside the loop. That is a fourth
+/// structural change to the emission path, and the same shape as the two
+/// already made.
+///
+/// Called from `translate_store` once the output GM view is known. Structure:
+///
+/// ```text
+/// <tile allocations>                       hoisted: loop-invariant
+/// scf.for %h_i = block_idx to heads step block_num {
+///   %base = h_i * rows_per_head            each head's row offset
+///   <partition_views at %base>             operands AND output
+///   <the stage's ops>
+///   pto.tstore -> out[%base]               inside, so every head is written
+/// }
+/// ```
+fn emit_batched_loop(
+    out_tv_ssa: &str,
+    out_elem_offset: u32,
+    dtype: &str,
+    p: &PendingBatched,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let name = match p.kind {
+        BatchedKind::Matmul => "matmul_batched",
+        BatchedKind::Softmax => "softmax_batched",
+    };
+    let heads = p.heads;
+    let (out_rows, out_cols) = (p.m, p.n);
 
     ops.push(format!(
-        "// --- {name}: {heads} heads in one launch, tiles reused across heads ---"
+        "// --- {name}: {heads} heads in one launch, store inside the loop ---"
     ));
 
-    // Open the grid-strided loop. blockDim = min(heads, aicores) at launch, so
-    // each core takes a strided subset and the loop degenerates to one
-    // iteration per core in the common case.
+    // Emit one head's body first, into a scratch buffer, so the allocations can
+    // be hoisted. The row base is live while this runs, so every partition_view
+    // it creates — including the output's — is head-relative.
     let bi64 = ctx.fresh_ssa();
     let bn64 = ctx.fresh_ssa();
     let bi = ctx.fresh_ssa();
     let bn = ctx.fresh_ssa();
-    ops.push(format!("{bi64} = \"pto.get_block_idx\"() : () -> i64"));
-    ops.push(format!("{bn64} = \"pto.get_block_num\"() : () -> i64"));
-    ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
-    ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
-    ctx.use_size(heads);
-    ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
-
-    // The head's row base, and the state that makes every partition_view in the
-    // body pick it up. This is the piece that was missing: without it the body
-    // reads fixed views and every iteration recomputes head 0.
     let base = ctx.fresh_ssa();
-    ctx.use_size(rows_per_head);
-    ops.push(format!(
-        "  {base} = arith.muli %h_i, %c{rows_per_head} : index   // head row base"
-    ));
-    ctx.set_pv_row_base(Some(base));
 
-    // Emit one head's body. Every view it creates is shifted by the base above.
     let mut body: Vec<String> = Vec::new();
-    match kind {
+    ctx.set_pv_row_base(Some(base.clone()));
+
+    let result_tile = match p.kind {
         BatchedKind::Matmul => {
-            let m = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
-            let k = ctx.resolve_const(args.get(4).map(|s| s.as_str()).unwrap_or("0"));
-            let n = ctx.resolve_const(args.get(5).map(|s| s.as_str()).unwrap_or("0"));
-            let a = args.get(1).ok_or("matmul_batched: missing a")?.trim().to_string();
-            let b = args.get(2).ok_or("matmul_batched: missing b")?.trim().to_string();
-            ctx.set_inline_consts(&[("%__m", m), ("%__k", k), ("%__n", n)]);
+            ctx.set_inline_consts(&[("%__m", p.m), ("%__k", p.k), ("%__n", p.n)]);
+            let bb = p.b.clone().unwrap_or_else(|| p.a.clone());
             let inner = format!(
-                "{result_ssa} = llvm.call @__tile_matmul_f32({a}, {a}, {b}, \
-                 %__m, %__k, %__n) : (i32, i32, i32, i32, i32, i32) -> i32"
+                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, %__m, %__k, %__n) : \
+                 (i32, i32, i32, i32, i32, i32) -> i32",
+                p.a, p.a, bb
             );
             translate_matmul(&inner, ctx, &mut body)?;
+            "%__batched".to_string()
         }
         BatchedKind::Softmax => {
-            let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
-            let cols = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
-            let x = args.get(1).ok_or("softmax_batched: missing src")?.trim().to_string();
-            ctx.set_inline_consts(&[("%__r", rows), ("%__c", cols)]);
+            // The operand's view was built by an earlier tile_load, OUTSIDE the
+            // loop and therefore at a fixed offset. Re-partition it here so
+            // each head reads its own slice; without this every iteration reads
+            // head 0 and writes it to head h — all heads written, all wrong,
+            // which is exactly what the device check reported.
+            let t = ctx
+                .get_tile(&p.a)
+                .ok_or_else(|| format!("softmax_batched: unknown tile {}", p.a))?
+                .clone();
+            let t = ctx.repartition_for_head(&t, p.m, p.n, &mut body).ok_or_else(|| {
+                format!(
+                    "softmax_batched: operand {} has no GM view to re-partition per \
+                     head — it was not loaded from global memory",
+                    p.a
+                )
+            })?;
+            let head_src = format!("{}__headsrc", p.a);
+            ctx.insert_tile(&head_src, t);
+            ctx.set_inline_consts(&[("%__r", p.m), ("%__c", p.n)]);
             let inner = format!(
-                "{result_ssa} = llvm.call @__tile_softmax_f32({x}, {x}, %__r, %__c) : \
-                 (i32, i32, i32, i32) -> i32"
+                "%__batched = llvm.call @__tile_softmax_f32({}, {}, %__r, %__c) : \
+                 (i32, i32, i32, i32) -> i32",
+                head_src, head_src
             );
             translate_softmax(&inner, "f32", ctx, &mut body)?;
+            "%__batched".to_string()
         }
-    }
+    };
+
+    // The store, still inside the row-base scope so it lands at head h.
+    let out_pv = ctx.make_pv(out_tv_ssa, out_rows, out_cols, dtype, out_elem_offset, &mut body);
+    let tile = ctx
+        .get_tile(&result_tile)
+        .ok_or_else(|| format!("{name}: stage produced no result tile"))?
+        .clone();
+    body.push(format!(
+        "pto.tstore ins({} : {}) outs({} : {})",
+        tile.ssa,
+        tile.tb_type,
+        out_pv,
+        ptv_type(out_rows, out_cols, dtype)
+    ));
+
     ctx.set_pv_row_base(None);
     ctx.clear_head_offsets();
 
-    // alloc_tile is loop-invariant and must NOT be re-run per iteration; hoist
-    // it above the loop. Everything else — including the partition_views, which
-    // now carry the head base — stays inside.
+    // alloc_tile is loop-invariant; everything else is per-head.
     let mut hoisted: Vec<String> = Vec::new();
     let mut inner_body: Vec<String> = Vec::new();
     for l in body {
@@ -2654,16 +2754,19 @@ fn translate_batched(
             inner_body.push(format!("  {l}"));
         }
     }
+    ops.extend(hoisted);
 
-    // Splice the hoisted allocations above the loop header we already pushed.
-    let loop_header_at = ops
-        .iter()
-        .rposition(|l| l.starts_with("scf.for %h_i"))
-        .expect("loop header just pushed");
-    for (i, l) in hoisted.into_iter().enumerate() {
-        ops.insert(loop_header_at + i, l);
-    }
-
+    ctx.use_size(heads);
+    ctx.use_size(p.m);
+    ops.push(format!("{bi64} = \"pto.get_block_idx\"() : () -> i64"));
+    ops.push(format!("{bn64} = \"pto.get_block_num\"() : () -> i64"));
+    ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
+    ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
+    ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
+    ops.push(format!(
+        "  {base} = arith.muli %h_i, %c{} : index   // head row base",
+        p.m
+    ));
     ops.extend(inner_body);
     ops.push("}".to_string());
     Ok(())
