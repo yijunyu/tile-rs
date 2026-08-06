@@ -3510,7 +3510,37 @@ fn translate_silu(
 /// bandwidth, not something measured on this box; npu-smi does not report it.
 /// The ~85 GB/s is measured, and its shape-independence is the solid part.)
 ///
-/// So there WAS something to reclaim: 16-28%. Shipped is now Kb=64 Nb=256,
+/// **RE-SWEPT MULTI-CORE, and the conclusion changed.** Everything above was
+/// measured with `pto_run` launching `<<<1>>>`, i.e. on ONE AI core, so Nb was
+/// only a tile shape. It is not: `n_iters = ceil(N/Nb)` is the BLOCK COUNT, so
+/// Nb decides how much of the chip is used. Nb=256 leaves just 6 blocks at
+/// N=1536 -- a quarter of the cores idle -- which cost nothing when one core
+/// ran anyway and costs 2.2x now.
+///
+/// Ratio to aclnnMatmul at the three shapes, and the worst block count each
+/// config reaches:
+///
+/// ```text
+///   Kb   Nb    896x4864  1536x1536  2048x11008   geomean   min blocks
+///   256  64      0.525     0.331      0.764       0.510        24
+///   128  128     0.489     0.440      0.693       0.530        12
+///   128  64      0.522     0.354      0.838       0.537        24
+///   64   128     0.567     0.488      0.802       0.606        12
+///   64   256     0.527     0.725      0.691       0.642         6   <- was shipped
+///   64   64      0.634     0.421      0.993       0.642        24
+/// ```
+///
+/// Shipped is now **Kb=256 Nb=64**: best geomean, ~2x faster than the vendor
+/// library, and the only leader that keeps every core busy at all three shapes.
+/// The rule behind it is simply `N/Nb >= core count`; a larger Nb starves the
+/// launch. Note Kb returns to 256, the value the single-core sweep moved away
+/// from.
+///
+/// The stale single-core reasoning is kept below because the SHAPE of the
+/// mistake matters more than the numbers: a knob whose meaning changes under a
+/// structural fix has to be re-swept, and a plateau is not an invariant.
+///
+/// So there WAS something to reclaim: 16-28%. The single-core conclusion was
 /// which wins at every shape measured. `Kb=128 Nb=256` is rejected by the UB
 /// guard while `Kb=64 Nb=256` passes, so the pair is still jointly constrained
 /// even though Nb is what pays.
@@ -3524,8 +3554,8 @@ fn translate_silu(
 /// Ascend910/CANN 9.0.0 box. Treat that crash as box/CANN-specific rather
 /// than a universal cap. Nb=256 is likewise unverified on 910B2, which cannot
 /// build these kernels at all (CANN 8.5.2 lacks CompactMode).
-const PTO_MM_KB: u32 = 64;
-const PTO_MM_NB: u32 = 256;
+const PTO_MM_KB: u32 = 256;
+const PTO_MM_NB: u32 = 64;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
 /// BLayout based on the companion `Right` tile width. At Nb=64 with i8 Left,
 /// ptoas silently emits `BLayout::ColMajor` (wrong) instead of RowMajor.
@@ -6597,11 +6627,12 @@ mod tests {
         // aligned to 48, and 1536 % 48 == 0, so 48 -- below the default, so
         // this case is unchanged by the new default.
         assert_eq!(pick_kb_for_n(1536, 151936), 48);
-        // N=65536: cap = 2^23/65536 = 128, above the default, so the default
-        // stands rather than the cap. Under the old Kb=256 this returned 128.
-        assert_eq!(pick_kb_for_n(1536, 65536), PTO_MM_KB);
-        // N=32768: cap = 256, well above the default.
-        assert_eq!(pick_kb_for_n(1536, 32768), PTO_MM_KB);
+        // N=65536: cap = 2^23/65536 = 128. Whether that binds depends on the
+        // default, so assert the RULE rather than a literal -- this expectation
+        // has now flipped twice as PTO_MM_KB moved 256 -> 64 -> 256.
+        assert_eq!(pick_kb_for_n(1536, 65536), PTO_MM_KB.min(128));
+        // N=32768: cap = 256.
+        assert_eq!(pick_kb_for_n(1536, 32768), PTO_MM_KB.min(256));
         // Degenerate / small K that's still > kb_cap.
         // K=128 (base=128), cap=48: 128%48!=0 → fallback halving to 32 (divides 128, ≤48).
         assert_eq!(pick_kb_for_n(128, 151936), 32);
