@@ -923,6 +923,8 @@ struct PtoContext {
     /// without changing any translator's signature. Outside a batched loop it
     /// is `None` and the emitted offsets are exactly as before.
     pv_row_base: Option<String>,
+    /// Column analogue of `pv_row_base`, for N-block loops.
+    pv_col_base: Option<String>,
     /// Constants injected for a synthesised call, so a re-emitted per-head line
     /// can carry its dimensions without inventing MLIR constant declarations.
     inline_consts: HashMap<String, u32>,
@@ -1140,6 +1142,7 @@ impl PtoContext {
             tile_error: None,
             head_offsets: None,
             pv_row_base: None,
+            pv_col_base: None,
             batched_result_stored_inline: std::collections::HashSet::new(),
             softmax_rows_stored_inline: std::collections::HashSet::new(),
             pending_row_softmax: HashMap::new(),
@@ -1354,9 +1357,20 @@ impl PtoContext {
             }
             None => format!("%c{}", row_off),
         };
+        // Same treatment for columns, which is what an N-block loop needs:
+        // `b_right` is `k*n` with no row term, so only a column offset bounds it.
+        let col_expr = match &self.pv_col_base {
+            Some(base) => {
+                let sum = format!("%pto_c{}", self.next_ssa);
+                self.next_ssa += 1;
+                ops.push(format!("{} = arith.addi {}, %c{} : index", sum, base, col_off));
+                sum
+            }
+            None => format!("%c{}", col_off),
+        };
         ops.push(format!(
-            "{} = pto.partition_view {}, offsets = [{}, %c{}], sizes = [%c{}, %c{}] : {} -> {}",
-            ssa, tv_ssa, row_expr, col_off, rows, cols, tv_ty, ptv_ty
+            "{} = pto.partition_view {}, offsets = [{}, {}], sizes = [%c{}, %c{}] : {} -> {}",
+            ssa, tv_ssa, row_expr, col_expr, rows, cols, tv_ty, ptv_ty
         ));
         ssa
     }
@@ -1396,6 +1410,38 @@ impl PtoContext {
 
     fn in_batched_loop(&self) -> bool {
         self.pv_row_base.is_some()
+    }
+
+    /// Run `f` with a COLUMN base from an N-block loop.
+    ///
+    /// The mirror of `with_row_block`, needed because the two bound different
+    /// tiles: `a_left` is `mb*k` and shrinks with rows, but `b_right` is `k*n`
+    /// with no row term at all. At S=512 both scores and pv stage a 128 KB
+    /// `b_right` against a 64 KB L0B cap, which no row-blocking touches.
+    fn with_col_block<T>(
+        &mut self,
+        nb: u32,
+        f: impl FnOnce(&mut Self, &mut Vec<String>) -> T,
+        ops: &mut Vec<String>,
+    ) -> T {
+        let prev = self.pv_col_base.clone();
+        let off = self.fresh_ssa();
+        self.use_size(nb);
+        ops.push(format!(
+            "  {off} = arith.muli %n_i, %c{nb} : index   // col block offset"
+        ));
+        let base = match &prev {
+            Some(pb) => {
+                let sum = self.fresh_ssa();
+                ops.push(format!("  {sum} = arith.addi {pb}, {off} : index"));
+                sum
+            }
+            None => off,
+        };
+        self.pv_col_base = Some(base);
+        let out = f(self, ops);
+        self.pv_col_base = prev;
+        out
     }
 
     /// Run `f` with the row base advanced by an INNER block loop.
@@ -3053,6 +3099,42 @@ fn translate_batched(
     Ok(())
 }
 
+/// Emit the store for one block of a batched stage, at the current row/col
+/// base.
+///
+/// Factored out because the store has to happen at the INNERMOST point of
+/// whatever loop nest the stage built. Appending it after the body works only
+/// while the stage produces one whole tile per head; the moment a head is
+/// blocked, an outside store writes just the last block — verified on device
+/// as `untouched=131072 / N-BLOCKING IS WRONG`, and invisible to timing because
+/// the launch count is identical either way.
+fn emit_block_store(
+    out_tv_ssa: &str,
+    out_elem_offset: u32,
+    dtype: &str,
+    tile_key: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let t = ctx
+        .get_tile(tile_key)
+        .ok_or_else(|| format!("batched: stage produced no result tile ({tile_key})"))?
+        .clone();
+    // Shape from the tile the stage actually produced, not from the head's
+    // logical shape: ptoas rejects a mismatch outright
+    // ("tstore expects dst static element count (262144) to match src (32768)"),
+    // which is the good failure mode but only fires if the shapes disagree.
+    let pv = ctx.make_pv(out_tv_ssa, t.rows, t.cols, dtype, out_elem_offset, ops);
+    ops.push(format!(
+        "pto.tstore ins({} : {}) outs({} : {})",
+        t.ssa,
+        t.tb_type,
+        pv,
+        ptv_type(t.rows, t.cols, dtype)
+    ));
+    Ok(())
+}
+
 /// Emit a batched stage's loop, with its store inside.
 ///
 /// # Status: the STORE is fixed, the LOAD is not. Still wrong on device.
@@ -3119,35 +3201,44 @@ fn emit_batched_loop(
     let mut body: Vec<String> = Vec::new();
     ctx.set_pv_row_base(Some(base.clone()));
 
+    // Set by any arm that stores per block inside its own loop nest; the
+    // trailing store below is then skipped, since it would be a second write of
+    // the last block only.
+    let mut stored_inline = false;
+
     let result_tile = match p.kind {
         BatchedKind::Matmul => {
             // A head's own operands can still exceed their memory: at S=1024
             // the [S,HD] left tile is 256 KB against a 64 KB L0A cap, and pv's
             // [S,S] staging tile is 4 MB against 512 KB of L1. The head loop
             // slices ACROSS heads; this blocks rows WITHIN one head.
+            // N-BLOCKING IS NOT WIRED HERE. See BATCHING_PLAN.md: a
+            // context-wide column base is wrong because operands disagree on
+            // what their columns mean -- A is [M,K] (columns are K), B is
+            // [K,N] and the output is [M,N] (columns are N). Applying one base
+            // to all three made A read columns 256..319 instead of 0..63, which
+            // the device check caught at max_abs ~1e-1 with untouched=0.
             let mb = pick_batched_rows(p.m, p.k, p.n);
             let bb = p.b.clone().unwrap_or_else(|| p.a.clone());
-            // Substitute the row count directly rather than routing it through
-            // an inline const: the const table is keyed by &'static str, and
-            // synthesising one per block size would leak.
-            let mk_inner = |rows: u32| {
-                format!(
-                    "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {rows}, {}, {}) : \
-                     (i32, i32, i32, i32, i32, i32) -> i32",
-                    p.a, p.a, bb, p.k, p.n
-                )
+            let inner = format!(
+                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {mb}, {}, {}) : \
+                 (i32, i32, i32, i32, i32, i32) -> i32",
+                p.a, p.a, bb, p.k, p.n
+            );
+            let body_fn = |c: &mut PtoContext, o: &mut Vec<String>| -> Result<(), String> {
+                translate_matmul(&inner, c, o)?;
+                emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
             };
             if mb < p.m {
-                let n_blk = p.m.div_ceil(mb);
-                ctx.use_size(n_blk);
-                body.push(format!("scf.for %r_i = %c0 to %c{n_blk} step %c1 {{"));
-                let inner = mk_inner(mb);
-                ctx.with_row_block(mb, |c, o| translate_matmul(&inner, c, o), &mut body)?;
+                let r_blk = p.m.div_ceil(mb);
+                ctx.use_size(r_blk);
+                body.push(format!("scf.for %r_i = %c0 to %c{r_blk} step %c1 {{"));
+                ctx.with_row_block(mb, body_fn, &mut body)?;
                 body.push("}".to_string());
             } else {
-                let inner = mk_inner(p.m);
-                translate_matmul(&inner, ctx, &mut body)?;
+                body_fn(ctx, &mut body)?;
             }
+            stored_inline = true;
             "%__batched".to_string()
         }
         // The head's own [rows, cols] tile can exceed UB on its own: at
@@ -3180,11 +3271,15 @@ fn emit_batched_loop(
                         tile,
                         tile_buf_type(rb, cols, "f32")
                     ));
-                    emit_softmax_steps(&src, "%__batched", rb, cols, "f32", c, o)
+                    emit_softmax_steps(&src, "%__batched", rb, cols, "f32", c, o)?;
+                    // Store this block's rows before the next iteration
+                    // overwrites the result tile.
+                    emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
                 },
                 &mut body,
             )?;
             body.push("}".to_string());
+            stored_inline = true;
             "%__batched".to_string()
         }
         BatchedKind::Softmax => {
@@ -3267,18 +3362,25 @@ fn emit_batched_loop(
     };
 
     // The store, still inside the row-base scope so it lands at head h.
-    let out_pv = ctx.make_pv(out_tv_ssa, out_rows, out_cols, dtype, out_elem_offset, &mut body);
-    let tile = ctx
-        .get_tile(&result_tile)
-        .ok_or_else(|| format!("{name}: stage produced no result tile"))?
-        .clone();
-    body.push(format!(
-        "pto.tstore ins({} : {}) outs({} : {})",
-        tile.ssa,
-        tile.tb_type,
-        out_pv,
-        ptv_type(out_rows, out_cols, dtype)
-    ));
+    //
+    // Skipped when an arm already stored per block inside its own loop nest:
+    // this one sits outside those loops, so it would write only the last
+    // block's tile a second time.
+    if !stored_inline {
+        let out_pv =
+            ctx.make_pv(out_tv_ssa, out_rows, out_cols, dtype, out_elem_offset, &mut body);
+        let tile = ctx
+            .get_tile(&result_tile)
+            .ok_or_else(|| format!("{name}: stage produced no result tile"))?
+            .clone();
+        body.push(format!(
+            "pto.tstore ins({} : {}) outs({} : {})",
+            tile.ssa,
+            tile.tb_type,
+            out_pv,
+            ptv_type(out_rows, out_cols, dtype)
+        ));
+    }
 
     ctx.set_pv_row_base(None);
     ctx.clear_head_offsets();
@@ -3771,22 +3873,46 @@ fn translate_matmul_blocked(
 /// Returns `m` unchanged when the head already fits, so shapes that worked
 /// before emit byte-identically (no inner loop at all).
 fn pick_batched_rows(m: u32, k: u32, n: u32) -> u32 {
+    pick_batched_blocks(m, k, n).0
+}
+
+/// Rows AND columns per block for a matmul stage inside a batched loop.
+///
+/// Two dimensions because the tiles they bound differ:
+///
+///   a_left  [mb, k]  -> L0A   shrinks with ROWS
+///   b_right [k, nb]  -> L0B   shrinks with COLUMNS only -- no row term
+///   acc     [mb, nb] -> L0C   shrinks with either
+///
+/// So row-blocking alone cannot make a wide B fit: at S=512 both scores and pv
+/// stage a 128 KB `b_right` against a 64 KB L0B cap regardless of `mb`.
+/// Returns `(m, n)` unchanged when the head already fits, so shapes that worked
+/// before emit byte-identically with no inner loops at all.
+fn pick_batched_blocks(m: u32, k: u32, n: u32) -> (u32, u32) {
     let b = 4u64; // f32 batched stages
-    let fits = |mb: u32| -> bool {
+    let fits = |mb: u32, nb: u32| -> bool {
         let a = (mb as u64) * (k as u64) * b;
-        let acc = (mb as u64) * (n as u64) * b;
+        let br = (k as u64) * (nb as u64) * b;
+        let acc = (mb as u64) * (nb as u64) * b;
         a <= SPEC_A2A3.l1_size as u64
             && a <= SPEC_A2A3.l0_a_size as u64
+            && br <= SPEC_A2A3.l0_b_size as u64
             && acc <= SPEC_A2A3.l0_c_size as u64
     };
-    if fits(m) {
-        return m;
+    if fits(m, n) {
+        return (m, n);
+    }
+    // Shrink N first: it is the only lever on `b_right`, and it relieves the
+    // accumulator too. Then shrink rows for whatever remains.
+    let mut nb = n;
+    while nb > 16 && !fits(m.min(16), nb) {
+        nb /= 2;
     }
     let mut mb = m;
-    while mb > 16 && !fits(mb) {
+    while mb > 16 && !fits(mb, nb) {
         mb /= 2;
     }
-    mb.max(16)
+    (mb.max(16), nb.max(16))
 }
 
 /// A row-blocked softmax awaiting its store, so the loop can enclose it.
