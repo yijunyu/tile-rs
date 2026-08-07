@@ -550,6 +550,13 @@ pub struct SocSpec {
     pub ub_reserved: usize,
     /// `ubblock_size` from `[AICoreSpec]`, in bytes.
     pub ubblock_size: usize,
+    /// `l1_size` — the CBUF that `loc=mat` staging tiles live in.
+    pub l1_size: usize,
+    /// `l0_a_size` / `l0_b_size` — `loc=left` / `loc=right` operand tiles.
+    pub l0_a_size: usize,
+    pub l0_b_size: usize,
+    /// `l0_c_size` — `loc=acc` accumulator tiles.
+    pub l0_c_size: usize,
 }
 
 impl SocSpec {
@@ -566,6 +573,9 @@ impl SocSpec {
     pub fn from_platform_ini(ini: &str, ub_reserved: usize) -> Option<SocSpec> {
         let mut in_aicore = false;
         let (mut ub_size, mut ubblock_size) = (None, None);
+        // L1/L0 come from the same [AICoreSpec] block; default to the 910B2
+        // figures if a spec omits them rather than failing the whole parse.
+        let (mut l1, mut l0a, mut l0b, mut l0c) = (524288, 65536, 65536, 131072);
         for line in ini.lines() {
             let l = line.trim();
             if l.starts_with('[') {
@@ -580,17 +590,39 @@ impl SocSpec {
             match k.trim() {
                 "ub_size" => ub_size = Some(v),
                 "ubblock_size" => ubblock_size = Some(v),
+                "l1_size" => l1 = v,
+                "l0_a_size" => l0a = v,
+                "l0_b_size" => l0b = v,
+                "l0_c_size" => l0c = v,
                 _ => {}
             }
         }
-        Some(SocSpec { ub_size: ub_size?, ub_reserved, ubblock_size: ubblock_size? })
+        Some(SocSpec {
+            ub_size: ub_size?,
+            ub_reserved,
+            ubblock_size: ubblock_size?,
+            l1_size: l1,
+            l0_a_size: l0a,
+            l0_b_size: l0b,
+            l0_c_size: l0c,
+        })
     }
 }
 
 /// 910B2 / Ascend910_9392, from `Ascend910B2.ini` `[AICoreSpec]`.
 /// `ub_reserved` is the 8 KB A2/A3 TMP_UB scratch documented in TSels.hpp.
 pub const SPEC_A2A3: SocSpec =
-    SocSpec { ub_size: 196608, ub_reserved: 8 * 1024, ubblock_size: 32 };
+    // L1/L0 sizes are the same [AICoreSpec] block ub_size comes from:
+    //   l0_a_size=65536  l0_b_size=65536  l0_c_size=131072  l1_size=524288
+    SocSpec {
+        ub_size: 196608,
+        ub_reserved: 8 * 1024,
+        ubblock_size: 32,
+        l1_size: 524288,
+        l0_a_size: 65536,
+        l0_b_size: 65536,
+        l0_c_size: 131072,
+    };
 
 /// Target Ascend architecture — the constraints are arch-parametric (C6).
 trait AscendArch {
@@ -709,6 +741,57 @@ fn validate_tile_shape<A: AscendArch>(logical_rows: u32, logical_cols: u32, dtyp
 /// Linear UB budget (C1 + C5): bump-allocates bank-aligned tile offsets and
 /// rejects allocations that would exceed UB_SIZE. This is the space analogue of
 /// the Pnd/Rdy typestate — allocation consumes budget, `free` returns it.
+/// Which on-chip memory a tile occupies, from its `loc=` attribute.
+///
+/// This distinction is the whole point: the allocator used to charge EVERY
+/// tile against the Unified Buffer, but `mat` / `left` / `right` / `acc` live
+/// in L1 / L0A / L0B / L0C and never touch UB at all. A blocked f32 matmul is
+/// entirely cube-side, so it was being rejected by a UB budget it does not
+/// consume — the projection at S=48..96 uses **0 bytes of UB** and still failed
+/// C1. Only `loc=vec` is UB-resident.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TileSpace {
+    Ub,
+    L1,
+    L0A,
+    L0B,
+    L0C,
+}
+
+impl TileSpace {
+    /// Read the space out of a `!pto.tile_buf<loc=..., ...>` type string.
+    fn from_type(tb_ty: &str) -> TileSpace {
+        if tb_ty.contains("loc=mat") {
+            TileSpace::L1
+        } else if tb_ty.contains("loc=left") {
+            TileSpace::L0A
+        } else if tb_ty.contains("loc=right") {
+            TileSpace::L0B
+        } else if tb_ty.contains("loc=acc") {
+            TileSpace::L0C
+        } else {
+            TileSpace::Ub
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            TileSpace::Ub => "UB",
+            TileSpace::L1 => "L1",
+            TileSpace::L0A => "L0A",
+            TileSpace::L0B => "L0B",
+            TileSpace::L0C => "L0C",
+        }
+    }
+}
+
+/// Bump allocator per on-chip memory space.
+///
+/// Still a bump allocator with no free: tile lifetimes are not tracked, so a
+/// kernel's peak is its SUM rather than its true high-water mark. That is
+/// conservative (it can reject a kernel that would fit) but never unsound. What
+/// changed is that each tile is now charged against the memory it actually
+/// occupies, which is what the `loc=` attribute has always said.
 struct UbAllocator {
     cursor: usize,
     ub_size: usize,
@@ -716,29 +799,62 @@ struct UbAllocator {
     arch: &'static str,
     /// Peak live bytes (for diagnostics / a future budget report).
     peak: usize,
+    /// Cursors for the cube-side spaces, in the order of `TileSpace`.
+    l1: usize,
+    l0a: usize,
+    l0b: usize,
+    l0c: usize,
 }
 
 impl UbAllocator {
     fn new<A: AscendArch>() -> Self {
-        UbAllocator { cursor: 0, ub_size: A::UB_SIZE, fractal: A::FRACTAL_BYTES, arch: A::NAME, peak: 0 }
-    }
-    /// Bytes already committed. The allocator never frees, so this is what a
-    /// later allocation actually has to fit under.
-    fn live(&self) -> usize { self.cursor }
-    /// Place a tile of `bytes`: bank-align the base, error if it overflows UB.
-    /// Returns the (in-bounds, aligned) UB byte offset.
-    fn place(&mut self, bytes: usize) -> Result<u64, String> {
-        let base = (self.cursor + self.fractal - 1) / self.fractal * self.fractal; // align_up (C5)
-        let end = base + bytes;
-        if end > self.ub_size {
-            return Err(format!(
-                "NPU UB budget (arch {}): tile of {}B at offset {}B would use {}B > UB_SIZE {}B (C1); \
-                 the live tile working set exceeds the Unified Buffer — reduce tile shapes or free earlier",
-                self.arch, bytes, base, end, self.ub_size));
+        UbAllocator {
+            cursor: 0,
+            ub_size: A::UB_SIZE,
+            fractal: A::FRACTAL_BYTES,
+            arch: A::NAME,
+            peak: 0,
+            l1: 0,
+            l0a: 0,
+            l0b: 0,
+            l0c: 0,
         }
-        self.cursor = end;
-        if end > self.peak { self.peak = end; }
+    }
+
+    /// Bytes already committed to UB. The allocator never frees, so this is
+    /// what a later UB allocation has to fit under.
+    fn live(&self) -> usize {
+        self.cursor
+    }
+
+    /// Place a tile of `bytes` in `space`: bank-align the base, error if it
+    /// overflows that space's capacity.
+    fn place_in(&mut self, space: TileSpace, bytes: usize) -> Result<u64, String> {
+        let (cursor, cap) = match space {
+            TileSpace::Ub => (&mut self.cursor, self.ub_size),
+            TileSpace::L1 => (&mut self.l1, SPEC_A2A3.l1_size),
+            TileSpace::L0A => (&mut self.l0a, SPEC_A2A3.l0_a_size),
+            TileSpace::L0B => (&mut self.l0b, SPEC_A2A3.l0_b_size),
+            TileSpace::L0C => (&mut self.l0c, SPEC_A2A3.l0_c_size),
+        };
+        let base = (*cursor + self.fractal - 1) / self.fractal * self.fractal; // align_up (C5)
+        let end = base + bytes;
+        if end > cap {
+            return Err(format!(
+                "NPU {} budget (arch {}): tile of {}B at offset {}B would use {}B > {}_SIZE {}B (C1); \
+                 the live tile working set exceeds the {} — reduce tile shapes or free earlier",
+                space.name(), self.arch, bytes, base, end, space.name(), cap, space.name()));
+        }
+        *cursor = end;
+        if space == TileSpace::Ub && end > self.peak {
+            self.peak = end;
+        }
         Ok(base as u64)
+    }
+
+    /// Place a UB tile. Kept for callers that know the tile is vector-side.
+    fn place(&mut self, bytes: usize) -> Result<u64, String> {
+        self.place_in(TileSpace::Ub, bytes)
     }
     #[allow(dead_code)]
     fn free(&mut self, bytes: usize) { self.cursor = self.cursor.saturating_sub(bytes); }
@@ -1363,7 +1479,10 @@ impl PtoContext {
         if self.tile_error.is_none() {
             if let Err(e) = validate_tile_shape::<A2A3>(rows, cols, dtype, tb_ty) {
                 self.tile_error = Some(e);
-            } else if let Err(e) = self.ub.place(rows as usize * cols as usize * dtype_bytes_pto(dtype)) {
+            } else if let Err(e) = self.ub.place_in(
+                TileSpace::from_type(tb_ty),
+                rows as usize * cols as usize * dtype_bytes_pto(dtype),
+            ) {
                 self.tile_error = Some(e);
             }
         }
@@ -2311,7 +2430,7 @@ fn emit_blocked_matmul_loops(
     // than grid-strided: the N-loop below already claims block_idx for core
     // parallelism, and nesting two grid-strided loops would have cores compute
     // overlapping (m, n) blocks.
-    let (m_off_ssa, m_indent) = if p.m_iters > 1 {
+    let (m_off_ssa, _m_indent) = if p.m_iters > 1 {
         ctx.use_size(p.m_iters);
         ctx.use_size(p.mb);
         let off = ctx.fresh_ssa();
@@ -4142,12 +4261,20 @@ fn pick_kb_for_n_dtype(k: u32, n: u32, lhs_bytes: u32) -> u32 {
 ///   A_blk = mb * kb * lhs      B_blk = kb * nb * rhs      acc = mb * nb * 4
 /// Only the A and acc terms carry `mb`, so shrinking it is what bounds growth.
 fn pick_mb(m: u32, kb: u32, nb: u32, dtypes: &MatmulDtypes, live_bytes: usize) -> u32 {
-    let budget = (SPEC_A2A3.ub_budget() as u64).saturating_sub(live_bytes as u64);
+    let ub_budget = (SPEC_A2A3.ub_budget() as u64).saturating_sub(live_bytes as u64);
+    // A blocked matmul's M-carrying tiles are CUBE-side, so the binding limits
+    // are L1 (mat_a staging) and L0A (a_left), not the Unified Buffer. Sizing
+    // against UB alone picked mb=192 at S=96 and then failed L0A at 96 KB
+    // against a 64 KB cap. Every space the block touches has to be checked.
     let fits = |mb: u32| -> bool {
         let a = (mb as u64) * (kb as u64) * dtypes.lhs_bytes();
         let b = (kb as u64) * (nb as u64) * dtypes.rhs_bytes();
         let acc = (mb as u64) * (nb as u64) * 4;
-        a + b + acc <= budget
+        a <= SPEC_A2A3.l1_size as u64            // mat_a staging
+            && a <= SPEC_A2A3.l0_a_size as u64   // a_left
+            && b <= SPEC_A2A3.l0_b_size as u64   // b_right
+            && acc <= SPEC_A2A3.l0_c_size as u64 // acc
+            && a + b + acc <= ub_budget.max(SPEC_A2A3.l1_size as u64)
     };
     if fits(m) {
         return m; // already fits: emit exactly what the pre-M-blocking path did
