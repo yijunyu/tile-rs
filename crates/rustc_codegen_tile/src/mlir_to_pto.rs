@@ -4122,22 +4122,33 @@ struct PendingRowSoftmax {
 fn pick_softmax_rows(rows: u32, cols: u32, dtype: &str, live_bytes: usize) -> u32 {
     let budget = (SPEC_A2A3.ub_budget() as u64).saturating_sub(live_bytes as u64);
     let eb = dtype_bytes_pto(dtype) as u64;
+    // FIVE full tiles are live, not four: tmp, sub, exp and out are allocated
+    // here, and the SOURCE block is resident too. Modelling four approved
+    // rb=16 at S=640 for 200 KB against a 184 KB budget, and the guard then
+    // rejected what this function had just blessed -- the tile it named
+    // (40960 B at offset 164864 B) is exactly the fifth.
     let fits = |rb: u32| -> bool {
-        // 3 full tiles + out, and 2 rows x 1 reductions.
-        let full = 4 * (rb as u64) * (cols as u64) * eb;
+        let full = 5 * (rb as u64) * (cols as u64) * eb;
         let rr = 2 * (rb as u64) * eb;
         full + rr <= budget
     };
     if fits(rows) {
         return rows;
     }
+    // Step down one row at a time, with NO 16-row floor.
+    //
+    // A2/A3 sets `REQUIRES_ROW16 = false` -- the 16-row rule is a cube
+    // (NZ/fractal) constraint and softmax is a vector-side stage, so a 1-row
+    // block is legal. The old floor was mine, not the hardware's, and it is
+    // what made S >= 640 look impossible: at 16 rows the working set is 200 KB
+    // however the columns are tiled, so the search bottomed out above budget
+    // and reported failure. Without it the budget is sufficient well past
+    // S=4096 (rb falls to 14, 12, 10, 9, ... as S grows).
     let mut rb = rows;
-    // Halve down to a 16-row floor (cube tile granularity); rows must stay a
-    // divisor of `rows` so the last block is not ragged.
-    while rb > 16 && !fits(rb) {
-        rb /= 2;
+    while rb > 1 && !fits(rb) {
+        rb -= 1;
     }
-    rb.max(16)
+    rb.max(1)
 }
 
 /// Emit a row-blocked softmax: one loop, per-block load / 5 steps / store.
@@ -4166,13 +4177,35 @@ fn emit_row_softmax_loop(
         .get_tile(&p.src)
         .ok_or_else(|| format!("row-softmax: unknown tile {}", p.src))?
         .clone();
-    let d = tsrc.deferred.clone().ok_or_else(|| {
-        format!(
-            "row-softmax: operand {} was not deferred — its load sits outside \
-             the loop, so every block would read block 0",
-            p.src
-        )
-    })?;
+    // If the operand was NOT deferred, fall back to the unblocked body rather
+    // than failing.
+    //
+    // The deferral pre-pass has no PtoContext, so it must guess `live_bytes = 0`
+    // while `translate_softmax` sees the real cursor -- the two can therefore
+    // disagree about whether blocking happens. Every attempt to make them agree
+    // by guessing a budget in the pre-pass traded one mismatch for another: an
+    // optimistic guess left S=96 undeferred, a pessimistic one blocked an f16
+    // [16,1024] stage that genuinely fits. Making the emitter TOLERANT removes
+    // the coupling: a spare deferral costs nothing, and a missing one now
+    // degrades to the form that was already correct.
+    let Some(d) = tsrc.deferred.clone() else {
+        return emit_softmax_steps(&p.src, "%__sm", p.rows, cols, dtype, ctx, ops)
+            .and_then(|()| {
+                let pv = ctx.make_pv(out_tv_ssa, p.rows, cols, dtype, out_elem_offset, ops);
+                let t = ctx
+                    .get_tile("%__sm")
+                    .ok_or("row-softmax: unblocked fallback produced no tile")?
+                    .clone();
+                ops.push(format!(
+                    "pto.tstore ins({} : {}) outs({} : {})",
+                    t.ssa,
+                    t.tb_type,
+                    pv,
+                    ptv_type(p.rows, cols, dtype)
+                ));
+                Ok(())
+            });
+    };
 
     // Emit one block's body into a scratch buffer so allocations can be
     // hoisted: they are loop-invariant, and re-allocating per block would
@@ -5041,7 +5074,12 @@ fn detect_batched_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
         // Row-blocked softmax: same deferral, same reason. This pre-pass has
         // no PtoContext, so shape args arrive as SSA names -- resolve them from
         // the module's own `llvm.mlir.constant` lines.
-        if t.contains("__tile_softmax_f32") && !t.contains("_batched") {
+        // BOTH dtypes: the deferral must cover every softmax the picker might
+        // block, and f16 has its own intrinsic. Matching only f32 left the f16
+        // path blocking without a deferred load.
+        if (t.contains("__tile_softmax_f32") || t.contains("__tile_softmax_f16"))
+            && !t.contains("_batched")
+        {
             if let Some(args) = extract_call_args(t) {
                 let lookup = |a: Option<&String>| -> Option<u32> {
                     let a = a?.trim();
@@ -5061,7 +5099,29 @@ fn detect_batched_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
                 // Only when it will actually be blocked; otherwise leave the
                 // existing (byte-identical) unblocked emission alone.
                 if let (Some(r), Some(c)) = (lookup(args.get(2)), lookup(args.get(3))) {
-                    if pick_softmax_rows(r, c, "f32", 0) < r {
+                    // DEFER WHENEVER BLOCKING IS POSSIBLE, not only when it is
+                    // certain. This pre-pass has no PtoContext, so it must pass
+                    // live_bytes = 0 -- an optimistic budget. `translate_softmax`
+                    // sees the real cursor, so it can decide to block where this
+                    // decided not to, and the operand's load would then sit
+                    // outside the loop. That mismatch is caught loudly
+                    // ("operand was not deferred"), but the fix is to defer on
+                    // the OPTIMISTIC side: a deferred load that turns out not to
+                    // need blocking is re-emitted unblocked at no cost, whereas
+                    // a missing deferral is a hard failure.
+                    // Decide on the SAME budget `translate_softmax` will use.
+                    //
+                    // An earlier version also deferred "pessimistically" on half
+                    // the budget, reasoning that a spare deferral is harmless.
+                    // It is not: at f16 [16,1024] the stage fits (160 KB of
+                    // 184 KB) and must NOT be blocked, but the halved budget
+                    // said otherwise and forced a block the emitter then could
+                    // not complete. Guessing a different budget here trades one
+                    // mismatch for another; the honest fix is to model the same
+                    // thing in both places, which the corrected 5-tile cost now
+                    // does.
+                    let dt = if t.contains("_f16") { "f16" } else { "f32" };
+                    if pick_softmax_rows(r, c, dt, 0) < r {
                         if let Some(a) = args.get(1) {
                             wanted.push((a.trim().to_string(), "A"));
                         }
@@ -5099,7 +5159,14 @@ fn detect_batched_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
     }
 
     for (i, line) in body_lines.iter().enumerate() {
-        if !line.contains("__tile_load_f32") {
+        // Match every dtype's load, not just f32: an f16 softmax that needs
+        // blocking has an `__tile_load_f16` producer, and matching only f32
+        // left it undeferred -- the stage then failed loudly with "operand was
+        // not deferred", which is the guard working but the scan being wrong.
+        if !line.contains("__tile_load_f32")
+            && !line.contains("__tile_load_f16")
+            && !line.contains("__tile_load_i8")
+        {
             continue;
         }
         if let Some(res) = extract_result_ssa(line.trim()) {
