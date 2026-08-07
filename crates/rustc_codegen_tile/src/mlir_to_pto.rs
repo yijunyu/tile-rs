@@ -1249,6 +1249,42 @@ impl PtoContext {
         Some(out)
     }
 
+    /// Load a deferred operand for this iteration into a NAMED vec tile.
+    ///
+    /// The sibling `load_deferred_for_head` stops at the partition_view because
+    /// its caller (the matmul path) must allocate the tile itself — it needs a
+    /// MAT tile, and allocating a vec tile there made the kernel span both
+    /// engines, which cannot be built on this CANN at all.
+    ///
+    /// Vector-side generic stages have no such constraint and do need the load,
+    /// so this completes it: partition_view -> alloc -> tload, under whatever
+    /// row base `with_head_rows` has installed. Registering the tile under
+    /// `name` lets the caller refer to it from the inner call.
+    fn load_deferred_for_head_as(
+        &mut self,
+        t: &TileInfo,
+        rows: u32,
+        cols: u32,
+        name: &str,
+        ops: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let d = t
+            .deferred
+            .clone()
+            .ok_or_else(|| format!("batched: operand for {name} was not deferred"))?;
+        let dtype = t.dtype.clone();
+        let pv = self.make_pv(&d.tv_ssa, rows, cols, &dtype, d.elem_offset, ops);
+        let tile = self.alloc_tile(name, rows, cols, &dtype, ops);
+        ops.push(format!(
+            "pto.tload ins({} : {}) outs({} : {})",
+            pv,
+            ptv_type(rows, cols, &dtype),
+            tile,
+            tile_buf_type(rows, cols, &dtype)
+        ));
+        Ok(())
+    }
+
     /// Create a partition_view from a tensor_view SSA.
     ///
     /// `elem_offset` is the flat element offset into the GM buffer (from GEP analysis).
@@ -1596,6 +1632,25 @@ fn analyze_body(
         // `pipelined_for(depth)` marker — consumed by the cpp emitter's
         // `detect_tiling_loop`. PTO ignores it because ptoas auto-inserts
         // cross-pipe sync during assembly.
+        // MUST PRECEDE every stage-op check: `batched.inner` embeds an op
+        // call verbatim, so an earlier `contains("__tile_<op>_f32")` would
+        // claim this line and translate the inner call OUTSIDE the loop.
+        // The GENERIC batched form. One recognition point for every stage that
+        // is not matmul or softmax, so adding a stage costs a caller-side
+        // description instead of an intrinsic + enum arm + emitter body.
+        //
+        //   %o = llvm.call @__tile_batched_f32(%out, %heads, %rows, %cols)
+        //        { batched.inner = "<one MLIR call, operands as %__op0..>",
+        //          batched.operands = "<ssa>:<rows>x<cols>,..." } : ...
+        //
+        // Each operand states its OWN rows-per-iteration. That is what keeps
+        // the shared-row-base defect unrepresentable at this layer, the same
+        // property `GmBatch` gives in user source.
+        if line.contains("__tile_batched_f32") {
+            let kind = parse_generic_batched(line)?;
+            translate_batched(line, kind, ctx, &mut ops)?;
+            continue;
+        }
         if line.contains("__tile_pipelined_for_begin")
             || line.contains("__tile_pipelined_for_end")
         {
@@ -2578,12 +2633,42 @@ struct PendingBatched {
 }
 
 /// Which batched stage `translate_batched` is emitting.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// # This enum is the thing that does not generalise
+///
+/// Each arm is one hand-written stage, so a batched `silu_mul` needs a third
+/// intrinsic, a third arm, and a third body in `emit_batched_loop`. The
+/// *machinery* underneath is already stage-agnostic — `emit_batched_loop`
+/// hoists allocations, opens the grid-strided loop and puts the store inside;
+/// `with_head_rows` scopes a row base per operand. Only the dispatch is keyed
+/// on intrinsic name.
+///
+/// `Generic` is the way out: it carries the per-iteration operand list and the
+/// inner op as data, so a new stage is a caller-side description rather than an
+/// emitter change. The two named arms remain because they emit byte-identical
+/// PTO to what is already validated on device, and that equality is the test
+/// that the generic path is faithful (see `batched_generic_matches_named`).
+#[derive(Clone, PartialEq, Eq)]
 enum BatchedKind {
     /// `heads` independent (M×K)@(K×N) products.
     Matmul,
     /// `heads` independent row-softmaxes over (rows×cols).
     Softmax,
+    /// Any stage expressible as tile ops over per-iteration operands.
+    ///
+    /// `inner` is an MLIR call line to translate once per iteration, with
+    /// `%__op0`, `%__op1`, … standing for the operands. `operands` gives each
+    /// one its OWN rows-per-iteration, which is what keeps the shared-row-base
+    /// bug unrepresentable here rather than merely fixed.
+    Generic {
+        /// Iterations in the batch, from `batched.heads` (see the note in
+        /// `translate_batched` on why this is an attribute, not an argument).
+        heads: u32,
+        /// The intrinsic to emit inside the loop, e.g. `__tile_silu_mul_f32`.
+        inner_call: String,
+        /// Per-operand `(ssa, rows, cols)`, in the order `inner_call` names them.
+        operands: Vec<(String, u32, u32)>,
+    },
 }
 
 /// Emit a stage that covers all attention heads in ONE launch.
@@ -2620,20 +2705,31 @@ fn translate_batched(
     let name = match kind {
         BatchedKind::Matmul => "matmul_batched",
         BatchedKind::Softmax => "softmax_batched",
+        BatchedKind::Generic { .. } => "batched",
     };
     let result_ssa = extract_result_ssa(line)
         .ok_or_else(|| format!("{name}: no result SSA in: {line}"))?;
     let args = extract_call_args(line)
         .ok_or_else(|| format!("{name}: cannot parse args in: {line}"))?;
 
-    let heads = ctx.resolve_const(args.last().map(|s| s.as_str()).unwrap_or("0"));
+    // Heads is the last call argument for the NAMED forms. The generic form
+    // cannot use an argument at all: its attributes embed another call, and
+    // `extract_call_args` stops at the first `)`, so it returns the inner
+    // call's args spliced onto the outer ones (`%h` came back as
+    // `"%h) {batched.inner = ..."`). Attributes are read by a separate
+    // quote-delimited scanner that embedded parentheses cannot confuse, so the
+    // count lives there.
+    let heads = match &kind {
+        BatchedKind::Generic { heads, .. } => *heads,
+        _ => ctx.resolve_const(args.last().map(|s| s.as_str()).unwrap_or("0")),
+    };
     if heads == 0 {
         return Err(format!("{name}: head count is 0 or unresolved in: {line}"));
     }
 
-    let pending = match kind {
+    let pending = match &kind {
         BatchedKind::Matmul => PendingBatched {
-            kind,
+            kind: kind.clone(),
             heads,
             a: args.get(1).ok_or("matmul_batched: missing a")?.trim().to_string(),
             b: Some(args.get(2).ok_or("matmul_batched: missing b")?.trim().to_string()),
@@ -2642,7 +2738,7 @@ fn translate_batched(
             n: ctx.resolve_const(args.get(5).map(|s| s.as_str()).unwrap_or("0")),
         },
         BatchedKind::Softmax => PendingBatched {
-            kind,
+            kind: kind.clone(),
             heads,
             a: args.get(1).ok_or("softmax_batched: missing src")?.trim().to_string(),
             b: None,
@@ -2650,6 +2746,29 @@ fn translate_batched(
             k: 0,
             n: ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0")),
         },
+        // A generic stage carries its own operand list, so the caller has
+        // already said what to load and at what per-iteration height. Shape
+        // fields describe the OUTPUT only.
+        // Output shape comes from the FIRST operand's declared rows x cols,
+        // not from the call args: an elementwise stage writes what it reads,
+        // and taking it from the operand list keeps one source of truth for
+        // shape. (args 2/3 are the caller's %r/%c SSAs, which resolve_const
+        // cannot see through -- reading them there yielded `unknown tile %r`.)
+        BatchedKind::Generic { operands, .. } => {
+            let (first, rows, cols) = operands
+                .first()
+                .ok_or("batched: empty operand list")?
+                .clone();
+            PendingBatched {
+                a: first,
+                b: operands.get(1).map(|(s, _, _)| s.clone()),
+                m: rows,
+                k: 0,
+                n: cols,
+                kind: kind.clone(),
+                heads,
+            }
+        }
     };
 
     ctx.batched_result_stored_inline.insert(result_ssa.clone());
@@ -2702,6 +2821,7 @@ fn emit_batched_loop(
     let name = match p.kind {
         BatchedKind::Matmul => "matmul_batched",
         BatchedKind::Softmax => "softmax_batched",
+        BatchedKind::Generic { .. } => "batched",
     };
     let heads = p.heads;
     let (out_rows, out_cols) = (p.m, p.n);
@@ -2769,6 +2889,48 @@ fn emit_batched_loop(
             translate_softmax(&inner, "f32", ctx, &mut body)?;
             "%__batched".to_string()
         }
+        BatchedKind::Generic { ref inner_call, ref operands, .. } => {
+            // The generalised path: load each operand at ITS OWN rows-per-
+            // iteration, then translate one inner call. Nothing here knows what
+            // the stage computes, so a new stage is a caller-side description
+            // rather than another arm of this match.
+            //
+            // Every operand must have been deferred by `detect_batched_loads`.
+            // A non-deferred operand is loaded once before the loop, so every
+            // iteration would read iteration 0's data — the exact bug that
+            // produced "written but wrong, byte-identically" on device. Fail
+            // loudly rather than emit it.
+            let mut names = Vec::with_capacity(operands.len());
+            for (i, (ssa, rows, cols)) in operands.iter().enumerate() {
+                let t = ctx
+                    .get_tile(ssa)
+                    .ok_or_else(|| format!("batched: unknown tile {ssa}"))?
+                    .clone();
+                if t.deferred.is_none() {
+                    return Err(format!(
+                        "batched: operand {ssa} was not deferred — its load sits \
+                         outside the loop, so every iteration would read \
+                         iteration 0"
+                    ));
+                }
+                let nm = format!("%__op{i}");
+                ctx.with_head_rows(
+                    *rows,
+                    |c, o| c.load_deferred_for_head_as(&t, *rows, *cols, &nm, o),
+                    &mut body,
+                )?;
+                names.push(nm);
+            }
+            // Shape constants the inner call may reference. `%__r`/`%__c` are
+            // the OUTPUT shape, which is what an elementwise stage operates at.
+            ctx.set_inline_consts(&[("%__r", p.m), ("%__c", p.n)]);
+            let mut inner = inner_call.clone();
+            for (i, nm) in names.iter().enumerate() {
+                inner = inner.replace(&format!("%__op{i}"), nm);
+            }
+            translate_line_in_batch(&inner, ctx, &mut body)?;
+            "%__batched".to_string()
+        }
     };
 
     // The store, still inside the row-base scope so it lands at head h.
@@ -2807,29 +2969,135 @@ fn emit_batched_loop(
     ops.push(format!("{bi} = arith.index_cast {bi64} : i64 to index"));
     ops.push(format!("{bn} = arith.index_cast {bn64} : i64 to index"));
     ops.push(format!("scf.for %h_i = {bi} to %c{heads} step {bn} {{"));
-    // KNOWN BUG: one row base is applied to EVERY operand.
+    // This is the OUTPUT's row base, and it is correct for the output alone.
     //
-    // That is only correct when all operands have the same rows-per-head. For
-    // scores = Q @ K^T they do not: Q is [S, D] with S rows per head, while the
-    // pre-transposed K is [D, S] with D rows. At the benchmarked shape S=32 and
-    // D=64, so K is read at half the offset it should be and every head after
-    // the first reads the wrong slice.
+    // It was once applied to every operand too, which is only right when all
+    // operands share rows-per-head. For scores = Q @ K^T they do not: Q is
+    // [S, D] with S rows per head, the pre-transposed K is [D, S] with D. At
+    // S=32 / D=64 that read K at half its offset, and every head after the
+    // first got the wrong slice — MERE 2.6e-01 against a 1.221e-4 bar.
     //
-    // The per-head parity check did not catch this because it exercises the
-    // batched SOFTMAX, whose single operand and output share a shape. The
-    // end-to-end check against model.py did: MERE 2.6e-01 against a 1.221e-4
-    // bar, where the per-head path gives 2.26e-06.
+    // Per-head parity could not see it: it exercises the batched SOFTMAX, whose
+    // single operand shares a shape with its output, which is exactly the case
+    // where a shared base happens to be right. Only end-to-end against model.py
+    // caught it. Two checks, two blind spots — keep both.
     //
-    // The fix is a base per operand rather than one shared base, which means
-    // load_deferred_for_head needs to know each operand's rows-per-head instead
-    // of inheriting the loop's. Left explicit rather than papered over.
+    // FIXED: operands now get their own base via `with_head_rows`, which scopes
+    // `pv_row_base` per operand (see the matmul path's two calls, m then k).
+    // The emitted PTO shows both, e.g. `%h_i * 32` for Q and `%h_i * 64` for
+    // K^T. All five operators pass end-to-end at MERE 1.0e-06..1.0e-05.
     ops.push(format!(
-        "  {base} = arith.muli %h_i, %c{} : index   // head row base (SHARED — see note)",
+        "  {base} = arith.muli %h_i, %c{} : index   // output head base",
         p.m
     ));
     ops.extend(inner_body);
     ops.push("}".to_string());
     Ok(())
+}
+
+/// Parse a `__tile_batched_f32` call's stage description into a `Generic` kind.
+///
+/// The two attributes are the whole interface:
+///   `batched.inner`    one MLIR call line, operands written `%__op0`, `%__op1`, …
+///   `batched.operands` `<ssa>:<rows>x<cols>` per operand, comma separated
+///
+/// Rows are per operand rather than per loop on purpose. One shared row base is
+/// correct only when every operand has the same height — true of a softmax,
+/// false of `Q @ K^T` — and that assumption cost a full debug cycle when it was
+/// implicit. Here it cannot be made implicitly.
+fn parse_generic_batched(line: &str) -> Result<BatchedKind, String> {
+    let attr = |name: &str| -> Option<String> {
+        let at = line.find(&format!("{name} = \""))?;
+        let rest = &line[at + name.len() + 4..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+    let inner_call = attr("batched.inner").ok_or_else(|| {
+        format!("batched: missing `batched.inner` attribute in: {line}")
+    })?;
+    let spec = attr("batched.operands").ok_or_else(|| {
+        format!("batched: missing `batched.operands` attribute in: {line}")
+    })?;
+
+    let mut operands = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (ssa, shape) = part
+            .split_once(':')
+            .ok_or_else(|| format!("batched: operand `{part}` is not `<ssa>:<rows>x<cols>`"))?;
+        let (r, c) = shape
+            .split_once('x')
+            .ok_or_else(|| format!("batched: operand `{part}` shape is not `<rows>x<cols>`"))?;
+        let rows: u32 = r.trim().parse().map_err(|_| format!("batched: bad rows in `{part}`"))?;
+        let cols: u32 = c.trim().parse().map_err(|_| format!("batched: bad cols in `{part}`"))?;
+        if rows == 0 || cols == 0 {
+            return Err(format!("batched: operand `{part}` has a zero dimension"));
+        }
+        operands.push((ssa.trim().to_string(), rows, cols));
+    }
+    if operands.is_empty() {
+        return Err(format!("batched: `batched.operands` is empty in: {line}"));
+    }
+    let heads: u32 = attr("batched.heads")
+        .ok_or_else(|| format!("batched: missing `batched.heads` attribute in: {line}"))?
+        .trim()
+        .parse()
+        .map_err(|_| format!("batched: `batched.heads` is not a number in: {line}"))?;
+    if heads == 0 {
+        return Err(format!("batched: `batched.heads` is 0 in: {line}"));
+    }
+    Ok(BatchedKind::Generic { heads, inner_call, operands })
+}
+
+/// Translate one inner call inside a batched loop.
+///
+/// A deliberately small dispatcher rather than a call back into the main loop:
+/// the main loop also handles loads, stores, GEPs and the batched intrinsics
+/// themselves, none of which may appear inside a batched body — a nested
+/// batched call, or a store that is not the loop's own, would produce silently
+/// wrong structure. Listing the stage ops here keeps "what can be batched"
+/// visible and makes anything else a clear error rather than a strange kernel.
+///
+/// Extending this is how a new stage becomes batchable. That is a one-line
+/// addition, against the intrinsic + enum arm + emitter body that the named
+/// path costs.
+fn translate_line_in_batch(
+    line: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    // Elementwise and reduction stages, f32. Matmul is NOT here: it needs
+    // MAT/left/right/acc tiles rather than vec, and the `Matmul` arm already
+    // emits the device-validated form.
+    let binaries = [
+        ("__tile_add_f32", "pto.tadd"),
+        ("__tile_sub_f32", "pto.tsub"),
+        ("__tile_mul_f32", "pto.tmul"),
+        ("__tile_div_f32", "pto.tdiv"),
+    ];
+    for (intr, op) in binaries {
+        if line.contains(intr) {
+            return translate_binary(line, "f32", op, ctx, ops);
+        }
+    }
+    let unaries = [
+        ("__tile_exp_f32", "pto.texp"),
+        ("__tile_neg_f32", "pto.tneg"),
+    ];
+    for (intr, op) in unaries {
+        if line.contains(intr) {
+            return translate_unary(line, "f32", op, ctx, ops);
+        }
+    }
+    if line.contains("__tile_silu_f32") {
+        return translate_unary(line, "f32", "pto.tsilu", ctx, ops);
+    }
+    if line.contains("__tile_softmax_f32") {
+        return translate_softmax(line, "f32", ctx, ops);
+    }
+    Err(format!(
+        "batched: no inner translation for this stage — extend \
+         translate_line_in_batch if it should be batchable: {line}"
+    ))
 }
 
 fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> Result<(), String> {
@@ -3840,6 +4108,18 @@ fn detect_batched_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
     let mut wanted: Vec<(String, &'static str)> = Vec::new();
     for line in body_lines {
         let t = line.trim();
+        // The generic form names its operands in an attribute rather than in
+        // the call args, so read them from there. Missing this would leave the
+        // loads outside the loop and every iteration would read iteration 0 —
+        // the failure that once produced "written, but wrong byte-identically".
+        if t.contains("__tile_batched_f32") {
+            if let Ok(BatchedKind::Generic { operands, .. }) = parse_generic_batched(t) {
+                for (ssa, _, _) in operands {
+                    wanted.push((ssa, "A"));
+                }
+            }
+            continue;
+        }
         let batched_mm = t.contains("__tile_matmul_batched_f32");
         let batched_sm = t.contains("__tile_softmax_batched_f32");
         if !batched_mm && !batched_sm {

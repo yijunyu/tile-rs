@@ -107,6 +107,190 @@ impl<'a, const R: usize, const C: usize, T> GmViewMut<'a, R, C, T> {
     }
 }
 
+// --- batched views -------------------------------------------------------
+//
+// A batch is `HEADS` independent `ROWS × COLS` operands laid out contiguously:
+// head `h` starts at element `h * ROWS * COLS`. Iterating a batch is what the
+// emitter turns into ONE grid-strided kernel launch instead of `HEADS` of them.
+//
+// The whole point of putting this in the type is the per-operand stride. The
+// worst bug in the hand-written batching applied ONE row base to every operand,
+// which is correct only when operands share rows-per-head -- true of a softmax
+// (one operand, same shape as its output), false of `Q @ K^T` where Q is [S,D]
+// and K^T is [D,S]. It survived per-head parity and was caught only end-to-end.
+// Here each view carries its OWN `ROWS`, so `h` advances Q by S and K^T by D
+// because that is what their types say. The bug is not fixed; it is
+// unrepresentable.
+//
+// `heads()` yields disjoint per-head views, and the mutable form hands out
+// `&mut`-shaped ownership per head, so a kernel that tries to reduce ACROSS
+// heads cannot be written -- the independence precondition is enforced by the
+// borrow checker rather than stated in a comment.
+
+/// Advance a const pointer by `n` elements.
+///
+/// Byte arithmetic through `usize` because this crate's `core` shim provides
+/// no `<*const T>::add`. Exact for the contiguous layout a batch requires.
+#[inline(always)]
+fn offset_const<T>(p: *const T, n: usize) -> *const T {
+    ((p as usize) + n * crate::core::mem::size_of::<T>()) as *const T
+}
+
+/// Advance a mut pointer by `n` elements. See [`offset_const`].
+#[inline(always)]
+fn offset_mut<T>(p: *mut T, n: usize) -> *mut T {
+    ((p as usize) + n * crate::core::mem::size_of::<T>()) as *mut T
+}
+
+/// A batch of `HEADS` read-only `ROWS × COLS` operands, contiguous per head.
+#[repr(transparent)]
+pub struct GmBatch<'a, const HEADS: usize, const ROWS: usize, const COLS: usize, T> {
+    ptr: *const T,
+    _brand: PhantomData<&'a T>,
+}
+
+/// A batch of `HEADS` mutable `ROWS × COLS` operands, contiguous per head.
+#[repr(transparent)]
+pub struct GmBatchMut<'a, const HEADS: usize, const ROWS: usize, const COLS: usize, T> {
+    ptr: *mut T,
+    _brand: PhantomData<&'a mut T>,
+}
+
+impl<'a, const H: usize, const R: usize, const C: usize, T> GmBatch<'a, H, R, C, T> {
+    /// Number of independent operands in this batch.
+    #[inline(always)]
+    pub const fn heads_len(&self) -> usize {
+        H
+    }
+
+    /// Base pointer. The emitter needs this; end users iterate instead.
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    /// The single head `h`, as an ordinary `GmView`.
+    ///
+    /// # Safety
+    /// `h < H`. Callers should prefer `heads()`, which cannot go out of range.
+    #[inline(always)]
+    pub unsafe fn head_unchecked(&self, h: usize) -> GmView<'a, R, C, T> {
+        GmView { ptr: offset_const(self.ptr, h * R * C), _brand: PhantomData }
+    }
+
+    /// Iterate the heads. This is the form the emitter recognises and turns
+    /// into a single grid-strided launch.
+    #[inline(always)]
+    pub fn heads(&self) -> GmBatchIter<'a, R, C, T> {
+        GmBatchIter { ptr: self.ptr, remaining: H, stride: R * C, _brand: PhantomData }
+    }
+}
+
+impl<'a, const H: usize, const R: usize, const C: usize, T> GmBatchMut<'a, H, R, C, T> {
+    #[inline(always)]
+    pub const fn heads_len(&self) -> usize {
+        H
+    }
+
+    #[inline(always)]
+    pub fn as_mut_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    /// # Safety
+    /// `h < H`, and no other live view may alias head `h`.
+    #[inline(always)]
+    pub unsafe fn head_unchecked_mut(&mut self, h: usize) -> GmViewMut<'a, R, C, T> {
+        GmViewMut { ptr: offset_mut(self.ptr, h * R * C), _brand: PhantomData }
+    }
+
+    /// Iterate the heads mutably. Yields disjoint views: `&mut self` means no
+    /// two heads are live at once, so a cross-head reduction will not compile.
+    #[inline(always)]
+    pub fn heads_mut(&mut self) -> GmBatchIterMut<'a, R, C, T> {
+        GmBatchIterMut { ptr: self.ptr, remaining: H, stride: R * C, _brand: PhantomData }
+    }
+}
+
+/// Iterator over the heads of a [`GmBatch`].
+pub struct GmBatchIter<'a, const ROWS: usize, const COLS: usize, T> {
+    ptr: *const T,
+    remaining: usize,
+    stride: usize,
+    _brand: PhantomData<&'a T>,
+}
+
+impl<'a, const R: usize, const C: usize, T> Iterator for GmBatchIter<'a, R, C, T> {
+    type Item = GmView<'a, R, C, T>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let v = GmView { ptr: self.ptr, _brand: PhantomData };
+        // SAFETY: `remaining` counts heads still inside the allocation the
+        // batch was minted over, so this stays in bounds (one-past-the-end on
+        // the final step, which is a legal pointer value).
+        self.ptr = offset_const(self.ptr, self.stride);
+        self.remaining -= 1;
+        Some(v)
+    }
+}
+
+impl<'a, const R: usize, const C: usize, T> GmBatchIter<'a, R, C, T> {
+    /// Heads not yet yielded. Inherent rather than `ExactSizeIterator`: this
+    /// crate's `core` shim defines a reduced `Iterator` and no such trait.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.remaining
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+/// Iterator over the heads of a [`GmBatchMut`], yielding disjoint views.
+pub struct GmBatchIterMut<'a, const ROWS: usize, const COLS: usize, T> {
+    ptr: *mut T,
+    remaining: usize,
+    stride: usize,
+    _brand: PhantomData<&'a mut T>,
+}
+
+impl<'a, const R: usize, const C: usize, T> Iterator for GmBatchIterMut<'a, R, C, T> {
+    type Item = GmViewMut<'a, R, C, T>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let v = GmViewMut { ptr: self.ptr, _brand: PhantomData };
+        // SAFETY: as above; and each yielded view covers a DISJOINT
+        // `stride`-element window, so no two aliases are ever live.
+        self.ptr = offset_mut(self.ptr, self.stride);
+        self.remaining -= 1;
+        Some(v)
+    }
+}
+
+impl<'a, const R: usize, const C: usize, T> GmBatchIterMut<'a, R, C, T> {
+    /// Heads not yet yielded. Inherent rather than `ExactSizeIterator`: this
+    /// crate's `core` shim defines a reduced `Iterator` and no such trait.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.remaining
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
 /// Device-memory context: a zero-sized token whose lifetime `'a` brands
 /// every view it mints. The launcher owns one, and views borrow from it,
 /// so no view can outlive the launch.
@@ -153,6 +337,30 @@ impl<'a> GmDeviceCtx<'a> {
         &'a self, ptr: *mut T,
     ) -> GmViewMut<'a, R, C, T> {
         GmViewMut { ptr, _brand: PhantomData }
+    }
+
+    /// Mint a read-only batch of `H` contiguous `R × C` operands.
+    ///
+    /// # Safety
+    /// `ptr` must back at least `H*R*C` contiguous readable elements of `T`,
+    /// with head `h` at offset `h*R*C`.
+    #[inline(always)]
+    pub unsafe fn batch<const H: usize, const R: usize, const C: usize, T>(
+        &'a self, ptr: *const T,
+    ) -> GmBatch<'a, H, R, C, T> {
+        GmBatch { ptr, _brand: PhantomData }
+    }
+
+    /// Mint a mutable batch of `H` contiguous `R × C` operands.
+    ///
+    /// # Safety
+    /// `ptr` must back at least `H*R*C` contiguous writable elements of `T`
+    /// and must not alias any other live view or batch from this ctx.
+    #[inline(always)]
+    pub unsafe fn batch_mut<const H: usize, const R: usize, const C: usize, T>(
+        &'a self, ptr: *mut T,
+    ) -> GmBatchMut<'a, H, R, C, T> {
+        GmBatchMut { ptr, _brand: PhantomData }
     }
 }
 
@@ -3475,3 +3683,4 @@ pub mod safe {
     }
 
 }
+
