@@ -925,6 +925,16 @@ struct PtoContext {
     pv_row_base: Option<String>,
     /// Column analogue of `pv_row_base`, for N-block loops.
     pv_col_base: Option<String>,
+    /// Rows per head for the A operand of the stage currently being emitted.
+    /// `translate_matmul` sees the BLOCK row count, not the head stride, so
+    /// without this A's head base came out `h_i * mb` instead of
+    /// `h_i * head_stride` -- every block of a head reading the same rows.
+    head_stride_a: Option<u32>,
+    /// Row offset contributed by an inner block loop, kept separately from
+    /// `pv_row_base` so `with_head_rows` can SUM with it. Using `pv_row_base`
+    /// for both conflated "the previous operand's head base" (replace) with
+    /// "this head's block offset" (add).
+    block_row_base: Option<String>,
     /// Constants injected for a synthesised call, so a re-emitted per-head line
     /// can carry its dimensions without inventing MLIR constant declarations.
     inline_consts: HashMap<String, u32>,
@@ -1143,6 +1153,8 @@ impl PtoContext {
             head_offsets: None,
             pv_row_base: None,
             pv_col_base: None,
+            head_stride_a: None,
+            block_row_base: None,
             batched_result_stored_inline: std::collections::HashSet::new(),
             softmax_rows_stored_inline: std::collections::HashSet::new(),
             pending_row_softmax: HashMap::new(),
@@ -1387,9 +1399,20 @@ impl PtoContext {
 
     /// Run `f` with the row base scaled for an operand of `rows` per head.
     ///
-    /// The loop publishes `%h_i`; this emits `%h_i * rows` and installs it as
-    /// the base for the duration, so operands with different heights land on
-    /// their own slices.
+    /// The loop publishes `%h_i`; this emits `%h_i * rows` so operands with
+    /// different heights land on their own slices.
+    ///
+    /// COMPOSES with an inner block offset rather than replacing it. When a
+    /// head is itself blocked, `with_row_block` has already installed
+    /// `%r_i * mb`, and overwriting it dropped that term entirely: A addressed
+    /// `h_i * mb` instead of `h_i * head_stride + r_i * mb`, so every block of
+    /// a head read the same rows. On device that is `untouched=0` with an
+    /// identical error in every column block — distinguishable from a column
+    /// mis-address (error DIFFERS per column block) only because the parity
+    /// check reports per (head, column block) rather than in aggregate.
+    ///
+    /// `rows` must be the operand's HEAD STRIDE, not the block size: the head
+    /// term steps over whole heads regardless of how finely one is walked.
     fn with_head_rows<T>(
         &mut self,
         rows: u32,
@@ -1402,7 +1425,24 @@ impl PtoContext {
         ops.push(format!(
             "  {b} = arith.muli %h_i, %c{rows} : index   // operand head base"
         ));
-        self.pv_row_base = Some(b);
+        // If an inner block loop already installed `%r_i * mb`, keep it: the
+        // operand address is head base PLUS block offset, and dropping either
+        // term is silently wrong.
+        //
+        // `block_row_base` is set only by `with_row_block`, so `prev` alone
+        // cannot be used here -- outside a block loop `prev` holds the previous
+        // OPERAND's head base, which must be replaced rather than summed.
+        let blk = self.block_row_base.clone();
+        self.pv_row_base = Some(match blk {
+            Some(blk) => {
+                let sum = self.fresh_ssa();
+                ops.push(format!(
+                    "  {sum} = arith.addi {b}, {blk} : index   // head base + row block"
+                ));
+                sum
+            }
+            None => b,
+        });
         let out = f(self, ops);
         self.pv_row_base = prev;
         out
@@ -1423,6 +1463,29 @@ impl PtoContext {
     ///
     /// This is the row base's lesson in the column dimension: a shared base is
     /// only correct when the operands agree, and here they do not.
+    /// Run `f` with the ROW-BLOCK offset suppressed.
+    ///
+    /// The mirror of `without_col_base`, and needed for the same reason on the
+    /// other operand. The M-block iterator indexes rows that are the M
+    /// dimension: true of `A` (`[M,K]`) and the output (`[M,N]`), false of `B`
+    /// (`[K,N]`, whose rows are K). Giving B the offset made every column block
+    /// of a head read the same wrong K rows — on device, identical error in
+    /// both column blocks of every head (max_abs ~1.1e-1).
+    ///
+    /// The full picture, which is what makes the four cases easy to get wrong:
+    ///
+    /// |        | rows are | takes r_i | cols are | takes n_i |
+    /// |--------|----------|-----------|----------|-----------|
+    /// | A [M,K]| M        | yes       | K        | no        |
+    /// | B [K,N]| K        | **no**    | N        | yes       |
+    /// | out    | M        | yes       | N        | yes       |
+    fn without_row_block<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = self.block_row_base.take();
+        let out = f(self);
+        self.block_row_base = prev;
+        out
+    }
+
     fn without_col_base<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let prev = self.pv_col_base.take();
         let out = f(self);
@@ -1489,11 +1552,18 @@ impl PtoContext {
                 ));
                 sum
             }
-            None => off,
+            None => off.clone(),
         };
+        // Publish the BLOCK OFFSET separately as well, so a later
+        // `with_head_rows` can SUM with it rather than replace it. Both terms
+        // are needed: the head base steps over whole heads, the block offset
+        // walks within one. Keeping them in one slot conflated "the previous
+        // operand's head base" (replace) with "this head's block offset" (add).
+        let prev_blk = self.block_row_base.replace(off);
         self.pv_row_base = Some(base);
         let out = f(self, ops);
         self.pv_row_base = prev;
+        self.block_row_base = prev_blk;
         out
     }
 
@@ -3230,39 +3300,47 @@ fn emit_batched_loop(
             // the [S,HD] left tile is 256 KB against a 64 KB L0A cap, and pv's
             // [S,S] staging tile is 4 MB against 512 KB of L1. The head loop
             // slices ACROSS heads; this blocks rows WITHIN one head.
-            // N-BLOCKING IS NOT WIRED. The column half is done and verified
-            // in the emitted PTO -- A gets no column offset, B and the output
-            // do (see `without_col_base`). What blocks it is the ROW half:
-            //
-            //   `with_head_rows` receives the BLOCK size, not the head stride,
-            //   so A's base came out `h_i * 128` instead of `h_i * 512`; and it
-            //   OVERWRITES `pv_row_base` rather than composing, discarding the
-            //   `r_i * mb` term `with_row_block` installed.
-            //
-            // On device that shows as every block written with identical error
-            // per head (max_abs ~1.4e-1), which is what distinguishes it from
-            // the earlier store bug (untouched=131072) and from a column-base
-            // bug (error differing between column blocks).
-            let mb = pick_batched_rows(p.m, p.k, p.n);
+            // Two blocking dimensions, bounding different tiles: `a_left` is
+            // [mb,k] and shrinks with ROWS, `b_right` is [k,nb] with no row
+            // term and shrinks only with COLUMNS.
+            let (mb, nb) = pick_batched_blocks(p.m, p.k, p.n);
+            // The head stride is the FULL rows-per-head; the block loops walk
+            // within it.
+            ctx.head_stride_a = Some(p.m);
             let bb = p.b.clone().unwrap_or_else(|| p.a.clone());
             let inner = format!(
-                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {mb}, {}, {}) : \
+                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {mb}, {}, {nb}) : \
                  (i32, i32, i32, i32, i32, i32) -> i32",
-                p.a, p.a, bb, p.k, p.n
+                p.a, p.a, bb, p.k
             );
+            // Store at the INNERMOST point; after the loops it writes only the
+            // last block.
             let body_fn = |c: &mut PtoContext, o: &mut Vec<String>| -> Result<(), String> {
                 translate_matmul(&inner, c, o)?;
                 emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
             };
-            if mb < p.m {
-                let r_blk = p.m.div_ceil(mb);
-                ctx.use_size(r_blk);
-                body.push(format!("scf.for %r_i = %c0 to %c{r_blk} step %c1 {{"));
-                ctx.with_row_block(mb, body_fn, &mut body)?;
+            let rows_fn = |c: &mut PtoContext, o: &mut Vec<String>| -> Result<(), String> {
+                if mb < p.m {
+                    let r_blk = p.m.div_ceil(mb);
+                    c.use_size(r_blk);
+                    o.push(format!("scf.for %r_i = %c0 to %c{r_blk} step %c1 {{"));
+                    c.with_row_block(mb, body_fn, o)?;
+                    o.push("}".to_string());
+                    Ok(())
+                } else {
+                    body_fn(c, o)
+                }
+            };
+            if nb < p.n {
+                let c_blk = p.n.div_ceil(nb);
+                ctx.use_size(c_blk);
+                body.push(format!("scf.for %n_i = %c0 to %c{c_blk} step %c1 {{"));
+                ctx.with_col_block(nb, rows_fn, &mut body)?;
                 body.push("}".to_string());
             } else {
-                body_fn(ctx, &mut body)?;
+                rows_fn(ctx, &mut body)?;
             }
+            ctx.head_stride_a = None;
             stored_inline = true;
             "%__batched".to_string()
         }
@@ -3605,11 +3683,17 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
         // Same shape of bug as the shared row base, one dimension over.
         let a_t = ctx
             .without_col_base(|c| {
-                c.with_head_rows(m, |c2, o| c2.load_deferred_for_head(&ta, m, k, o), ops)
+                // HEAD STRIDE, not the block row count: the head term steps
+                // over whole heads however finely one is walked.
+                let stride_a = c.head_stride_a.unwrap_or(m);
+                c.with_head_rows(stride_a, |c2, o| c2.load_deferred_for_head(&ta, m, k, o), ops)
             })
             .ok_or_else(|| format!("matmul_batched: operand {a_ssa} not deferred"))?;
+        // B is [K,N]: its rows are K, so the M-block offset must NOT reach it.
         let b_t = ctx
-            .with_head_rows(k, |c, o| c.load_deferred_for_head(&tb, k, n, o), ops)
+            .without_row_block(|c| {
+                c.with_head_rows(k, |c2, o| c2.load_deferred_for_head(&tb, k, n, o), ops)
+            })
             .ok_or_else(|| format!("matmul_batched: operand {b_ssa} not deferred"))?;
         (a_t, b_t)
     } else {
