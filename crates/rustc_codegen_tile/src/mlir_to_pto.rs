@@ -722,6 +722,9 @@ impl UbAllocator {
     fn new<A: AscendArch>() -> Self {
         UbAllocator { cursor: 0, ub_size: A::UB_SIZE, fractal: A::FRACTAL_BYTES, arch: A::NAME, peak: 0 }
     }
+    /// Bytes already committed. The allocator never frees, so this is what a
+    /// later allocation actually has to fit under.
+    fn live(&self) -> usize { self.cursor }
     /// Place a tile of `bytes`: bank-align the base, error if it overflows UB.
     /// Returns the (in-bounds, aligned) UB byte offset.
     fn place(&mut self, bytes: usize) -> Result<u64, String> {
@@ -861,8 +864,17 @@ struct PendingBlockedMatmul {
     m: u32,
     k: u32,
     n: u32,
+    /// M block. The A operand is `[M, K]` and M grows with sequence length
+    /// (`M = pad(B*S)`), so without an M block the A tile alone overflows the
+    /// UB: 128 KB at S=96 against a 184 KB budget. Blocking M makes the
+    /// working set S-INDEPENDENT — 80 KB at every S including 897, the largest
+    /// case the AscendC baselines cover.
+    mb: u32,
     kb: u32,
     nb: u32,
+    /// `1` means no M loop is emitted, preserving the pre-M-blocking output
+    /// byte for byte at shapes that already fit.
+    m_iters: u32,
     n_iters: u32,
     k_iters: u32,
     /// Dtype triple (dst, lhs, rhs) for the pto.tmatmul. The output tstore
@@ -986,6 +998,9 @@ impl PtoContext {
 
     /// Resolve an SSA value to a u32 constant, checking const_map first
     /// then falling back to parse_const_arg for %cN / literal values.
+    /// UB bytes already committed in this kernel.
+    fn ub_live_bytes(&self) -> usize { self.ub.live() }
+
     fn resolve_const(&self, s: &str) -> u32 {
         // Synthesised per-head calls carry their dims here rather than as
         // module constants.
@@ -2261,9 +2276,11 @@ fn emit_blocked_matmul_loops(
     let tv_a_ty = tv_type(p.m, p.k, p.dtypes.lhs);
     let tv_b_ty = tv_type(p.k, p.n, p.dtypes.rhs);
     let tv_o_ty = tv_type(p.m, p.n, out_dtype);
-    let pv_a_ty = ptv_type(p.m, p.kb, p.dtypes.lhs);
+    // Shapes that carry M use the BLOCK. At m_iters==1 `mb == m`, so these are
+    // the same strings the pre-M-blocking emitter produced.
+    let pv_a_ty = ptv_type(p.mb, p.kb, p.dtypes.lhs);
     let pv_b_ty = ptv_type(p.kb, p.nb, p.dtypes.rhs);
-    let pv_o_ty = ptv_type(p.m, p.nb, out_dtype);
+    let pv_o_ty = ptv_type(p.mb, p.nb, out_dtype);
     let _ = (tv_a_ty, tv_b_ty, tv_o_ty); // types carried via caller ctx, variables used for symmetry
 
     // Outer N-loop — parallelised across AICores via get_block_idx/num.
@@ -2289,6 +2306,24 @@ fn emit_blocked_matmul_loops(
     // f32. It is kept because it costs nothing here, but it does NOT mean an
     // f32 kernel must avoid an outer scf.for — which matters for batched
     // heads, where the loop form lifts the UB ceiling that unrolling imposes.
+    // Outermost M-loop. Emitted only when the A operand does not fit whole, so
+    // shapes that already worked keep byte-identical output. Sequential rather
+    // than grid-strided: the N-loop below already claims block_idx for core
+    // parallelism, and nesting two grid-strided loops would have cores compute
+    // overlapping (m, n) blocks.
+    let (m_off_ssa, m_indent) = if p.m_iters > 1 {
+        ctx.use_size(p.m_iters);
+        ctx.use_size(p.mb);
+        let off = ctx.fresh_ssa();
+        ops.push(format!(
+            "scf.for %m_i = %c0 to %c{} step %c1 {{", p.m_iters
+        ));
+        ops.push(format!("  {} = arith.muli %m_i, %c{} : index", off, p.mb));
+        (off, "  ")
+    } else {
+        ("%c0".to_string(), "")
+    };
+
     let (n_off_ssa, outer_indent) = if p.n_iters > 1 {
         let bi64_ssa = ctx.fresh_ssa();
         let bn64_ssa = ctx.fresh_ssa();
@@ -2379,16 +2414,30 @@ fn emit_blocked_matmul_loops(
         k_body_indent, k_off_ssa, p.kb
     ));
 
-    // Per-block partition_view for A[0:M, k_off:k_off+Kb].
+    // Per-block partition_view for A[m_off:m_off+Mb, k_off:k_off+Kb].
+    //
+    // The row offset folds the M-block iterator into the base. At m_iters==1
+    // `m_off_ssa` is `%c0` and this collapses to the previous `%c{a_base_row}`
+    // form, which is what keeps already-fitting shapes byte-identical.
+    let a_row_ssa = if p.m_iters > 1 {
+        let r = ctx.fresh_ssa();
+        ops.push(format!(
+            "{}{} = arith.addi {}, %c{} : index",
+            k_body_indent, r, m_off_ssa, a_base_row
+        ));
+        r
+    } else {
+        format!("%c{}", a_base_row)
+    };
     let pv_a_blk = ctx.fresh_ssa();
     ops.push(format!(
-        "{}{} = pto.partition_view {}, offsets = [%c{}, {}], sizes = [%c{}, %c{}] : {} -> {}",
+        "{}{} = pto.partition_view {}, offsets = [{}, {}], sizes = [%c{}, %c{}] : {} -> {}",
         k_body_indent,
         pv_a_blk,
         p.tv_a_ssa,
-        a_base_row,
+        a_row_ssa,
         k_off_ssa,
-        p.m,
+        p.mb,
         p.kb,
         tv_type(p.m, p.k, p.dtypes.lhs),
         pv_a_ty
@@ -2453,15 +2502,28 @@ fn emit_blocked_matmul_loops(
     ops.push(format!("{}}}", k_indent)); // close K-loop
 
     // Store this block-column of the result: output[0:M, n_off:n_off+Nb].
+    // Output block lands at the same M offset the A block was read from, so
+    // each (m, n) block writes its own rows. Collapses to the previous form at
+    // m_iters==1.
+    let out_row_ssa = if p.m_iters > 1 {
+        let r = ctx.fresh_ssa();
+        ops.push(format!(
+            "{}{} = arith.addi {}, %c{} : index",
+            k_indent, r, m_off_ssa, out_base_row
+        ));
+        r
+    } else {
+        format!("%c{}", out_base_row)
+    };
     let pv_o_blk = ctx.fresh_ssa();
     ops.push(format!(
-        "{}{} = pto.partition_view {}, offsets = [%c{}, {}], sizes = [%c{}, %c{}] : {} -> {}",
+        "{}{} = pto.partition_view {}, offsets = [{}, {}], sizes = [%c{}, %c{}] : {} -> {}",
         k_indent,
         pv_o_blk,
         tv_out_ssa,
-        out_base_row,
+        out_row_ssa,
         n_off_ssa,
-        p.m,
+        p.mb,
         p.nb,
         tv_type(p.m, p.n, out_dtype),
         pv_o_ty
@@ -2527,6 +2589,9 @@ fn emit_blocked_matmul_loops(
 
     if p.n_iters > 1 {
         ops.push("}".to_string()); // close N-loop
+    }
+    if p.m_iters > 1 {
+        ops.push("}".to_string()); // close M-loop
     }
 }
 
@@ -3283,15 +3348,21 @@ fn translate_matmul_blocked(
     //   a_left (M × Kb)  — L0A working copy, dtype=lhs
     //   b_right (Kb × Nb) — L0B working copy, dtype=rhs
     //   acc    (M × Nb)  — L0C accumulator (one block-column at a time), dtype=dst
-    let mat_a_ty = mat_tile_type(m, kb, dtypes.lhs);
+    // Decide the M block BEFORE allocating: mat_a / a_left / acc all carry M,
+    // and at full M the staging tile alone can exceed the UB (512x128xf32 =
+    // 256 KB against 184 KB) long before the loop that would have tiled it.
+    let mb = pick_mb(m, kb, nb, &dtypes, ctx.ub_live_bytes());
+    let m_iters = m.div_ceil(mb.max(1));
+
+    let mat_a_ty = mat_tile_type(mb, kb, dtypes.lhs);
     let mat_b_ty = mat_tile_type(kb, nb, dtypes.rhs);
-    let left_ty = left_tile_type(m, kb, dtypes.lhs);
+    let left_ty = left_tile_type(mb, kb, dtypes.lhs);
     let right_ty = right_tile_type(kb, nb, dtypes.rhs);
-    let acc_ty = acc_tile_type(m, nb, dtypes.dst);
+    let acc_ty = acc_tile_type(mb, nb, dtypes.dst);
 
     let mat_a_ssa = ctx.alloc_tile_typed(
         &format!("{}__mat_a_blk", result_ssa),
-        m,
+        mb,
         kb,
         dtypes.lhs,
         &mat_a_ty,
@@ -3307,7 +3378,7 @@ fn translate_matmul_blocked(
     );
     let a_left_ssa = ctx.alloc_tile_typed(
         &format!("{}__a_left_blk", result_ssa),
-        m,
+        mb,
         kb,
         dtypes.lhs,
         &left_ty,
@@ -3326,7 +3397,7 @@ fn translate_matmul_blocked(
     // inline below. The downstream tstore must recognise "already stored"
     // to avoid a duplicate emit.
     let acc_ssa =
-        ctx.alloc_tile_typed(result_ssa, m, nb, dtypes.dst, &acc_ty, ops);
+        ctx.alloc_tile_typed(result_ssa, mb, nb, dtypes.dst, &acc_ty, ops);
 
     // Per the design note: we emit the per-N-block tstore inline below.
     // To avoid translate_store re-emitting a full-shape tstore for
@@ -3373,8 +3444,10 @@ fn translate_matmul_blocked(
         m,
         k,
         n,
+        mb,
         kb,
         nb,
+        m_iters,
         n_iters,
         k_iters,
         dtypes,
@@ -3981,6 +4054,9 @@ fn translate_silu(
 /// exception) and the UB working set at 144 KB, inside the 184 KB budget.
 const PTO_MM_KB: u32 = 128;
 const PTO_MM_NB: u32 = 64;
+/// Cap for the M block. 64 rows keeps the f32 working set at 80 KB against a
+/// 184 KB budget for every sequence length, including S=897.
+const PTO_MM_MB: u32 = 64;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
 /// BLayout based on the companion `Right` tile width. At Nb=64 with i8 Left,
 /// ptoas silently emits `BLayout::ColMajor` (wrong) instead of RowMajor.
@@ -4056,6 +4132,34 @@ fn pick_kb_for_n_dtype(k: u32, n: u32, lhs_bytes: u32) -> u32 {
 
 /// Pick an effective N block size: min(N, PTO_MM_NB). If N is smaller than
 /// PTO_MM_NB we skip the N-loop and emit a single tmatmul.
+/// Pick an M block: the largest power-of-two multiple of 16 up to
+/// `PTO_MM_MB` that keeps the live working set inside the UB budget.
+///
+/// Returns `m` itself when the whole operand already fits, so shapes that
+/// worked before emit byte-identically (no M loop is generated at m_iters==1).
+///
+/// The working set is A_blk + B_blk + acc:
+///   A_blk = mb * kb * lhs      B_blk = kb * nb * rhs      acc = mb * nb * 4
+/// Only the A and acc terms carry `mb`, so shrinking it is what bounds growth.
+fn pick_mb(m: u32, kb: u32, nb: u32, dtypes: &MatmulDtypes, live_bytes: usize) -> u32 {
+    let budget = (SPEC_A2A3.ub_budget() as u64).saturating_sub(live_bytes as u64);
+    let fits = |mb: u32| -> bool {
+        let a = (mb as u64) * (kb as u64) * dtypes.lhs_bytes();
+        let b = (kb as u64) * (nb as u64) * dtypes.rhs_bytes();
+        let acc = (mb as u64) * (nb as u64) * 4;
+        a + b + acc <= budget
+    };
+    if fits(m) {
+        return m; // already fits: emit exactly what the pre-M-blocking path did
+    }
+    // Walk down in 16-row steps (the cube tile granularity) to the largest fit.
+    let mut mb = m.min(PTO_MM_MB);
+    while mb > 16 && !fits(mb) {
+        mb -= 16;
+    }
+    mb.max(16)
+}
+
 fn pick_nb(n: u32) -> u32 {
     pick_nb_for_dtype(n, 2)
 }
@@ -4079,7 +4183,19 @@ fn matmul_needs_blocking(m: u32, k: u32, n: u32, dtypes: &MatmulDtypes) -> bool 
     const L0_CAP_BYTES: u64 = 64 * 1024; // L0A and L0B individual cap
     let mk_bytes = (m as u64) * (k as u64) * dtypes.lhs_bytes();
     let kn_bytes = (k as u64) * (n as u64) * dtypes.rhs_bytes();
-    mk_bytes > L0_CAP_BYTES || kn_bytes > L0_CAP_BYTES
+    if mk_bytes > L0_CAP_BYTES || kn_bytes > L0_CAP_BYTES {
+        return true;
+    }
+    // Also block when the UNBLOCKED working set would not fit the UB.
+    //
+    // Testing only the L0 caps missed exactly the case M-blocking exists for:
+    // at S=96 the A operand is 256x96xf32 = 96 KB, under the 64 KB L0 cap only
+    // after tiling but over the UB budget as a live tile, so the emitter took
+    // the unblocked path and then failed the C1 guard. The projection's
+    // M = pad(B*S) grows with sequence length, so this is the term that decides
+    // whether long sequences can be emitted at all.
+    let acc_bytes = (m as u64) * (n as u64) * 4;
+    mk_bytes + kn_bytes + acc_bytes > SPEC_A2A3.ub_budget() as u64
 }
 
 /// Pre-pass: find tile_load lines whose result is consumed only by a
