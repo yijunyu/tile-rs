@@ -4945,7 +4945,22 @@ fn pick_nb(n: u32) -> u32 {
 /// which produces garbage numerics.
 fn pick_nb_for_dtype(n: u32, lhs_bytes: u32) -> u32 {
     let nb_base = if lhs_bytes == 1 { PTO_MM_NB_I8 } else { PTO_MM_NB };
-    nb_base.min(n)
+    let mut nb = nb_base.min(n);
+    // Nb must DIVIDE n: the blocked emitter rejects `n % nb != 0` outright, and
+    // `min(64, n)` does not guarantee it. At n=96 that gave nb=64 and a hard
+    // "N=96 must be a multiple of Nb=64", which is what made every sequence
+    // length in 72..96 unemittable — 4 of the 11 failing lengths in a 16..1024
+    // sweep, and the cheapest band to close because it is pure block policy.
+    //
+    // Halve rather than step by 16: `PTO_MM_NB_I8 = 256` exists because ptoas
+    // picks the L0A Left tile's BLayout from the companion Right tile's WIDTH,
+    // and silently emits ColMajor for i8 at Nb=64. That hazard is width-linked
+    // and only validated at power-of-two widths, so staying on powers of two
+    // keeps every shape inside the territory the device probes covered.
+    while nb > 16 && n % nb != 0 {
+        nb /= 2;
+    }
+    nb
 }
 
 /// Decide whether this matmul shape requires blocking. We block when
