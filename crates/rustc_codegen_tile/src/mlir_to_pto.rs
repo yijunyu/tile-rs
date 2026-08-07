@@ -918,6 +918,9 @@ struct PtoContext {
     /// the loop early produced a kernel that computed every head and stored
     /// only the last — verified wrong on device.
     batched_result_stored_inline: std::collections::HashSet<String>,
+    /// Softmaxes whose rows are blocked; the loop must enclose their store.
+    softmax_rows_stored_inline: std::collections::HashSet<String>,
+    pending_row_softmax: HashMap<String, PendingRowSoftmax>,
     /// Pending batched emissions keyed by result SSA.
     pending_batched: HashMap<String, PendingBatched>,
     /// silu_mul result SSAs whose store is emitted inline (per-N-block) by
@@ -1097,6 +1100,8 @@ impl PtoContext {
             head_offsets: None,
             pv_row_base: None,
             batched_result_stored_inline: std::collections::HashSet::new(),
+            softmax_rows_stored_inline: std::collections::HashSet::new(),
+            pending_row_softmax: HashMap::new(),
             pending_batched: HashMap::new(),
             inline_consts: HashMap::new(),
             tv_map: HashMap::new(),
@@ -2283,6 +2288,18 @@ fn translate_store(
             .ok_or_else(|| format!("tile_store: pending batched stage for {} missing", buf_ssa))?;
         let out_tv_ssa = ctx.get_or_make_tv(&gm_name, rows, cols, dtype, ops);
         return emit_batched_loop(&out_tv_ssa, elem_offset, dtype, &pending, ctx, ops);
+    }
+
+    // Row-blocked softmax intercept: the loop has to CONTAIN the store, or
+    // only the last block reaches GM — the same failure the batched path hit
+    // (heads 1..N untouched) for the same reason.
+    if ctx.softmax_rows_stored_inline.contains(buf_ssa) {
+        let pending = ctx
+            .pending_row_softmax
+            .remove(buf_ssa)
+            .ok_or_else(|| format!("tile_store: pending row-softmax for {buf_ssa} missing"))?;
+        let out_tv_ssa = ctx.get_or_make_tv(&gm_name, rows, cols, dtype, ops);
+        return emit_row_softmax_loop(&out_tv_ssa, elem_offset, dtype, &pending, ctx, ops);
     }
 
     // Blocked-silu_mul intercept (#67): same shape as the matmul one — the
@@ -3605,6 +3622,140 @@ fn translate_matmul_blocked(
 ///
 /// This matches the FlashAttention reference implementation in pto-isa:
 /// `TROWMAX(new_max, x, tmp)` → `TROWEXPANDSUB(sub, x, new_max)` → `TEXP` → `TROWSUM` → `TROWEXPANDDIV`
+/// A row-blocked softmax awaiting its store, so the loop can enclose it.
+#[derive(Clone)]
+struct PendingRowSoftmax {
+    src: String,
+    rows: u32,
+    cols: u32,
+    /// Rows per block; `rows` when the whole tile already fits.
+    rb: u32,
+    n_blocks: u32,
+    dtype: String,
+}
+
+/// Rows per softmax block.
+///
+/// Row-tiling a softmax is EXACT, not an approximation: `trowmax`, `trowsum`
+/// and both expand steps reduce along columns, within a row, so row `i` depends
+/// on no other row. (Splitting COLUMNS would be a different problem needing
+/// online rescaling — that is flash-attention, and it is not what this does.)
+///
+/// The 5-step stable form keeps 3 full `[rows, cols]` tiles live (tmp, sub,
+/// exp) plus 2 row-reduction tiles, so at S=128 f32 that is ~193 KB against a
+/// 184 KB budget. Returns `rows` unchanged when the whole thing already fits,
+/// which is what keeps existing kernels byte-identical.
+fn pick_softmax_rows(rows: u32, cols: u32, dtype: &str, live_bytes: usize) -> u32 {
+    let budget = (SPEC_A2A3.ub_budget() as u64).saturating_sub(live_bytes as u64);
+    let eb = dtype_bytes_pto(dtype) as u64;
+    let fits = |rb: u32| -> bool {
+        // 3 full tiles + out, and 2 rows x 1 reductions.
+        let full = 4 * (rb as u64) * (cols as u64) * eb;
+        let rr = 2 * (rb as u64) * eb;
+        full + rr <= budget
+    };
+    if fits(rows) {
+        return rows;
+    }
+    let mut rb = rows;
+    // Halve down to a 16-row floor (cube tile granularity); rows must stay a
+    // divisor of `rows` so the last block is not ragged.
+    while rb > 16 && !fits(rb) {
+        rb /= 2;
+    }
+    rb.max(16)
+}
+
+/// Emit a row-blocked softmax: one loop, per-block load / 5 steps / store.
+///
+/// Row-tiling is exact — every reduction is along columns, within a row — so
+/// this computes the same values as the unblocked form, in blocks that fit.
+///
+/// The store is INSIDE the loop. A store left outside writes only the last
+/// block, which is the defect the batched work hit as "iterations 1..N
+/// untouched"; the shape of the bug is identical, so the shape of the fix is.
+fn emit_row_softmax_loop(
+    out_tv_ssa: &str,
+    out_elem_offset: u32,
+    dtype: &str,
+    p: &PendingRowSoftmax,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let (rb, cols) = (p.rb, p.cols);
+    ops.push(format!(
+        "// --- softmax: {} rows in blocks of {rb}, store inside the loop ---",
+        p.rows
+    ));
+
+    let tsrc = ctx
+        .get_tile(&p.src)
+        .ok_or_else(|| format!("row-softmax: unknown tile {}", p.src))?
+        .clone();
+    let d = tsrc.deferred.clone().ok_or_else(|| {
+        format!(
+            "row-softmax: operand {} was not deferred — its load sits outside \
+             the loop, so every block would read block 0",
+            p.src
+        )
+    })?;
+
+    // Emit one block's body into a scratch buffer so allocations can be
+    // hoisted: they are loop-invariant, and re-allocating per block would
+    // charge the UB budget once per iteration.
+    let base = ctx.fresh_ssa();
+    let mut body: Vec<String> = Vec::new();
+    ctx.set_pv_row_base(Some(base.clone()));
+
+    let pv = ctx.make_pv(&d.tv_ssa, rb, cols, dtype, d.elem_offset, &mut body);
+    let src_blk = format!("{}__srcblk", p.src);
+    let src_tile = ctx.alloc_tile(&src_blk, rb, cols, dtype, &mut body);
+    body.push(format!(
+        "pto.tload ins({} : {}) outs({} : {})",
+        pv,
+        ptv_type(rb, cols, dtype),
+        src_tile,
+        tile_buf_type(rb, cols, dtype)
+    ));
+
+    let out_key = format!("{}__outblk", p.src);
+    emit_softmax_steps(&src_blk, &out_key, rb, cols, dtype, ctx, &mut body)?;
+
+    let out_pv = ctx.make_pv(out_tv_ssa, rb, cols, dtype, out_elem_offset, &mut body);
+    let out_tile = ctx
+        .get_tile(&out_key)
+        .ok_or("row-softmax: softmax produced no result tile")?
+        .clone();
+    body.push(format!(
+        "pto.tstore ins({} : {}) outs({} : {})",
+        out_tile.ssa,
+        out_tile.tb_type,
+        out_pv,
+        ptv_type(rb, cols, dtype)
+    ));
+
+    ctx.set_pv_row_base(None);
+
+    let mut hoisted: Vec<String> = Vec::new();
+    let mut inner: Vec<String> = Vec::new();
+    for l in body {
+        if l.contains("pto.alloc_tile") {
+            hoisted.push(l);
+        } else {
+            inner.push(format!("  {l}"));
+        }
+    }
+    ops.extend(hoisted);
+
+    ctx.use_size(p.n_blocks);
+    ctx.use_size(rb);
+    ops.push(format!("scf.for %r_i = %c0 to %c{} step %c1 {{", p.n_blocks));
+    ops.push(format!("  {base} = arith.muli %r_i, %c{rb} : index   // row block base"));
+    ops.extend(inner);
+    ops.push("}".to_string());
+    Ok(())
+}
+
 fn translate_softmax(
     line: &str,
     dtype: &str,
@@ -3619,18 +3770,62 @@ fn translate_softmax(
     let rows = ctx.resolve_const(args.get(2).map(|s| s.as_str()).unwrap_or("0"));
     let cols = ctx.resolve_const(args.get(3).map(|s| s.as_str()).unwrap_or("0"));
 
+    // Never block inside an enclosing batched loop: that loop already slices
+    // the operand, the row base is taken, and deferring here would leave the
+    // stage with no result tile for its store.
+    let rb = if ctx.in_batched_loop() {
+        rows
+    } else {
+        pick_softmax_rows(rows, cols, dtype, ctx.ub_live_bytes())
+    };
+    let n_blocks = rows.div_ceil(rb.max(1));
+    if rb < rows {
+        // Blocked: defer to the store, which is where the output GM view is
+        // known and therefore where the enclosing loop can be emitted.
+        ctx.softmax_rows_stored_inline.insert(result_ssa.clone());
+        ctx.pending_row_softmax.insert(
+            result_ssa.clone(),
+            PendingRowSoftmax {
+                src: src_ssa.to_string(),
+                rows,
+                cols,
+                rb,
+                n_blocks,
+                dtype: dtype.to_string(),
+            },
+        );
+        return Ok(());
+    }
+
+    emit_softmax_steps(src_ssa, &result_ssa, rows, cols, dtype, ctx, ops)
+}
+
+/// The 5-step numerically-stable softmax, over one `[rows, cols]` tile.
+///
+/// Shared by the plain and row-blocked paths so the two cannot drift: the
+/// blocked form is this same body under a loop, at a smaller `rows`.
+///
+///   trowmax -> trowexpandsub -> texp -> trowsum -> trowexpanddiv
+fn emit_softmax_steps(
+    src_key: &str,
+    out_key: &str,
+    rows: u32,
+    cols: u32,
+    dtype: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
     let tsrc = ctx
-        .get_tile(src_ssa)
-        .ok_or_else(|| format!("softmax: unknown tile {}", src_ssa))?
+        .get_tile(src_key)
+        .ok_or_else(|| format!("softmax: unknown tile {src_key}"))?
         .clone();
     let tb_ty = tile_buf_type(rows, cols, dtype);
 
-    // Step 1: allocate scratch tiles
-    let t_max_key = format!("{}__max", result_ssa);
-    let t_tmp_key = format!("{}__tmp", result_ssa);
-    let t_sub_key = format!("{}__sub", result_ssa);
-    let t_exp_key = format!("{}__exp", result_ssa);
-    let t_sum_key = format!("{}__sum", result_ssa);
+    let t_max_key = format!("{out_key}__max");
+    let t_tmp_key = format!("{out_key}__tmp");
+    let t_sub_key = format!("{out_key}__sub");
+    let t_exp_key = format!("{out_key}__exp");
+    let t_sum_key = format!("{out_key}__sum");
 
     // t_max and t_sum are row-reduction outputs: rows×1, col_major
     let rr_ty = tile_buf_type_rowreduce(rows, dtype);
@@ -3639,8 +3834,7 @@ fn translate_softmax(
     let t_sub_ssa = ctx.alloc_tile(&t_sub_key, rows, cols, dtype, ops);
     let t_exp_ssa = ctx.alloc_tile(&t_exp_key, rows, cols, dtype, ops);
     let t_sum_ssa = ctx.alloc_tile_rowreduce(&t_sum_key, rows, dtype, ops);
-    // Step 5 destination mapped to result_ssa
-    let t_out_ssa = ctx.alloc_tile(&result_ssa, rows, cols, dtype, ops);
+    let t_out_ssa = ctx.alloc_tile(out_key, rows, cols, dtype, ops);
 
     let src_ssa_pto = tsrc.ssa.clone();
 
@@ -4355,6 +4549,38 @@ fn detect_batched_loads(body_lines: &[String]) -> HashMap<usize, &'static str> {
         // the call args, so read them from there. Missing this would leave the
         // loads outside the loop and every iteration would read iteration 0 —
         // the failure that once produced "written, but wrong byte-identically".
+        // Row-blocked softmax: same deferral, same reason. This pre-pass has
+        // no PtoContext, so shape args arrive as SSA names -- resolve them from
+        // the module's own `llvm.mlir.constant` lines.
+        if t.contains("__tile_softmax_f32") && !t.contains("_batched") {
+            if let Some(args) = extract_call_args(t) {
+                let lookup = |a: Option<&String>| -> Option<u32> {
+                    let a = a?.trim();
+                    if let Ok(v) = a.parse::<u32>() {
+                        return Some(v);
+                    }
+                    body_lines.iter().find_map(|l| {
+                        let l = l.trim();
+                        let (lhs, rhs) = l.split_once('=')?;
+                        if lhs.trim() != a || !rhs.contains("llvm.mlir.constant") {
+                            return None;
+                        }
+                        let inner = rhs.split('(').nth(1)?;
+                        inner.split(':').next()?.trim().parse::<u32>().ok()
+                    })
+                };
+                // Only when it will actually be blocked; otherwise leave the
+                // existing (byte-identical) unblocked emission alone.
+                if let (Some(r), Some(c)) = (lookup(args.get(2)), lookup(args.get(3))) {
+                    if pick_softmax_rows(r, c, "f32", 0) < r {
+                        if let Some(a) = args.get(1) {
+                            wanted.push((a.trim().to_string(), "A"));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if t.contains("__tile_batched_f32") {
             if let Ok(BatchedKind::Generic { operands, .. }) = parse_generic_batched(t) {
                 for (ssa, _, _) in operands {
