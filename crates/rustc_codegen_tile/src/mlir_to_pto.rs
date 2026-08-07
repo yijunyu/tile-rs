@@ -4244,15 +4244,22 @@ fn pick_batched_blocks_k(m: u32, k: u32, n: u32) -> (u32, u32, u32) {
             let pow2_le = |v: u32| -> u32 {
                 if v == 0 { 0 } else { 1 << (31 - v.leading_zeros()) }
             };
-            let mut mb = pow2_le(mb_cap.min(m));
+            // nb stays a POWER OF TWO: ptoas picks the L0A Left tile's BLayout
+            // from the companion Right tile's WIDTH, a hazard only validated at
+            // power-of-two widths (see `pick_nb_for_dtype`).
             let mut nb = pow2_le(nb_cap.min(n));
-            // Respect the accumulator, and keep both dividing their extent so
-            // the loops tile exactly.
-            while mb > 1 && (!fits_kb(mb, kb, nb) || m % mb != 0) {
-                mb /= 2;
-            }
-            while nb > 1 && (!fits_kb(mb, kb, nb) || n % nb != 0) {
+            while nb > 1 && (!fits_kb(16, kb, nb) || n % nb != 0) {
                 nb /= 2;
+            }
+            // mb steps by 16 -- the cube row granularity -- NOT by halving.
+            // The width hazard above is width-linked and says nothing about the
+            // row count, and forcing mb to a power of two costs real trips:
+            // `scores` (m=896, k=64, n=896) takes mb=224 at 88% of L0C for 28
+            // trips, but the nearest power of two is 128, giving 49 trips. That
+            // regressed scores 66 -> 110 us until this loop stepped by 16.
+            let mut mb = (mb_cap.min(m) / 16) * 16;
+            while mb > 16 && (!fits_kb(mb, kb, nb) || m % mb != 0) {
+                mb -= 16;
             }
             if mb >= 16 && nb >= 16 && fits_kb(mb, kb, nb) {
                 let trips = (m / mb) * (n / nb) * (k / kb);
