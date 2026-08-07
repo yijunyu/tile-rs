@@ -4144,8 +4144,17 @@ fn pick_softmax_rows(rows: u32, cols: u32, dtype: &str, live_bytes: usize) -> u3
     // however the columns are tiled, so the search bottomed out above budget
     // and reported failure. Without it the budget is sufficient well past
     // S=4096 (rb falls to 14, 12, 10, 9, ... as S grows).
+    //
+    // The block must also DIVIDE `rows`. The emitted loop is a bare
+    // `scf.for 0 to ceil(rows/rb) step 1` with no tail guard, so a block that
+    // merely fits still walks off the end of the view: S=896 picked rb=10,
+    // giving 90 trips x 10 = 900 rows against an 896-row tensor, and the last
+    // iteration read 4 rows past it. That is an out-of-bounds access, and the
+    // device reports it as ACL 507035 at the softmax sync -- it emitted and
+    // built cleanly, so only running it on silicon caught it. Fitting is a
+    // capacity question; dividing is a correctness one, and both must hold.
     let mut rb = rows;
-    while rb > 1 && !fits(rb) {
+    while rb > 1 && !(fits(rb) && rows % rb == 0) {
         rb -= 1;
     }
     rb.max(1)
