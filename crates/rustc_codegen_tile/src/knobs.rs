@@ -518,6 +518,25 @@ pub const MEASUREMENT_PROTOCOL: (&str, u32, u32) = ("median-of-repeats", 20, 5);
 ///
 /// So: score `arithmetic` knobs in isolation, and `occupancy` knobs ONLY on a
 /// model large enough to be bandwidth-bound.
+/// Result of a JOINT search over all 16 Metal knobs, scored end-to-end on three
+/// objectives (3B q4_0 decode, 0.5B q8_0 decode, 0.5B q8_0 prefill).
+///
+/// The shipped configuration is on the Pareto front and nothing dominates it.
+/// Two things the per-kernel searches could not have shown:
+///
+/// 1. THE KNOBS ARE COUPLED ACROSS KERNELS. The small GEMM tile serves PREFILL
+///    (shapes below TILERS_MM_NARROW_ROWS), so tuning it for any other reason
+///    is catastrophic there: S_tm 128 -> 32 reads as a decode gain and costs
+///    9x on prefill; the front contains members at 14x, 16x, 47x and 71x.
+///    Setting NARROW=999999 -- forcing the small tile everywhere -- is the
+///    single most destructive knob value in the space.
+///
+/// 2. A PARETO FRONT CAN BE PART NOISE. The genome that "beat" the incumbent on
+///    3B q4_0 decode (1.051 vs 1.075) differs from it only in Q8_QPL, S_tm and
+///    S_sgn -- a q8_0 mat-vec knob and two GEMM knobs, NONE of which the q4_0
+///    decode path executes. That 2% is measurement noise sitting on the front
+///    because NSGA-II cannot know which knobs reach which objective. Check
+///    that a claimed win is on a knob the objective can actually see.
 pub const ORACLE_VALIDITY: &[(&str, &str)] = &[
     ("MUL_MV_ILV_ROWS_PER_TG", "occupancy -- score end-to-end only"),
     ("MUL_MV_ROWS_PER_TG",     "occupancy -- score end-to-end only"),
