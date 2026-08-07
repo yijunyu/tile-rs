@@ -4879,13 +4879,33 @@ fn translate_silu(
 ///     far over the 184 KB UB budget the vendor spec allows (`SPEC_A2A3`).
 /// Both were masked while `A2A3::UB_SIZE` wrongly carried the 256 KB A5 figure.
 ///
-/// Kb=128, Nb=64 keeps L0A/L0B at 32 KB each (half the cap, clear of the
-/// exception) and the UB working set at 144 KB, inside the 184 KB budget.
-const PTO_MM_KB: u32 = 128;
-const PTO_MM_NB: u32 = 64;
-/// Cap for the M block. 64 rows keeps the f32 working set at 80 KB against a
-/// 184 KB budget for every sequence length, including S=897.
-const PTO_MM_MB: u32 = 64;
+/// Kb=64, Nb=128, Mb=192 fills 75% of L0C while keeping L0A (48 KB) and L0B
+/// (32 KB) STRICTLY under the 64 KB cap, clear of the exactly-64 KB exception
+/// recorded above.
+///
+/// This replaces Kb=128/Nb=64/Mb=64, which used 12.5% of L0C and made the four
+/// projections 75.6% of a measured S=769 forward -- 4493 us of 5942, at ~1/15th
+/// the per-FLOP efficiency of `scores_batched` (224x128, 87.5% of L0C) on the
+/// same cube engine. The accumulator, not the sequence length, was the limit:
+/// a 64x64 acc retires 4 K MACs per pass where a 192x128 retires 24 K.
+///
+/// Trip counts on the shapes the five operators actually emit:
+///
+///   shape                  old   new
+///   proj  [832,640,640]    650   250
+///   kv-proj MQA (N=128)    130    50
+///   proj  [320,640,640]    250   100
+///   proj  short (64,192)     6     6   (unchanged: already single-tile)
+///
+/// Mb=192 is a multiple of both 16 (`PTO_MM_MROW_ALIGN`, the cube fixedRowSize)
+/// and 64, so it divides the padded M of every emitted projection. 208 would
+/// cut one more trip on [832,...] but only because it divides 832 -- tuning to
+/// one shape rather than to the hardware.
+const PTO_MM_KB: u32 = 64;
+const PTO_MM_NB: u32 = 128;
+/// Cap for the M block. See the Kb/Nb note above: 192 rows put L0A at 48 KB
+/// (192*64*4), under the cap, and the acc at 96 KB of L0C's 128 KB.
+const PTO_MM_MB: u32 = 192;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
 /// BLayout based on the companion `Right` tile width. At Nb=64 with i8 Left,
 /// ptoas silently emits `BLayout::ColMajor` (wrong) instead of RowMajor.
@@ -4980,9 +5000,14 @@ fn pick_mb(m: u32, kb: u32, nb: u32, dtypes: &MatmulDtypes, live_bytes: usize) -
         let a = (mb as u64) * (kb as u64) * dtypes.lhs_bytes();
         let b = (kb as u64) * (nb as u64) * dtypes.rhs_bytes();
         let acc = (mb as u64) * (nb as u64) * 4;
+        // STRICTLY under L0A/L0B, not `<=`. A tile at exactly the 64 KB cap
+        // caused "aicore execution exception" on 910B2 (recorded above for
+        // Kb=256/Nb=64), attributed to fractal metadata pushing the real
+        // allocation past the hardware limit. L0C has no such recorded
+        // exception and keeps `<=`.
         a <= SPEC_A2A3.l1_size as u64            // mat_a staging
-            && a <= SPEC_A2A3.l0_a_size as u64   // a_left
-            && b <= SPEC_A2A3.l0_b_size as u64   // b_right
+            && a < SPEC_A2A3.l0_a_size as u64    // a_left
+            && b < SPEC_A2A3.l0_b_size as u64    // b_right
             && acc <= SPEC_A2A3.l0_c_size as u64 // acc
             && a + b + acc <= ub_budget.max(SPEC_A2A3.l1_size as u64)
     };
@@ -5007,7 +5032,18 @@ fn pick_nb(n: u32) -> u32 {
 /// which produces garbage numerics.
 fn pick_nb_for_dtype(n: u32, lhs_bytes: u32) -> u32 {
     let nb_base = if lhs_bytes == 1 { PTO_MM_NB_I8 } else { PTO_MM_NB };
-    let mut nb = nb_base.min(n);
+    // Clamp to a POWER OF TWO <= n, not to n itself. `min(base, n)` returns n
+    // whenever n < base, and n need not be a power of two: at base=128, n=96
+    // yielded nb=96, which then divides n so the halving loop below never runs
+    // and a non-power-of-two width reaches ptoas. That is precisely the
+    // width-linked BLayout hazard the halving exists to avoid -- it was masked
+    // while base was 64 because 96 > 64 kept the clamp off.
+    let mut nb = if n >= nb_base {
+        nb_base
+    } else {
+        n.next_power_of_two() / if n.is_power_of_two() { 1 } else { 2 }
+    }
+    .max(1);
     // Nb must DIVIDE n: the blocked emitter rejects `n % nb != 0` outright, and
     // `min(64, n)` does not guarantee it. At n=96 that gave nb=64 and a hard
     // "N=96 must be a multiple of Nb=64", which is what made every sequence
@@ -8153,9 +8189,12 @@ mod tests {
         // 2^23 threshold, Kb ≤ (2^23)/151936 ≈ 55 → aligned to 48.
         // 1536 % 48 == 0, so expect Kb=48.
         assert_eq!(pick_kb_for_n(1536, 151936), 48);
-        // N=65536 exactly at old failure boundary: 2^23/65536 = 128. 1536%128=0.
-        // The stride cap (128) and the default Kb (128) coincide here.
-        assert_eq!(pick_kb_for_n(1536, 65536), 128);
+        // N=65536 exactly at old failure boundary: the stride cap is
+        // 2^23/65536 = 128. Whichever of {stride cap, default Kb} is smaller
+        // governs; asserted against PTO_MM_KB rather than a literal, because
+        // the two merely COINCIDED at 128 while PTO_MM_KB was 128 and the
+        // literal then silently encoded that coincidence as intent.
+        assert_eq!(pick_kb_for_n(1536, 65536), PTO_MM_KB.min(128));
         // N=32768: stride cap = 2^23/32768 = 256, so the default Kb governs.
         assert_eq!(pick_kb_for_n(1536, 32768), PTO_MM_KB);
         // Degenerate / small K that's still > kb_cap.
