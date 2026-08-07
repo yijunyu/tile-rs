@@ -4040,9 +4040,29 @@ fn pick_batched_blocks(m: u32, k: u32, n: u32) -> (u32, u32) {
     }
     // Shrink N first: it is the only lever on `b_right`, and it relieves the
     // accumulator too. Then shrink rows for whatever remains.
+    //
+    // The block must land on a C2-LEGAL WIDTH, not merely a smaller one.
+    // Halving 384 gives 192, and 192*4 = 768 B spans 512 B fractals with a bad
+    // stride — a hard C2 rejection. That single miss made S=320..384 fail for
+    // every operator that batches heads (Local and Strided escaped only because
+    // their head_dim=24 lands the halving elsewhere).
+    //
+    // Candidates are the multiples of `c2_col_multiple` that DIVIDE n, largest
+    // first. Padded widths are always multiples of 128 (see `pad_cols_c2`), so
+    // such a divisor always exists; the `<= m` case covers sub-fractal widths,
+    // which C2 exempts.
+    let cm = c2_col_multiple("f32").max(1);
     let mut nb = n;
-    while nb > 16 && !fits(m.min(16), nb) {
-        nb /= 2;
+    if n > cm {
+        nb = (1..=n / cm)
+            .rev()
+            .map(|q| q * cm)
+            .find(|&cand| n % cand == 0 && fits(m.min(16), cand))
+            .unwrap_or(cm);
+    } else {
+        while nb > 16 && !fits(m.min(16), nb) {
+            nb /= 2;
+        }
     }
     let mut mb = m;
     while mb > 16 && !fits(mb, nb) {
