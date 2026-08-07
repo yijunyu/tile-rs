@@ -1412,6 +1412,24 @@ impl PtoContext {
         self.pv_row_base.is_some()
     }
 
+    /// Run `f` with the column base SUPPRESSED.
+    ///
+    /// Needed because operands disagree on what their columns mean. Under an
+    /// N-block loop the column offset is the N iterator, which is correct for
+    /// `B` (`[K,N]`) and the output (`[M,N]`) but WRONG for `A` (`[M,K]`, whose
+    /// columns are the K dimension). Applying one base to all three made A read
+    /// columns 256..319 instead of 0..63 at nb=256 — every block written, every
+    /// value wrong (max_abs ~1e-1 on device), which no timing run would catch.
+    ///
+    /// This is the row base's lesson in the column dimension: a shared base is
+    /// only correct when the operands agree, and here they do not.
+    fn without_col_base<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = self.pv_col_base.take();
+        let out = f(self);
+        self.pv_col_base = prev;
+        out
+    }
+
     /// Run `f` with a COLUMN base from an N-block loop.
     ///
     /// The mirror of `with_row_block`, needed because the two bound different
@@ -3212,12 +3230,19 @@ fn emit_batched_loop(
             // the [S,HD] left tile is 256 KB against a 64 KB L0A cap, and pv's
             // [S,S] staging tile is 4 MB against 512 KB of L1. The head loop
             // slices ACROSS heads; this blocks rows WITHIN one head.
-            // N-BLOCKING IS NOT WIRED HERE. See BATCHING_PLAN.md: a
-            // context-wide column base is wrong because operands disagree on
-            // what their columns mean -- A is [M,K] (columns are K), B is
-            // [K,N] and the output is [M,N] (columns are N). Applying one base
-            // to all three made A read columns 256..319 instead of 0..63, which
-            // the device check caught at max_abs ~1e-1 with untouched=0.
+            // N-BLOCKING IS NOT WIRED. The column half is done and verified
+            // in the emitted PTO -- A gets no column offset, B and the output
+            // do (see `without_col_base`). What blocks it is the ROW half:
+            //
+            //   `with_head_rows` receives the BLOCK size, not the head stride,
+            //   so A's base came out `h_i * 128` instead of `h_i * 512`; and it
+            //   OVERWRITES `pv_row_base` rather than composing, discarding the
+            //   `r_i * mb` term `with_row_block` installed.
+            //
+            // On device that shows as every block written with identical error
+            // per head (max_abs ~1.4e-1), which is what distinguishes it from
+            // the earlier store bug (untouched=131072) and from a column-base
+            // bug (error differing between column blocks).
             let mb = pick_batched_rows(p.m, p.k, p.n);
             let bb = p.b.clone().unwrap_or_else(|| p.a.clone());
             let inner = format!(
@@ -3574,8 +3599,14 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
         // the wrong offset for every head after the first — caught by the
         // end-to-end check against model.py (MERE 2.6e-01), not by per-head
         // parity, whose softmax has one operand shaped like its output.
+        // And each operand takes the COLUMN base only if its columns are the N
+        // dimension. A is [M,K] -- its columns are K, so an N-block offset
+        // would read the wrong slice of it; B is [K,N], so it takes the offset.
+        // Same shape of bug as the shared row base, one dimension over.
         let a_t = ctx
-            .with_head_rows(m, |c, o| c.load_deferred_for_head(&ta, m, k, o), ops)
+            .without_col_base(|c| {
+                c.with_head_rows(m, |c2, o| c2.load_deferred_for_head(&ta, m, k, o), ops)
+            })
             .ok_or_else(|| format!("matmul_batched: operand {a_ssa} not deferred"))?;
         let b_t = ctx
             .with_head_rows(k, |c, o| c.load_deferred_for_head(&tb, k, n, o), ops)
