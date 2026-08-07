@@ -1398,6 +1398,41 @@ impl PtoContext {
         self.pv_row_base.is_some()
     }
 
+    /// Run `f` with the row base advanced by an INNER block loop.
+    ///
+    /// Composes with `with_head_rows`: the head loop contributes `h_i * rows`
+    /// and this adds `r_i * rb`, so a per-head operand that is itself too large
+    /// for its memory can be walked in blocks without disturbing the head
+    /// slicing. Both terms are needed -- dropping either reads the wrong slice,
+    /// and the two failures look identical from a timing run.
+    fn with_row_block<T>(
+        &mut self,
+        rb: u32,
+        f: impl FnOnce(&mut Self, &mut Vec<String>) -> T,
+        ops: &mut Vec<String>,
+    ) -> T {
+        let prev = self.pv_row_base.clone();
+        let off = self.fresh_ssa();
+        self.use_size(rb);
+        ops.push(format!(
+            "  {off} = arith.muli %r_i, %c{rb} : index   // row block offset"
+        ));
+        let base = match &prev {
+            Some(h) => {
+                let sum = self.fresh_ssa();
+                ops.push(format!(
+                    "  {sum} = arith.addi {h}, {off} : index   // head base + row block"
+                ));
+                sum
+            }
+            None => off,
+        };
+        self.pv_row_base = Some(base);
+        let out = f(self, ops);
+        self.pv_row_base = prev;
+        out
+    }
+
     /// Load a deferred operand's slice for the head the loop is on.
     ///
     /// Emits partition_view + alloc + tload at the current row base, so the
@@ -3086,14 +3121,70 @@ fn emit_batched_loop(
 
     let result_tile = match p.kind {
         BatchedKind::Matmul => {
-            ctx.set_inline_consts(&[("%__m", p.m), ("%__k", p.k), ("%__n", p.n)]);
+            // A head's own operands can still exceed their memory: at S=1024
+            // the [S,HD] left tile is 256 KB against a 64 KB L0A cap, and pv's
+            // [S,S] staging tile is 4 MB against 512 KB of L1. The head loop
+            // slices ACROSS heads; this blocks rows WITHIN one head.
+            let mb = pick_batched_rows(p.m, p.k, p.n);
             let bb = p.b.clone().unwrap_or_else(|| p.a.clone());
-            let inner = format!(
-                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, %__m, %__k, %__n) : \
-                 (i32, i32, i32, i32, i32, i32) -> i32",
-                p.a, p.a, bb
-            );
-            translate_matmul(&inner, ctx, &mut body)?;
+            // Substitute the row count directly rather than routing it through
+            // an inline const: the const table is keyed by &'static str, and
+            // synthesising one per block size would leak.
+            let mk_inner = |rows: u32| {
+                format!(
+                    "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {rows}, {}, {}) : \
+                     (i32, i32, i32, i32, i32, i32) -> i32",
+                    p.a, p.a, bb, p.k, p.n
+                )
+            };
+            if mb < p.m {
+                let n_blk = p.m.div_ceil(mb);
+                ctx.use_size(n_blk);
+                body.push(format!("scf.for %r_i = %c0 to %c{n_blk} step %c1 {{"));
+                let inner = mk_inner(mb);
+                ctx.with_row_block(mb, |c, o| translate_matmul(&inner, c, o), &mut body)?;
+                body.push("}".to_string());
+            } else {
+                let inner = mk_inner(p.m);
+                translate_matmul(&inner, ctx, &mut body)?;
+            }
+            "%__batched".to_string()
+        }
+        // The head's own [rows, cols] tile can exceed UB on its own: at
+        // S=1024 that is 4 MB against a 184 KB budget. Block rows WITHIN the
+        // head, composing with the head base via `with_row_block`.
+        BatchedKind::Softmax if pick_softmax_rows(p.m, p.n, "f32", 0) < p.m => {
+            let rb = pick_softmax_rows(p.m, p.n, "f32", 0);
+            let n_blk = p.m.div_ceil(rb);
+            let a = p.a.clone();
+            let cols = p.n;
+            ctx.use_size(n_blk);
+            body.push(format!("scf.for %r_i = %c0 to %c{n_blk} step %c1 {{"));
+            ctx.with_row_block(
+                rb,
+                |c, o| -> Result<(), String> {
+                    let t = c
+                        .get_tile(&a)
+                        .ok_or_else(|| format!("softmax_batched: unknown tile {a}"))?
+                        .clone();
+                    let d = t.deferred.clone().ok_or_else(|| {
+                        format!("softmax_batched: operand {a} was not deferred")
+                    })?;
+                    let src = format!("{a}__headsrc");
+                    let pv = c.make_pv(&d.tv_ssa, rb, cols, "f32", d.elem_offset, o);
+                    let tile = c.alloc_tile(&src, rb, cols, "f32", o);
+                    o.push(format!(
+                        "pto.tload ins({} : {}) outs({} : {})",
+                        pv,
+                        ptv_type(rb, cols, "f32"),
+                        tile,
+                        tile_buf_type(rb, cols, "f32")
+                    ));
+                    emit_softmax_steps(&src, "%__batched", rb, cols, "f32", c, o)
+                },
+                &mut body,
+            )?;
+            body.push("}".to_string());
             "%__batched".to_string()
         }
         BatchedKind::Softmax => {
@@ -3663,6 +3754,41 @@ fn translate_matmul_blocked(
 ///
 /// This matches the FlashAttention reference implementation in pto-isa:
 /// `TROWMAX(new_max, x, tmp)` → `TROWEXPANDSUB(sub, x, new_max)` → `TEXP` → `TROWSUM` → `TROWEXPANDDIV`
+/// Rows per block for a matmul stage INSIDE a batched loop.
+///
+/// The head loop slices across heads; this bounds one head's own operands. All
+/// four tiles a matmul stages carry M, and each lands in a different memory, so
+/// every cap has to hold at once:
+///
+///   mat_a [mb,k] -> L1     a_left [mb,k] -> L0A
+///   mat_b [k,n]  -> L1     b_right[k,n]  -> L0B     acc [mb,n] -> L0C
+///
+/// NOTE `b_right` is `k*n` with no `mb` term, so row-blocking cannot shrink it.
+/// A head whose B operand alone exceeds L0B needs N-blocking, which this does
+/// not do -- it returns the 16-row floor and the guard then reports L0B, which
+/// is the honest outcome rather than a silently wrong tile.
+///
+/// Returns `m` unchanged when the head already fits, so shapes that worked
+/// before emit byte-identically (no inner loop at all).
+fn pick_batched_rows(m: u32, k: u32, n: u32) -> u32 {
+    let b = 4u64; // f32 batched stages
+    let fits = |mb: u32| -> bool {
+        let a = (mb as u64) * (k as u64) * b;
+        let acc = (mb as u64) * (n as u64) * b;
+        a <= SPEC_A2A3.l1_size as u64
+            && a <= SPEC_A2A3.l0_a_size as u64
+            && acc <= SPEC_A2A3.l0_c_size as u64
+    };
+    if fits(m) {
+        return m;
+    }
+    let mut mb = m;
+    while mb > 16 && !fits(mb) {
+        mb /= 2;
+    }
+    mb.max(16)
+}
+
 /// A row-blocked softmax awaiting its store, so the loop can enclose it.
 #[derive(Clone)]
 struct PendingRowSoftmax {
