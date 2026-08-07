@@ -665,6 +665,47 @@ fn dtype_bytes_pto(dtype: &str) -> usize {
     match dtype { "f16" | "bf16" => 2, "i8" => 1, _ => 4 }
 }
 
+/// Columns per fractal for `dtype` — the C2-legal width granularity.
+///
+/// C2 requires `cols * sizeof(dtype) % FRACTAL_BYTES == 0` for any row-major
+/// data tile whose row spans more than one fractal. So a shape that will be
+/// loaded or stored has to be padded to a MULTIPLE of this, not merely to a
+/// round number: at S=897 the driver's `up(seq, 32)` gives 928, and
+/// 928 * 4 = 3712 B leaves 128 B over a 512 B fractal. 1024 is the next legal
+/// width.
+///
+/// Exposed so callers pad from the same rule the validator enforces, rather
+/// than each hardcoding a constant that is only right for one dtype:
+///
+/// | dtype | bytes | C2-legal multiple |
+/// |---|---|---|
+/// | f32  | 4 | 128 |
+/// | f16 / bf16 | 2 | 256 |
+/// | i8   | 1 | 512 |
+pub fn c2_col_multiple(dtype: &str) -> u32 {
+    (A2A3::FRACTAL_BYTES / dtype_bytes_pto(dtype)) as u32
+}
+
+/// Round `cols` up to the next C2-legal width for `dtype`.
+///
+/// SUB-FRACTAL ROWS ARE EXEMPT, and that exemption is load bearing. C2 only
+/// constrains a tile whose row spans MORE than one fractal; a row of
+/// `cols * b <= FRACTAL_BYTES` fits inside one and has no stride to get wrong.
+/// The validator has always known this — padding unconditionally to the
+/// multiple would inflate every small shape 4x (S=32 -> 128, HD=64 -> 128) and
+/// push the batched stages over the UB budget, which is exactly what happened
+/// when this was first written without the guard.
+///
+/// So: shapes at or under one fractal are returned unchanged, and only genuinely
+/// wide rows are rounded up.
+pub fn pad_cols_c2(cols: u32, dtype: &str) -> u32 {
+    let m = c2_col_multiple(dtype).max(1);
+    if cols <= m {
+        return cols; // sub-fractal: C2 does not apply
+    }
+    cols.div_ceil(m) * m
+}
+
 /// Shape validation (C2-C4) for a tile on arch `A`. Returns Err with a precise
 /// diagnostic on any violation.
 fn parse_tb_dim(tb_ty: &str, key: &str) -> Option<u32> {
