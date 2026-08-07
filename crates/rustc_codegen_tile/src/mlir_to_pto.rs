@@ -930,6 +930,13 @@ struct PtoContext {
     /// without this A's head base came out `h_i * mb` instead of
     /// `h_i * head_stride` -- every block of a head reading the same rows.
     head_stride_a: Option<u32>,
+    /// Rows per head for the B operand of a batched matmul.
+    ///
+    /// B's head stride defaulted to the matmul's own `k`, which was right only
+    /// while `k` WAS the rows-per-head. Under K-blocking the inner call passes
+    /// `kb` (128, not 896), so every head after the first read V at 1/7th of
+    /// its true offset -- MERE 44.4. Carried explicitly, like `head_stride_a`.
+    head_stride_b: Option<u32>,
     /// Row offset contributed by an inner block loop, kept separately from
     /// `pv_row_base` so `with_head_rows` can SUM with it. Using `pv_row_base`
     /// for both conflated "the previous operand's head base" (replace) with
@@ -973,6 +980,18 @@ struct PtoContext {
     batched_result_stored_inline: std::collections::HashSet<String>,
     /// Softmaxes whose rows are blocked; the loop must enclose their store.
     softmax_rows_stored_inline: std::collections::HashSet<String>,
+    /// When set, a batched matmul emits the K-accumulating form
+    /// (`tmatmul` on the first K iteration, `tmatmul.acc` after) instead of a
+    /// plain `tmatmul` that would overwrite the accumulator each iteration.
+    matmul_accumulate: bool,
+    /// Offset of the current K block, applied by each operand loader to the
+    /// axis that operand indexes K by. See `with_k_block`.
+    pv_k_base: Option<String>,
+    /// Which axis the operand being loaded RIGHT NOW indexes K by:
+    /// `Some(true)` = rows (a `[K,N]` operand), `Some(false)` = columns (an
+    /// `[M,K]` operand), `None` = this operand has no K axis (the `[M,N]`
+    /// output). Only consulted when `pv_k_base` is set.
+    pv_k_on_rows: Option<bool>,
     pending_row_softmax: HashMap<String, PendingRowSoftmax>,
     /// Pending batched emissions keyed by result SSA.
     pending_batched: HashMap<String, PendingBatched>,
@@ -1154,9 +1173,13 @@ impl PtoContext {
             pv_row_base: None,
             pv_col_base: None,
             head_stride_a: None,
+            head_stride_b: None,
             block_row_base: None,
             batched_result_stored_inline: std::collections::HashSet::new(),
             softmax_rows_stored_inline: std::collections::HashSet::new(),
+            matmul_accumulate: false,
+            pv_k_base: None,
+            pv_k_on_rows: None,
             pending_row_softmax: HashMap::new(),
             pending_batched: HashMap::new(),
             inline_consts: HashMap::new(),
@@ -1357,28 +1380,56 @@ impl PtoContext {
         // per-head base, so each iteration reads its own head's slice. This is
         // the only place partition_view offsets are written, which is why
         // batching needs no change to any translator.
-        let row_expr = match &self.pv_row_base {
-            Some(base) => {
+        // The K block lands on whichever axis THIS operand indexes K by:
+        // rows for a `[K,N]` operand, columns for `[M,K]`, neither for the
+        // `[M,N]` output. Folding it into the row/col bases instead would put
+        // it on the wrong operand -- the batched matmul suppresses exactly
+        // those two axes per operand.
+        let k_row = if self.pv_k_on_rows == Some(true) { self.pv_k_base.clone() } else { None };
+        let k_col = if self.pv_k_on_rows == Some(false) { self.pv_k_base.clone() } else { None };
+        let row_expr = match (&self.pv_row_base, &k_row) {
+            (base, kb) if base.is_some() || kb.is_some() => {
+                // Sum whichever terms are present, then the constant.
+                let mut cur = match (base.clone(), kb.clone()) {
+                    (Some(b), Some(k)) => {
+                        let acc = format!("%pto_ra{}", self.next_ssa);
+                        self.next_ssa += 1;
+                        ops.push(format!("{} = arith.addi {}, {} : index", acc, b, k));
+                        acc
+                    }
+                    (Some(b), None) => b,
+                    (None, Some(k)) => k,
+                    (None, None) => unreachable!(),
+                };
                 let sum = format!("%pto_r{}", self.next_ssa);
                 self.next_ssa += 1;
-                ops.push(format!(
-                    "{} = arith.addi {}, %c{} : index",
-                    sum, base, row_off
-                ));
-                sum
+                ops.push(format!("{} = arith.addi {}, %c{} : index", sum, cur, row_off));
+                cur = sum;
+                cur
             }
-            None => format!("%c{}", row_off),
+            _ => format!("%c{}", row_off),
         };
         // Same treatment for columns, which is what an N-block loop needs:
         // `b_right` is `k*n` with no row term, so only a column offset bounds it.
-        let col_expr = match &self.pv_col_base {
-            Some(base) => {
+        let col_expr = match (&self.pv_col_base, &k_col) {
+            (base, kb) if base.is_some() || kb.is_some() => {
+                let cur = match (base.clone(), kb.clone()) {
+                    (Some(b), Some(k)) => {
+                        let acc = format!("%pto_ca{}", self.next_ssa);
+                        self.next_ssa += 1;
+                        ops.push(format!("{} = arith.addi {}, {} : index", acc, b, k));
+                        acc
+                    }
+                    (Some(b), None) => b,
+                    (None, Some(k)) => k,
+                    (None, None) => unreachable!(),
+                };
                 let sum = format!("%pto_c{}", self.next_ssa);
                 self.next_ssa += 1;
-                ops.push(format!("{} = arith.addi {}, %c{} : index", sum, base, col_off));
+                ops.push(format!("{} = arith.addi {}, %c{} : index", sum, cur, col_off));
                 sum
             }
-            None => format!("%c{}", col_off),
+            _ => format!("%c{}", col_off),
         };
         ops.push(format!(
             "{} = pto.partition_view {}, offsets = [{}, {}], sizes = [%c{}, %c{}] : {} -> {}",
@@ -1452,6 +1503,10 @@ impl PtoContext {
         self.pv_row_base.is_some()
     }
 
+    fn set_matmul_accumulate(&mut self, on: bool) {
+        self.matmul_accumulate = on;
+    }
+
     /// Run `f` with the column base SUPPRESSED.
     ///
     /// Needed because operands disagree on what their columns mean. Under an
@@ -1522,6 +1577,52 @@ impl PtoContext {
         self.pv_col_base = Some(base);
         let out = f(self, ops);
         self.pv_col_base = prev;
+        out
+    }
+
+    /// Run `f` with a K-block offset applied on the axis each operand indexes
+    /// K by.
+    ///
+    /// K is the CONTRACTED dimension, so unlike a row or column block it lands
+    /// on a different axis per operand: A is `[M,K]` and takes it on COLUMNS,
+    /// B is `[K,N]` and takes it on ROWS. The output takes it on neither -- it
+    /// is `[M,N]`, and every K iteration accumulates into the same tile.
+    ///
+    /// This is the same per-operand offsets rule that the row/column blocks
+    /// follow; applying one shared base to both operands reads the wrong slice
+    /// of one of them, and produces a plausible wrong answer rather than an
+    /// error.
+    /// Run `f` with a K-block offset available to the operand loaders.
+    ///
+    /// K is the CONTRACTED dimension, so it lands on a DIFFERENT AXIS per
+    /// operand: A is `[M,K]` and takes it on COLUMNS, B is `[K,N]` on ROWS,
+    /// and the output `[M,N]` takes it on neither.
+    ///
+    /// It therefore cannot ride in `pv_row_base` / `pv_col_base` the way the M
+    /// and N blocks do. The batched matmul already wraps A in
+    /// `without_col_base` and B in `without_row_block` -- precisely the two
+    /// axes K needs -- so a K offset placed in those slots is suppressed on the
+    /// operand that needs it and applied to the one that does not. That emitted
+    /// an A slice fixed at columns [0,128) for every K iteration and a B slice
+    /// taking K on its columns: the axes swapped, MERE 9.1 with
+    /// matched_ratio 0.0003.
+    ///
+    /// Kept in its own slot so each loader can apply it to its own axis.
+    fn with_k_block<T>(
+        &mut self,
+        kb: u32,
+        f: impl FnOnce(&mut Self, &mut Vec<String>) -> T,
+        ops: &mut Vec<String>,
+    ) -> T {
+        let prev = self.pv_k_base.clone();
+        let off = self.fresh_ssa();
+        self.use_size(kb);
+        ops.push(format!(
+            "  {off} = arith.muli %k_i, %c{kb} : index   // K block offset"
+        ));
+        self.pv_k_base = Some(off);
+        let out = f(self, ops);
+        self.pv_k_base = prev;
         out
     }
 
@@ -3303,21 +3404,49 @@ fn emit_batched_loop(
             // Two blocking dimensions, bounding different tiles: `a_left` is
             // [mb,k] and shrinks with ROWS, `b_right` is [k,nb] with no row
             // term and shrinks only with COLUMNS.
-            let (mb, nb) = pick_batched_blocks(p.m, p.k, p.n);
+            // K is the third blocking dimension. Without it `a_left` [mb,k] and
+            // `b_right` [k,nb] both scale with K, so at K=896 the 64 KB L0A/L0B
+            // caps pin mb and nb to 16 whatever the accumulator could hold --
+            // pv ran a 16x16 acc at 0.2% of L0C for that reason.
+            let (mb, kb, nb) = pick_batched_blocks_k(p.m, p.k, p.n);
             // The head stride is the FULL rows-per-head; the block loops walk
             // within it.
             ctx.head_stride_a = Some(p.m);
+            // B's rows-per-head is the FULL k, not the K block: the head term
+            // steps over whole heads however finely K is walked.
+            ctx.head_stride_b = Some(p.k);
             let bb = p.b.clone().unwrap_or_else(|| p.a.clone());
             let inner = format!(
-                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {mb}, {}, {nb}) : \
+                "%__batched = llvm.call @__tile_matmul_f32({}, {}, {}, {mb}, {kb}, {nb}) : \
                  (i32, i32, i32, i32, i32, i32) -> i32",
-                p.a, p.a, bb, p.k
+                p.a, p.a, bb
             );
-            // Store at the INNERMOST point; after the loops it writes only the
-            // last block.
+            // With a K loop the store must sit OUTSIDE it: every K iteration
+            // accumulates into the same [mb,nb] tile, and storing per iteration
+            // would write partial sums and leave only the last slice's
+            // contribution. Without one, the store is the innermost act as
+            // before.
+            let k_blk = if kb < p.k { p.k / kb } else { 1 };
             let body_fn = |c: &mut PtoContext, o: &mut Vec<String>| -> Result<(), String> {
-                translate_matmul(&inner, c, o)?;
-                emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
+                if k_blk > 1 {
+                    c.use_size(k_blk);
+                    o.push(format!("scf.for %k_i = %c0 to %c{k_blk} step %c1 {{"));
+                    c.with_k_block(
+                        kb,
+                        |c2, o2| -> Result<(), String> {
+                            c2.set_matmul_accumulate(true);
+                            let r = translate_matmul(&inner, c2, o2);
+                            c2.set_matmul_accumulate(false);
+                            r
+                        },
+                        o,
+                    )?;
+                    o.push("}".to_string());
+                    emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
+                } else {
+                    translate_matmul(&inner, c, o)?;
+                    emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
+                }
             };
             let rows_fn = |c: &mut PtoContext, o: &mut Vec<String>| -> Result<(), String> {
                 if mb < p.m {
@@ -3341,6 +3470,7 @@ fn emit_batched_loop(
                 rows_fn(ctx, &mut body)?;
             }
             ctx.head_stride_a = None;
+            ctx.head_stride_b = None;
             stored_inline = true;
             "%__batched".to_string()
         }
@@ -3707,13 +3837,26 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
                 // HEAD STRIDE, not the block row count: the head term steps
                 // over whole heads however finely one is walked.
                 let stride_a = c.head_stride_a.unwrap_or(m);
-                c.with_head_rows(stride_a, |c2, o| c2.load_deferred_for_head(&ta, m, k, o), ops)
+                // A is [M,K]: K is its COLUMN axis. `without_col_base` above
+                // suppresses the N-block column base, which A must not take --
+                // the K offset is carried separately and still applies here.
+                c.pv_k_on_rows = Some(false);
+                let r = c.with_head_rows(stride_a, |c2, o| c2.load_deferred_for_head(&ta, m, k, o), ops);
+                c.pv_k_on_rows = None;
+                r
             })
             .ok_or_else(|| format!("matmul_batched: operand {a_ssa} not deferred"))?;
         // B is [K,N]: its rows are K, so the M-block offset must NOT reach it.
         let b_t = ctx
             .without_row_block(|c| {
-                c.with_head_rows(k, |c2, o| c2.load_deferred_for_head(&tb, k, n, o), ops)
+                // B is [K,N]: K is its ROW axis. `without_row_block` suppresses
+                // the M-block row base, which B must not take; the K offset is
+                // separate and does apply.
+                c.pv_k_on_rows = Some(true);
+                let stride_b = c.head_stride_b.unwrap_or(k);
+                let r = c.with_head_rows(stride_b, |c2, o| c2.load_deferred_for_head(&tb, k, n, o), ops);
+                c.pv_k_on_rows = None;
+                r
             })
             .ok_or_else(|| format!("matmul_batched: operand {b_ssa} not deferred"))?;
         (a_t, b_t)
@@ -3779,10 +3922,34 @@ fn translate_matmul(line: &str, ctx: &mut PtoContext, ops: &mut Vec<String>) -> 
         "pto.tmov ins({} : {}) outs({} : {})",
         mat_b_ssa, mat_b_ty, right_ssa, right_ty
     ));
-    ops.push(format!(
-        "pto.tmatmul ins({}, {} : {}, {}) outs({} : {})",
-        left_ssa, right_ssa, left_ty, right_ty, acc_ssa, acc_ty
-    ));
+    if ctx.matmul_accumulate {
+        // Inside a K loop: the FIRST iteration writes the accumulator, every
+        // later one adds into it. A plain tmatmul here would discard all but
+        // the last K slice's contribution -- a wrong answer that still
+        // assembles, runs and looks plausible, which is exactly the failure a
+        // timing run cannot see.
+        //
+        // Same shape as `emit_blocked_matmul_loops` uses on the non-batched
+        // path, which is validated; this is a port of it, not a new scheme.
+        let is_first = ctx.fresh_ssa();
+        ops.push(format!("  {is_first} = arith.cmpi eq, %k_i, %c0 : index"));
+        ops.push(format!("  scf.if {is_first} {{"));
+        ops.push(format!(
+            "    pto.tmatmul ins({}, {} : {}, {}) outs({} : {})",
+            left_ssa, right_ssa, left_ty, right_ty, acc_ssa, acc_ty
+        ));
+        ops.push("  } else {".to_string());
+        ops.push(format!(
+            "    pto.tmatmul.acc ins({}, {}, {} : {}, {}, {}) outs({} : {})",
+            acc_ssa, left_ssa, right_ssa, acc_ty, left_ty, right_ty, acc_ssa, acc_ty
+        ));
+        ops.push("  }".to_string());
+    } else {
+        ops.push(format!(
+            "pto.tmatmul ins({}, {} : {}, {}) outs({} : {})",
+            left_ssa, right_ssa, left_ty, right_ty, acc_ssa, acc_ty
+        ));
+    }
 
     Ok(())
 }
@@ -4025,19 +4192,82 @@ fn pick_batched_rows(m: u32, k: u32, n: u32) -> u32 {
 /// Returns `(m, n)` unchanged when the head already fits, so shapes that worked
 /// before emit byte-identically with no inner loops at all.
 fn pick_batched_blocks(m: u32, k: u32, n: u32) -> (u32, u32) {
+    let (mb, _kb, nb) = pick_batched_blocks_k(m, k, n);
+    (mb, nb)
+}
+
+/// Rows, K-depth and columns per block for a batched matmul stage.
+///
+/// K is the third blocking dimension, and WITHOUT it both of the others are
+/// pinned whenever K is large: `a_left` is `[mb, k]` and `b_right` is
+/// `[k, nb]`, so at K=896 the 64 KB L0A/L0B caps hold mb and nb to 16 no
+/// matter what the accumulator could take. pv ([S,S] @ [S,HD]) ran a 16x16
+/// accumulator at 0.2% of L0C for exactly this reason, and took 578 us of a
+/// 2750 us forward -- while `scores`, the same size transposed but with K=64,
+/// ran the same work in 66 us. The low L0C occupancy was a symptom; K was the
+/// cause.
+///
+/// Returns `kb == k` when the shape already fits, so no K loop is emitted and
+/// every previously-working kernel stays byte-identical.
+fn pick_batched_blocks_k(m: u32, k: u32, n: u32) -> (u32, u32, u32) {
     let b = 4u64; // f32 batched stages
-    let fits = |mb: u32, nb: u32| -> bool {
-        let a = (mb as u64) * (k as u64) * b;
-        let br = (k as u64) * (nb as u64) * b;
+    let fits_kb = |mb: u32, kb: u32, nb: u32| -> bool {
+        let a = (mb as u64) * (kb as u64) * b;
+        let br = (kb as u64) * (nb as u64) * b;
         let acc = (mb as u64) * (nb as u64) * b;
         a <= SPEC_A2A3.l1_size as u64
             && a <= SPEC_A2A3.l0_a_size as u64
             && br <= SPEC_A2A3.l0_b_size as u64
             && acc <= SPEC_A2A3.l0_c_size as u64
     };
+    let fits = |mb: u32, nb: u32| -> bool { fits_kb(mb, k, nb) };
     if fits(m, n) {
-        return (m, n);
+        return (m, k, n);
     }
+
+    // Try K-blocking FIRST, because it is the only lever that unpins the other
+    // two. Walk candidate Kb downward; for each, take the largest mb and nb the
+    // caps then allow. Kb must DIVIDE k -- the K loop is a bare
+    // `scf.for 0 to k/kb` and a partial tail would silently drop a slice of the
+    // reduction, which is a wrong answer rather than a rejected one.
+    //
+    // Candidates stay powers of two: `pick_nb_for_dtype` documents that ptoas
+    // chooses the L0A Left tile's BLayout from the companion Right tile's
+    // width, a hazard only validated at power-of-two widths.
+    let mut best: Option<(u32, u32, u32, u32)> = None; // (trips, mb, kb, nb)
+    let mut kb = k.next_power_of_two().min(512);
+    while kb >= 32 {
+        if k % kb == 0 {
+            // Largest mb and nb the caps allow at this Kb, both powers of two.
+            let mb_cap = ((SPEC_A2A3.l0_a_size as u64) / ((kb as u64) * b)) as u32;
+            let nb_cap = ((SPEC_A2A3.l0_b_size as u64) / ((kb as u64) * b)) as u32;
+            let pow2_le = |v: u32| -> u32 {
+                if v == 0 { 0 } else { 1 << (31 - v.leading_zeros()) }
+            };
+            let mut mb = pow2_le(mb_cap.min(m));
+            let mut nb = pow2_le(nb_cap.min(n));
+            // Respect the accumulator, and keep both dividing their extent so
+            // the loops tile exactly.
+            while mb > 1 && (!fits_kb(mb, kb, nb) || m % mb != 0) {
+                mb /= 2;
+            }
+            while nb > 1 && (!fits_kb(mb, kb, nb) || n % nb != 0) {
+                nb /= 2;
+            }
+            if mb >= 16 && nb >= 16 && fits_kb(mb, kb, nb) {
+                let trips = (m / mb) * (n / nb) * (k / kb);
+                if best.is_none() || trips < best.unwrap().0 {
+                    best = Some((trips, mb, kb, nb));
+                }
+            }
+        }
+        kb /= 2;
+    }
+    if let Some((_, mb, kb, nb)) = best {
+        return (mb, kb, nb);
+    }
+    // No K-blocked candidate: fall through to the original row/column search,
+    // which is still correct, just narrower.
     // Shrink N first: it is the only lever on `b_right`, and it relieves the
     // accumulator too. Then shrink rows for whatever remains.
     //
@@ -4068,7 +4298,7 @@ fn pick_batched_blocks(m: u32, k: u32, n: u32) -> (u32, u32) {
     while mb > 16 && !fits(mb, nb) {
         mb /= 2;
     }
-    (mb.max(16), nb.max(16))
+    (mb.max(16), k, nb.max(16))
 }
 
 /// Rows per block for a GENERIC batched stage.
