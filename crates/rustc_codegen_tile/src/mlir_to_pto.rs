@@ -4127,8 +4127,16 @@ fn pick_softmax_rows(rows: u32, cols: u32, dtype: &str, live_bytes: usize) -> u3
     // rb=16 at S=640 for 200 KB against a 184 KB budget, and the guard then
     // rejected what this function had just blessed -- the tile it named
     // (40960 B at offset 164864 B) is exactly the fifth.
+    // THREE full-width tiles, not five: `emit_softmax_steps` aliases exp and
+    // out onto sub (each is dead the instant the next op reads it), leaving
+    // src, tmp and the shared sub/exp/out buffer. Two row-reduction tiles
+    // (max, sum) are rows x 1.
+    //
+    // This MUST track the allocation in `emit_softmax_steps`. It previously
+    // said four while five were allocated, and the guard rejected shapes this
+    // function had just blessed.
     let fits = |rb: u32| -> bool {
-        let full = 5 * (rb as u64) * (cols as u64) * eb;
+        let full = 3 * (rb as u64) * (cols as u64) * eb;
         let rr = 2 * (rb as u64) * eb;
         full + rr <= budget
     };
@@ -4348,9 +4356,24 @@ fn emit_softmax_steps(
     let t_max_ssa = ctx.alloc_tile_rowreduce(&t_max_key, rows, dtype, ops);
     let t_tmp_ssa = ctx.alloc_tile(&t_tmp_key, rows, cols, dtype, ops);
     let t_sub_ssa = ctx.alloc_tile(&t_sub_key, rows, cols, dtype, ops);
-    let t_exp_ssa = ctx.alloc_tile(&t_exp_key, rows, cols, dtype, ops);
     let t_sum_ssa = ctx.alloc_tile_rowreduce(&t_sum_key, rows, dtype, ops);
-    let t_out_ssa = ctx.alloc_tile(out_key, rows, cols, dtype, ops);
+
+    // `sub` is dead the instant texp reads it, and the texp result is dead the
+    // instant trowexpanddiv reads it -- so exp and out are the SAME buffer as
+    // sub. Three full-width tiles become one, cutting the working set from
+    // 5 x [rb, cols] to 3 and letting `pick_softmax_rows` choose a larger rb
+    // (16 instead of 8 at S=896, halving the trips from 112 to 56).
+    //
+    // Both aliased ops are elementwise with a 1:1 index map, so in-place is
+    // sound in principle -- but whether ptoas and ccec ACCEPT an aliased
+    // src/dst is a toolchain question, not an algebraic one. Probed on device
+    // before writing this: probes/README records the run, and the aliased
+    // kernel at rb=16/S=896 gave all 896 rows summing to 1 (worst deviation
+    // 9.0e-08), every value in [0,1], and argmax preserved.
+    ctx.alias_tile(&t_sub_key, &t_exp_key);
+    ctx.alias_tile(&t_sub_key, out_key);
+    let t_exp_ssa = t_sub_ssa.clone();
+    let t_out_ssa = t_sub_ssa.clone();
 
     let src_ssa_pto = tsrc.ssa.clone();
 
