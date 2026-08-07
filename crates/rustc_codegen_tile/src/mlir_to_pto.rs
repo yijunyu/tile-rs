@@ -3421,45 +3421,66 @@ fn emit_batched_loop(
             "%__batched".to_string()
         }
         BatchedKind::Generic { ref inner_call, ref operands, .. } => {
-            // The generalised path: load each operand at ITS OWN rows-per-
-            // iteration, then translate one inner call. Nothing here knows what
-            // the stage computes, so a new stage is a caller-side description
-            // rather than another arm of this match.
+            // Every operand and the result are live at once, so a stage's own
+            // tiles can exceed UB inside a single head: silu_mul at S=1024
+            // stages 3 x [S,HD] f32 = 768 KB against 184 KB. Block rows within
+            // the head, exactly as the matmul arm does.
             //
-            // Every operand must have been deferred by `detect_batched_loads`.
-            // A non-deferred operand is loaded once before the loop, so every
-            // iteration would read iteration 0's data — the exact bug that
-            // produced "written but wrong, byte-identically" on device. Fail
-            // loudly rather than emit it.
-            let mut names = Vec::with_capacity(operands.len());
-            for (i, (ssa, rows, cols)) in operands.iter().enumerate() {
-                let t = ctx
-                    .get_tile(ssa)
-                    .ok_or_else(|| format!("batched: unknown tile {ssa}"))?
-                    .clone();
-                if t.deferred.is_none() {
-                    return Err(format!(
-                        "batched: operand {ssa} was not deferred — its load sits \
-                         outside the loop, so every iteration would read \
-                         iteration 0"
-                    ));
+            // All operands here share the row dimension (an elementwise stage
+            // reads and writes the same shape), so unlike the matmul every one
+            // of them takes the block offset -- there is no [K,N] operand whose
+            // rows mean something else.
+            let rb = pick_generic_rows(p.m, operands, "f32");
+            let ops_owned: Vec<(String, u32, u32)> = operands.clone();
+            let inner_owned = inner_call.clone();
+            let emit = |c: &mut PtoContext, o: &mut Vec<String>, rows: u32| -> Result<(), String> {
+                let mut names = Vec::with_capacity(ops_owned.len());
+                for (i, (ssa, orows, cols)) in ops_owned.iter().enumerate() {
+                    let t = c
+                        .get_tile(ssa)
+                        .ok_or_else(|| format!("batched: unknown tile {ssa}"))?
+                        .clone();
+                    if t.deferred.is_none() {
+                        return Err(format!(
+                            "batched: operand {ssa} was not deferred — its load sits \
+                             outside the loop, so every iteration would read \
+                             iteration 0"
+                        ));
+                    }
+                    let nm = format!("%__op{i}");
+                    // Each operand advances by ITS OWN declared rows-per-
+                    // iteration. The generic form exists to express stages whose
+                    // operands differ in height, so passing one shared value
+                    // here would reintroduce the very bug this path was built
+                    // to make unrepresentable.
+                    //
+                    // Note that is the HEAD stride; the block loop contributes
+                    // its own term, which `with_head_rows` now sums in.
+                    c.with_head_rows(
+                        *orows,
+                        |c2, o2| c2.load_deferred_for_head_as(&t, rows, *cols, &nm, o2),
+                        o,
+                    )?;
+                    names.push(nm);
                 }
-                let nm = format!("%__op{i}");
-                ctx.with_head_rows(
-                    *rows,
-                    |c, o| c.load_deferred_for_head_as(&t, *rows, *cols, &nm, o),
-                    &mut body,
-                )?;
-                names.push(nm);
+                c.set_inline_consts(&[("%__r", rows), ("%__c", p.n)]);
+                let mut inner = inner_owned.clone();
+                for (i, nm) in names.iter().enumerate() {
+                    inner = inner.replace(&format!("%__op{i}"), nm);
+                }
+                translate_line_in_batch(&inner, c, o)?;
+                emit_block_store(out_tv_ssa, out_elem_offset, dtype, "%__batched", c, o)
+            };
+            if rb < p.m {
+                let r_blk = p.m.div_ceil(rb);
+                ctx.use_size(r_blk);
+                body.push(format!("scf.for %r_i = %c0 to %c{r_blk} step %c1 {{"));
+                ctx.with_row_block(rb, |c, o| emit(c, o, rb), &mut body)?;
+                body.push("}".to_string());
+            } else {
+                emit(ctx, &mut body, p.m)?;
             }
-            // Shape constants the inner call may reference. `%__r`/`%__c` are
-            // the OUTPUT shape, which is what an elementwise stage operates at.
-            ctx.set_inline_consts(&[("%__r", p.m), ("%__c", p.n)]);
-            let mut inner = inner_call.clone();
-            for (i, nm) in names.iter().enumerate() {
-                inner = inner.replace(&format!("%__op{i}"), nm);
-            }
-            translate_line_in_batch(&inner, ctx, &mut body)?;
+            stored_inline = true;
             "%__batched".to_string()
         }
     };
@@ -4028,6 +4049,31 @@ fn pick_batched_blocks(m: u32, k: u32, n: u32) -> (u32, u32) {
         mb /= 2;
     }
     (mb.max(16), nb.max(16))
+}
+
+/// Rows per block for a GENERIC batched stage.
+///
+/// Every operand plus the output is live at once, so the budget divides by the
+/// count rather than by a fixed three: `silu_mul` stages two inputs and one
+/// output, which at S=1024 is 768 KB of `[S,HD]` f32 against a 184 KB UB.
+///
+/// Returns `rows` unchanged when the stage already fits, so shapes that worked
+/// before emit byte-identically with no inner loop at all.
+fn pick_generic_rows(rows: u32, operands: &[(String, u32, u32)], dtype: &str) -> u32 {
+    let eb = dtype_bytes_pto(dtype) as u64;
+    // Widest operand decides: they are loaded into equally-shaped tiles.
+    let cols = operands.iter().map(|(_, _, c)| *c).max().unwrap_or(1) as u64;
+    let live = operands.len() as u64 + 1; // inputs + result
+    let budget = SPEC_A2A3.ub_budget() as u64;
+    let fits = |rb: u32| -> bool { live * (rb as u64) * cols * eb <= budget };
+    if fits(rows) {
+        return rows;
+    }
+    let mut rb = rows;
+    while rb > 16 && !fits(rb) {
+        rb /= 2;
+    }
+    rb.max(16)
 }
 
 /// A row-blocked softmax awaiting its store, so the loop can enclose it.
