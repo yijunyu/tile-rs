@@ -2,11 +2,11 @@
 
 **tile-rs** is a Rust compiler framework for writing accelerator kernels *once* and lowering them to many hardware backends. You write kernels in a safe, idiomatic Rust tile DSL; a custom `rustc` codegen backend lowers them through MLIR to whichever target you select — the same source producing numerically-equivalent results across very different accelerators.
 
-The same kernel lowers to **15 backends** through a pluggable registry — NVIDIA/AMD GPUs, Apple GPUs (Metal), Vulkan/SPIR-V, AWS Trainium, Huawei Ascend, and more. **Eight are validated end-to-end on real hardware today** — Apple Metal, Vulkan (MoltenVK), Huawei Ascend NPU, NVIDIA GPU, Google TPU, AWS Trainium, Intel Gaudi, and the portable `linalg`→CPU bridge (five with published [pu-rs.org](https://pu-rs.org) benchmark entries); the rest are codegen-proven and scaffolded for on-hardware bring-up.
+The same kernel lowers to **16 backends** through a pluggable registry — NVIDIA/AMD GPUs, Apple GPUs (Metal), Vulkan/SPIR-V, AWS Trainium, Huawei Ascend, and more. **Eight are validated end-to-end on real hardware today** — Apple Metal, Vulkan (MoltenVK), Huawei Ascend NPU, NVIDIA GPU, Google TPU, AWS Trainium, Intel Gaudi, and the portable `linalg`→CPU bridge (five with published [pu-rs.org](https://pu-rs.org) benchmark entries); the rest are codegen-proven and scaffolded for on-hardware bring-up.
 
 ## Features
 
-- **Write once, target many** — a single Rust tile DSL (`tile_std`) lowers to 15 codegen backends through MLIR
+- **Write once, target many** — a single Rust tile DSL (`tile_std`) lowers to 16 codegen backends through MLIR
 - **Pluggable backends** — a `CodegenTarget` registry picks the target at build time via `TILERS_CODEGEN_PATH`; adding a backend never touches kernel source
 - **Memory-safe kernels** — typed, RAII-style APIs structurally prevent whole classes of bugs common in hand-written accelerator C/C++
 - **Numerical equivalence** — generated kernels match a CPU reference *on real hardware* (validated on 8 targets: Apple Metal, Vulkan/MoltenVK, Huawei Ascend NPU, NVIDIA GPU, Google TPU, AWS Trainium, Intel Gaudi, and the `linalg`→CPU bridge — five with benchmark entries at [pu-rs.org](https://pu-rs.org); every backend is also checked by a codegen generality test suite)
@@ -14,7 +14,7 @@ The same kernel lowers to **15 backends** through a pluggable registry — NVIDI
 
 ## Supported Targets
 
-The same `tile_std` kernel lowers to each backend below, selected with `TILERS_CODEGEN_PATH`. Every backend is proven by a **codegen generality matrix** — each `convert_mlir_to_<backend>` turns one shared MLIR module into syntactically-marked target source (15/15 tested). **On-HW** marks backends whose generated kernels are additionally validated end-to-end against a CPU reference on real hardware — via the [pu-rs.org](https://pu-rs.org) leaderboard (Metal, Ascend, NVIDIA, TPU, Trainium) and/or standalone runs (Vulkan on MoltenVK; Gaudi on a cloud instance; the `linalg` bridge on CPU).
+The same `tile_std` kernel lowers to each backend below, selected with `TILERS_CODEGEN_PATH`. Every backend is proven by a **codegen generality matrix** — each `convert_mlir_to_<backend>` turns one shared MLIR module into syntactically-marked target source (16/16 tested). **On-HW** marks backends whose generated kernels are additionally validated end-to-end against a CPU reference on real hardware — via the [pu-rs.org](https://pu-rs.org) leaderboard (Metal, Ascend, NVIDIA, TPU, Trainium) and/or standalone runs (Vulkan on MoltenVK; Gaudi on a cloud instance; the `linalg` bridge on CPU).
 
 <!-- BACKEND REPO LINKS (pre-staged): the per-backend repos are deployed PRIVATE.
      Open-sourcing is ASYNCHRONOUS — when a backend repo is flipped public, link its
@@ -36,8 +36,16 @@ The same `tile_std` kernel lowers to each backend below, selected with `TILERS_C
 | Qualcomm Hexagon| `hexagon` | HVX / QNN                    | ✅ | — |
 | Cerebras        | `csl`     | CSL                          | ✅ | — |
 | Tenstorrent     | `ttmetal` | Tensix                       | ✅ | — |
+| Huawei PICO NPU | `pico`    | PICO intrinsics → `.om`      | ✅ | — |
 
-All 15 emit their target language (codegen-tested); **8 are validated end-to-end on real hardware** today — Apple Metal (M2 Max / M4), Vulkan/SPIR-V (MoltenVK on Apple Silicon), Huawei Ascend NPU (910B), NVIDIA GPU (Tesla T4 / H20, via `mlir_to_cuda`), Google TPU (v5e, via `mlir_to_tpu` Pallas), AWS Trainium (trn1, via `mlir_to_nki`), Intel Gaudi (cloud, via `mlir_to_gaudi`), and the portable `linalg` bridge (CPU). Five carry published [pu-rs.org](https://pu-rs.org) benchmark entries (Metal, Ascend, NVIDIA, TPU, Trainium); Vulkan, Gaudi, and the CPU `linalg` path are validated by standalone runs.
+PICO is the one target with **no vendor compiler downstream** — there is no `nvcc`,
+`hexagon-clang` or `ptoas` in its path. `mlir_to_pico` emits a program over the
+PICO intrinsic set, and [svp](https://gitcode.com/ArthurBetter) assembles that
+into a loadable `.om`. It is therefore also the only emitter that registers
+outside the `emitters` feature: it imports no `crate::mlir_parse`, so it builds
+and is tested without LLVM.
+
+All 16 emit their target language (codegen-tested); **8 are validated end-to-end on real hardware** today — Apple Metal (M2 Max / M4), Vulkan/SPIR-V (MoltenVK on Apple Silicon), Huawei Ascend NPU (910B), NVIDIA GPU (Tesla T4 / H20, via `mlir_to_cuda`), Google TPU (v5e, via `mlir_to_tpu` Pallas), AWS Trainium (trn1, via `mlir_to_nki`), Intel Gaudi (cloud, via `mlir_to_gaudi`), and the portable `linalg` bridge (CPU). Five carry published [pu-rs.org](https://pu-rs.org) benchmark entries (Metal, Ascend, NVIDIA, TPU, Trainium); Vulkan, Gaudi, and the CPU `linalg` path are validated by standalone runs.
 
 ## Architecture
 
@@ -69,7 +77,7 @@ Each backend supplies its own host runtime, registered behind the `CodegenTarget
 | `tile_codegen` | The `CodegenTarget` trait + `TargetRegistry` — the pluggable backend skeleton |
 | `tile_spec` | Executable Gherkin (Given/When/Then) spec layer + the codegen-generality test suite |
 | `tile_hal` | Vendor-neutral Hardware Abstraction Layer (host-side device/stream/buffer + backend selection) |
-| `rustc_codegen_tile` | Custom rustc codegen backend (MIR → MLIR → backend source). The 15 backend **emitters** are open source — `src/mlir_to_*.rs`, exercised by `tile_spec`. The LLVM-dependent backend that links them into a runnable `librustc_codegen_tile.so` is distributed as a prebuilt release artifact (it needs LLVM 20; the emitters do not). |
+| `rustc_codegen_tile` | Custom rustc codegen backend (MIR → MLIR → backend source). The 16 backend **emitters** are open source — `src/mlir_to_*.rs`, exercised by `tile_spec`. The LLVM-dependent backend that links them into a runnable `librustc_codegen_tile.so` is distributed as a prebuilt release artifact (it needs LLVM 20; the emitters do not). |
 
 ## Quick Start
 

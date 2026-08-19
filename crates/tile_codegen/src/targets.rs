@@ -6,6 +6,9 @@
 //!   wired under the `emitters` feature — they live in the full
 //!   `rustc_codegen_tile` tree and import `crate::mlir_parse`, so they compile on
 //!   an LLVM-20 box. See `register_emitters`.
+//! * `pico` is the exception: it is self-contained (own parser, own intrinsic
+//!   model, no `crate::mlir_parse`), so it registers in the default build and is
+//!   tested by the standalone macOS build like [`DebugTarget`].
 //! * The CLOSED AscendC + PTO targets come in under `ascend` — registered the
 //!   SAME WAY (`register(Box::new(..))`), which is the entire point: "move
 //!   ascend-specific codegen to the same level as the other targets" reduces to
@@ -17,6 +20,16 @@ use crate::target::{CodegenTarget, EmitOpts, EmitOut, TargetMeta};
 /// Register every target compiled into this build.
 pub fn register_builtin(r: &mut TargetRegistry) {
     r.register(Box::new(DebugTarget));
+
+    // PICO, unconditionally: `mlir_to_pico` imports nothing from this crate, so
+    // unlike the other 14 it needs neither the `emitters` feature nor an LLVM-20
+    // box. Registering it here means the 16th target is exercised by the same
+    // default build that keeps the skeleton verifiable standalone.
+    r.register(Box::new(EmitterTarget::new(
+        "pico",
+        "pico.s",
+        crate::mlir_to_pico::convert_mlir_to_pico,
+    )));
 
     #[cfg(feature = "emitters")]
     register_emitters(r);

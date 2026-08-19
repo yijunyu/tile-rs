@@ -20,7 +20,7 @@
 //!
 //! | features        | builds where      | contains                                   |
 //! |-----------------|-------------------|--------------------------------------------|
-//! | *(default)*     | anywhere (macOS)  | trait + registry + `DebugTarget`           |
+//! | *(default)*     | anywhere (macOS)  | trait + registry + `DebugTarget` + `pico`  |
 //! | `emitters`      | LLVM-20 box       | + the 14 open `convert_mlir_to_*` emitters |
 //! | `ascend`        | LLVM-20 box       | + closed AscendC/PTO targets (peers)       |
 //!
@@ -61,6 +61,21 @@ pub(crate) mod mlir_to_gpu;
 
 #[cfg(feature = "emitters")]
 pub(crate) mod emitters;
+
+// PICO is the one emitter that is NOT behind `emitters`.
+//
+// The other 14 import `crate::mlir_parse` and are part of the LLVM-20 codegen
+// crate, so they can only build on that box. `mlir_to_pico` carries its own
+// parser and its own intrinsic model and imports nothing from this crate, so it
+// compiles in the default std-only build — which means the PICO target is
+// registered, selectable and testable anywhere, including the macOS skeleton
+// build that keeps this crate verifiable standalone.
+//
+// It has no vendor compiler behind it either: the emitted intrinsic program is
+// assembled into a loadable `.om` by svp, so there is no `ptoas` step to gate a
+// build on.
+#[path = "../../rustc_codegen_tile/src/mlir_to_pico.rs"]
+pub(crate) mod mlir_to_pico;
 
 // Under `ascend`: the CLOSED AscendC + PTO targets (non-open-source).
 #[cfg(feature = "ascend")]
@@ -114,6 +129,60 @@ mod tests {
         r.register(Box::new(Noop));
         assert_eq!(r.len(), 1);
         assert!(r.select("noop").is_some());
+    }
+
+    #[test]
+    fn pico_is_registered_in_the_default_build() {
+        // The 16th target, and the only emitter outside the `emitters` feature.
+        // If this ever needs an LLVM-20 box, something has started importing
+        // `crate::mlir_parse` and the standalone build has quietly lost a target.
+        let r = TargetRegistry::with_builtin();
+        assert!(r.select("pico").is_some(), "pico must register without any feature");
+        assert!(r.names().contains(&"pico"));
+    }
+
+    #[test]
+    fn pico_lowers_a_kernel_to_an_intrinsic_program() {
+        let r = TargetRegistry::with_builtin();
+        let t = r.select("pico").expect("pico target");
+        let mlir = r#"
+module {
+  llvm.func @tile_softmax(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    %1 = llvm.mlir.constant(1 : i32) : i32
+    %2 = llvm.mlir.constant(1024 : i32) : i32
+    %3 = llvm.call @__tile_load_f32(%arg0, %1, %2) : (!llvm.ptr<1>, i32, i32) -> i32
+    %4 = llvm.call @__tile_softmax_f32(%3, %3, %1, %2) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %4, %1, %2) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let out = t.emit(mlir, &EmitOpts::default()).expect("emit ok");
+        assert_eq!(out.ext, "pico.s");
+        // There is no `softmax` instruction on PICO, so the listing shows the
+        // five the vector engine actually runs rather than one that does not exist.
+        for mnemonic in ["vmax", "vsemad", "vexp", "vsum", "vdiv"] {
+            assert!(out.source.contains(mnemonic), "missing `{mnemonic}`:\n{}", out.source);
+        }
+        assert!(out.source.contains("PackPicoOm"), "the build path must name svp's packer");
+    }
+
+    #[test]
+    fn pico_refuses_an_operation_it_has_no_intrinsic_for() {
+        // A target with no vendor compiler behind it cannot fall back on "the
+        // compiler will sort it out", so an unknown op is an error, not a stub.
+        let r = TargetRegistry::with_builtin();
+        let t = r.select("pico").unwrap();
+        let mlir = r#"
+module {
+  llvm.func @k(%arg0: !llvm.ptr<1>) attributes {hacc.entry} {
+    %1 = llvm.call @__tile_conv3d_f32(%arg0) : (!llvm.ptr<1>) -> i32
+    llvm.return
+  }
+}
+"#;
+        let err = t.emit(mlir, &EmitOpts::default()).unwrap_err();
+        assert!(err.contains("no PICO intrinsic lowering"), "{err}");
     }
 
     #[test]
