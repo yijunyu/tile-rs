@@ -4,6 +4,11 @@
 
 The same kernel lowers to **15 backends** through a pluggable registry — NVIDIA/AMD GPUs, Apple GPUs (Metal), Vulkan/SPIR-V, AWS Trainium, Huawei Ascend, and more. **Eight are validated end-to-end on real hardware today** — Apple Metal, Vulkan (MoltenVK), Huawei Ascend NPU, NVIDIA GPU, Google TPU, AWS Trainium, Intel Gaudi, and the portable `linalg`→CPU bridge (five with published [pu-rs.org](https://pu-rs.org) benchmark entries); the rest are codegen-proven and scaffolded for on-hardware bring-up.
 
+**[tile-rs next to Mojo 1.0](docs/mojo-1.0-comparison.md)** — sixteen kernels on an
+Apple M1 Ultra, the one target both projects support: 15 of 16 faster, one tie,
+median gap 4.7%. Plus the five-backend Ascend 910B2 table, all generated from the
+same source.
+
 ## Features
 
 - **Write once, target many** — a single Rust tile DSL (`tile_std`) lowers to 15 codegen backends through MLIR
