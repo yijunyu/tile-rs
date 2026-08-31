@@ -1075,8 +1075,32 @@ impl Op {
             .collect()
     }
 
+    /// Names that reach this emitter and have **no** PICO lowering, but whose
+    /// spelling contains a more generic probe from `TABLE`.
+    ///
+    /// Refusing is the entire point. `__tile_mul_mv_q8_0_f32` contains
+    /// `__tile_mul_`, so it used to classify as `Op::Mul` and emit `vvmul`
+    /// (0x41, *elementwise*, vector unit) — a quantised matrix-vector product
+    /// that compiled, ran, and computed the wrong tensor without a diagnostic.
+    /// A sweep of all 211 registered pico kernels on 2026-08-31 found 20 doing
+    /// exactly that: 14 `mul_mm_*` and 6 `mul_mv_*`, including the `q8_0`,
+    /// `iq2_xxs` and MoE `id_map0` variants a quantised model leans on hardest.
+    ///
+    /// These are matmul-family ops. They belong on the cube unit behind a real
+    /// lowering; until one exists, `no PICO intrinsic lowering for X` is the
+    /// only honest answer, and it is what the rest of this emitter already does
+    /// for every name it does not know.
+    const NO_LOWERING: &[&str] = &["__tile_mul_mm_", "__tile_mul_mv_"];
+
     fn classify(callee: &str) -> Option<Op> {
-        // Longest-first: `__tile_rms_norm_` must not be shadowed by a shorter probe.
+        if Op::NO_LOWERING.iter().any(|p| callee.contains(p)) {
+            return None;
+        }
+        // Probes are matched LONGEST-FIRST, computed rather than assumed. This
+        // used to rely on table order and the order was wrong: `__tile_matmul_`
+        // sat above `__tile_matmul_transposed_`, so every transposed matmul
+        // silently lost its transpose. Ordering is not a property a reader can
+        // check, so it is no longer load-bearing — `max_by_key` is.
         const TABLE: &[(&str, Op)] = &[
             ("__tile_load_", Op::Load),
             ("__tile_store_", Op::Store),
@@ -1122,7 +1146,11 @@ impl Op {
             ("__tile_max_", Op::Max),
             ("__tile_min_", Op::Min),
         ];
-        TABLE.iter().find(|(p, _)| callee.contains(p)).map(|(_, o)| *o)
+        TABLE
+            .iter()
+            .filter(|(p, _)| callee.contains(p))
+            .max_by_key(|(p, _)| p.len())
+            .map(|(_, o)| *o)
     }
 
     pub(crate) fn name(self) -> &'static str {
@@ -1741,6 +1769,61 @@ pub fn convert_mlir_to_pico_for(mlir: &str, m: &Machine) -> Result<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A generic probe must never capture a kernel it does not implement.
+    ///
+    /// Found by sweeping all 211 registered pico kernels through the real
+    /// binary on 2026-08-31 (kernel-impact coverage run 2). `classify` matched
+    /// on `callee.contains(p)` and took the FIRST hit, so 20 matmul-family
+    /// kernels matched the generic `__tile_mul_` probe and emitted `vvmul`
+    /// (0x41, elementwise, vector unit). That is the worst failure a lowering
+    /// can have: it compiles, it runs, and it computes a different tensor.
+    ///
+    /// Refusal is the correct behaviour here, not a placeholder — the emitter
+    /// already refuses every name it does not know, and a wrong answer is worse
+    /// than a compile error. If a cube lowering for these ever lands, this test
+    /// should change to assert THAT, never to delete the assertion.
+    #[test]
+    fn a_generic_probe_never_captures_a_kernel_it_cannot_lower() {
+        for callee in [
+            "__tile_mul_mv_q8_0_f32",
+            "__tile_mul_mv_id_q8_0_f32",
+            "__tile_mul_mv_id_iq2_xxs_pair_swiglu_f32",
+            "__tile_mul_mm_q8_0_f32",
+            "__tile_mul_mm_id_q8_0_f16",
+            "__tile_mul_mm_id_map0_ne20_16_full",
+        ] {
+            assert_eq!(
+                Op::classify(callee),
+                None,
+                "{callee} must be refused, not lowered to elementwise mul"
+            );
+        }
+        // The plain elementwise ops these shadow must still work.
+        assert_eq!(Op::classify("__tile_mul_f32"), Some(Op::Mul));
+        assert_eq!(Op::classify("__tile_mul_f16"), Some(Op::Mul));
+    }
+
+    /// The same bug in its second form: probe order, not a missing probe.
+    ///
+    /// `__tile_matmul_` preceded `__tile_matmul_transposed_` in the table, and
+    /// first-match-wins silently dropped the transpose — B instead of B^T.
+    /// Dispatch is now longest-match, computed at the call, so no future edit
+    /// can reintroduce this by appending a row in the wrong place.
+    #[test]
+    fn the_longest_probe_wins_regardless_of_table_order() {
+        assert_eq!(
+            Op::classify("__tile_matmul_transposed_f32"),
+            Some(Op::MatmulTransposed),
+            "a transposed matmul must not fall back to plain matmul"
+        );
+        assert_eq!(Op::classify("__tile_matmul_f16"), Some(Op::Matmul));
+        // The pairs the original comment worried about, now actually enforced.
+        assert_eq!(Op::classify("__tile_reduce_max_f32"), Some(Op::ReduceMax));
+        assert_eq!(Op::classify("__tile_reduce_sum_f32"), Some(Op::Sum));
+        assert_eq!(Op::classify("__tile_add_scalar_f32"), Some(Op::AddS));
+        assert_eq!(Op::classify("__tile_rms_norm_f32"), Some(Op::RmsNorm));
+    }
 
     fn softmax_mlir() -> &'static str {
         r#"
