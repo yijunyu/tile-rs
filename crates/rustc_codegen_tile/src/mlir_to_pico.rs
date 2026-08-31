@@ -104,7 +104,7 @@ pub mod pico_isa {
             Intrinsic { op: 0x0e, name: Some("min"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x0f, name: Some("mini"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("imm", 31, 32), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x10, name: Some("cmp"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x11, name: Some("cmpi"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("imm", 31, 32), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x11, name: Some("cmpi"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("Xa", 11, 6), Field::new("src", 17, 6), Field::new("pred", 23, 6), Field::new("imm", 31, 32), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x12, name: Some("and"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x13, name: Some("andi"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("imm", 31, 32), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x14, name: Some("or"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
@@ -112,21 +112,21 @@ pub mod pico_isa {
             Intrinsic { op: 0x16, name: Some("xor"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x17, name: Some("not"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x18, name: Some("shl"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x19, name: Some("shli"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("imm5", 23, 5), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x19, name: Some("shli"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("rsv0", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("imm5", 23, 5), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x1a, name: Some("shr"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("src2", 23, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x1b, name: Some("shri"), class: Class::Scalar, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("imm5", 23, 5), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x1c, name: Some("mov"), class: Class::Scalar, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("mode", 7, 3), Field::new("dst", 10, 16), Field::new("src", 31, 32), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x1d, name: Some("ldxr"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x1d, name: Some("ldxr"), class: Class::Scalar, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("BaseAddrType", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x1e, name: Some("stxr"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x1f, name: Some("insert"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x20, name: Some("cvt"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x1f, name: Some("insert"), class: Class::Scalar, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("dst", 11, 6), Field::new("src", 17, 6), Field::new("dst_bit", 23, 5), Field::new("bit_count", 28, 5), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x20, name: Some("cvt"), class: Class::Scalar, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("mode", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("exp", 23, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x21, name: Some("nop"), class: Class::Control, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x22, name: Some("end"), class: Class::Control, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x23, name: Some("trap"), class: Class::Control, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x24, name: Some("jmp"), class: Class::Control, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("mode", 7, 4), Field::new("Xd", 11, 6), Field::new("dst", 31, 32), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x25, name: Some("jc"), class: Class::Control, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("mode", 7, 4), Field::new("Xd", 11, 6), Field::new("dst", 31, 32), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x26, name: Some("jnc"), class: Class::Control, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("mode", 7, 4), Field::new("Xd", 11, 6), Field::new("dst", 31, 32), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x27, name: Some("jdnz"), class: Class::Control, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x27, name: Some("jdnz"), class: Class::Control, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("Xn", 11, 6), Field::new("dst", 31, 32), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x28, name: Some("bar"), class: Class::Control, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x29, name: Some("enew"), class: Class::Event, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("Xd", 11, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x2a, name: Some("eset"), class: Class::Event, status: Status::ExecutionVerified, fields: &[Field::new("op", 0, 7), Field::new("pipe", 7, 4), Field::new("Xn", 11, 6), Field::new("f63", 63, 1)] },
@@ -149,14 +149,14 @@ pub mod pico_isa {
             Intrinsic { op: 0x3b, name: Some("vmin"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x3c, name: Some("vnot"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x3d, name: Some("vsemad"), class: Class::Vector, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("Xp", 35, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x3e, name: Some("vvasltc"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x3e, name: Some("vvasltc"), class: Class::Vector, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("mask_en", 36, 1), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x3f, name: Some("vvadd"), class: Class::Vector, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x40, name: Some("vvsub"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x40, name: Some("vvsub"), class: Class::Vector, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x41, name: Some("vvmul"), class: Class::Vector, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x42, name: Some("vvdiv"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x43, name: Some("vvmad"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x44, name: Some("vvmax"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
-            Intrinsic { op: 0x45, name: Some("vvmin"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x42, name: Some("vvdiv"), class: Class::Vector, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x43, name: Some("vvmad"), class: Class::Vector, status: Status::OwnerSpecified, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x44, name: Some("vvmax"), class: Class::Vector, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("mode", 38, 1), Field::new("f63", 63, 1)] },
+            Intrinsic { op: 0x45, name: Some("vvmin"), class: Class::Vector, status: Status::FieldsInferred, fields: &[Field::new("op", 0, 7), Field::new("type", 7, 4), Field::new("Xd", 11, 6), Field::new("Xn", 17, 6), Field::new("Xm", 23, 6), Field::new("Xt", 29, 6), Field::new("mode", 38, 1), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x46, name: Some("vvcmp"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x47, name: Some("vvand"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
             Intrinsic { op: 0x48, name: Some("vvor"), class: Class::Vector, status: Status::NameOnly, fields: &[Field::new("op", 0, 7), Field::new("dst", 11, 6), Field::new("f63", 63, 1)] },
@@ -544,8 +544,9 @@ pub mod pico_isa {
             assert_eq!(c.named, 91, "every slot in the named block has a mnemonic");
             assert_eq!(c.execution_verified, 14, "exactly the asm_pico FIELDS set round-trips");
             assert_eq!(
-                c.owner_specified, 11,
-                "the owner vector/GPLP field model (10) plus scalar div's decode_div table"
+                c.owner_specified, 16,
+                "the owner vector/GPLP field model (10), scalar div's decode_div table, \
+                 and the five the 2026-08-29 owner reply named completely"
             );
             assert_eq!(c.template_qualified, 1, "vlut");
             assert!(lookup(0x5a).is_some(), "0x5a is the last named opcode");
@@ -642,6 +643,15 @@ pub mod pico_isa {
             // own `decode_div`, the scalar ALU exception with four register
             // operands. pypto's PicoDecodeScalarDivOperands gives the identical
             // layout, and 45,880 corpus words vary exactly its four extents.
+            //
+            // Five more arrived with the owner reply of 2026-08-29: `ldxr` 0x1d,
+            // `cvt` 0x20, `vvasltc` 0x3e, `vvsub` 0x40 and `vvmad` 0x43. The bar
+            // they cleared is not that the owner spoke about them -- the same reply
+            // spoke about a dozen others -- but that the field table it gave is
+            // complete over every bit the board corpus shows moving. `cmpi` 0x11 is
+            // the counter-example kept deliberately: its predicate field is now
+            // named, and it is still not here, because the answer says nothing
+            // about [7:10], which 1.5 M words show varying.
             let owner: Vec<&str> = INTRINSICS
                 .iter()
                 .filter(|i| i.status == Status::OwnerSpecified)
@@ -650,11 +660,29 @@ pub mod pico_isa {
             assert_eq!(
                 owner,
                 vec![
-                    "div", "frvbg", "ldgp", "sglp", "vsltc", "vexp", "vsum", "vmax", "vsemad",
-                    "vvadd", "vvmul"
+                    "div", "ldxr", "cvt", "frvbg", "ldgp", "sglp", "vsltc", "vexp", "vsum",
+                    "vmax", "vsemad", "vvasltc", "vvadd", "vvsub", "vvmul", "vvmad"
                 ]
             );
+            // Still not vvmax. The owner reply confirms the refusal was right:
+            // "vvmin has weaker independent evidence than vvmax", and neither is on
+            // the authorable list -- their `mode[38]` tail is unqualified.
             assert_ne!(by_name("vvmax").unwrap().status, Status::OwnerSpecified);
+            assert_ne!(by_name("vvmin").unwrap().status, Status::OwnerSpecified);
+            // And still not the four the reply explicitly fenced off: vvcmp 0x46 is
+            // a named architectural slot that no production surface reaches, and
+            // vvand/vvor/vvxor are owner-declared but independently unqualified.
+            for n in ["vvcmp", "vvand", "vvor", "vvxor"] {
+                assert!(!by_name(n).unwrap().is_emittable(), "{n} must stay decode-only");
+            }
+            // The reply's own headline: these are NOT the common four-register form.
+            // Reading vdiv's [29:34] as the common `Xt` caused a real patching error
+            // upstream; this table must never acquire that field for them.
+            for n in ["vlog", "vdiv", "vsqrt", "neg", "dwarp"] {
+                let i = by_name(n).unwrap();
+                assert!(!i.is_emittable(), "{n} must stay fail-closed");
+                assert!(i.field("Xt").is_none(), "{n} is not the common four-register form");
+            }
             // div's fourth register is the whole point: modelled as the ordinary
             // three-register form it silently drops the divisor.
             let d = by_name("div").unwrap();
