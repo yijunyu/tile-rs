@@ -1008,11 +1008,18 @@ pub enum Op {
     Softmax,
     RmsNorm,
     Matmul,
+    /// Dense matrix-vector, `y[ne01] = A[ne01,ne00] . x[ne00]` (tile_std
+    /// `__tile_mul_mv_{f32,f16}_f32*`). Cube, not vector: the MAC does the
+    /// `ne00` reduction in hardware.
+    MulMv,
+    /// `mul_mv` where A is `block_q8_0 { half d; int8_t qs[32] }` — 34 B per
+    /// 32-element block of K, `ne00 % 32 == 0`.
+    MulMvQ8_0,
 }
 
 impl Op {
     /// Every operation this emitter knows how to lower.
-    pub const ALL: [Op; 34] = [
+    pub const ALL: [Op; 36] = [
         Op::Load,
         Op::Store,
         Op::Add,
@@ -1047,6 +1054,8 @@ impl Op {
         Op::Softmax,
         Op::RmsNorm,
         Op::Matmul,
+        Op::MulMv,
+        Op::MulMvQ8_0,
     ];
 
     /// The tile-API name, as it appears in a listing and a manifest.
@@ -1090,10 +1099,41 @@ impl Op {
     /// lowering; until one exists, `no PICO intrinsic lowering for X` is the
     /// only honest answer, and it is what the rest of this emitter already does
     /// for every name it does not know.
-    const NO_LOWERING: &[&str] = &["__tile_mul_mm_", "__tile_mul_mv_"];
+    ///
+    /// The dense and `q8_0` `mul_mv` forms left this list when `Op::MulMv` /
+    /// `Op::MulMvQ8_0` landed. What remains is not "not done yet" in the same
+    /// sense — each entry names a capability this op program cannot express:
+    ///
+    /// - `__tile_mul_mv_id_` / `__tile_mul_mm_id_` are MoE-routed. They select
+    ///   an expert per token from a routing table, which is a gather this
+    ///   emitter has no op for. Lowering them to an unrouted matvec would be
+    ///   the same class of silent wrongness as the elementwise `vvmul` this
+    ///   deny-list was created to stop.
+    /// - `iq2_xxs` dequantises through a codebook, not an affine scale. There
+    ///   is no disclosed PICO instruction for a codebook lookup on the cube
+    ///   operand path, and `vlut` is the SFU nonlinearity table, not this.
+    /// - `__tile_mul_mm_` (matrix-matrix) is the obvious next lowering and is
+    ///   deliberately still refused: it is a different tiling problem, not a
+    ///   free generalisation of `mul_mv`, and nothing has measured it.
+    const NO_LOWERING: &[&str] = &[
+        "__tile_mul_mm_",
+        "__tile_mul_mv_id_",
+        "__tile_mul_mv_iq2_",
+    ];
 
     fn classify(callee: &str) -> Option<Op> {
         if Op::NO_LOWERING.iter().any(|p| callee.contains(p)) {
+            return None;
+        }
+        // A `pair` matvec computes TWO products into TWO destinations
+        // (`src0_a`/`src0_b` share one `src1` -> `dst_a`/`dst_b`; it exists to
+        // save a `src1` load against two separate dispatches). The op program
+        // has one result per instruction, so lowering it as a single `mul_mv`
+        // would silently drop half the output — the same failure as the
+        // elementwise `vvmul` this deny-list was built for, one level up.
+        // Caught by re-sweeping the registry after adding `Op::MulMv`, which is
+        // the reason the sweep is run after a change and not only before one.
+        if callee.contains("__tile_mul_mv") && callee.contains("_pair") {
             return None;
         }
         // Probes are matched LONGEST-FIRST, computed rather than assumed. This
@@ -1125,6 +1165,13 @@ impl Op {
             ("__tile_reduce_max_", Op::ReduceMax),
             ("__tile_reduce_sum_", Op::Sum),
             ("__tile_matmul_transposed_", Op::MatmulTransposed),
+            // Longest-match handles the family: `__tile_mul_mv_ext_q8_0_f32_r1_2`
+            // reaches the q8_0 probe, `__tile_mul_mv_f16_f32_reduce` the dense
+            // one, and the MoE/codebook spellings never get here at all —
+            // NO_LOWERING refuses them above.
+            ("__tile_mul_mv_q8_0_", Op::MulMvQ8_0),
+            ("__tile_mul_mv_ext_q8_0_", Op::MulMvQ8_0),
+            ("__tile_mul_mv_", Op::MulMv),
             ("__tile_dequantize_i8_", Op::Dequantize),
             ("__tile_quantize_", Op::Quantize),
             ("__tile_transpose_", Op::Transpose),
@@ -1189,6 +1236,8 @@ impl Op {
             Op::Softmax => "softmax",
             Op::RmsNorm => "rms_norm",
             Op::Matmul => "matmul",
+            Op::MulMv => "mul_mv",
+            Op::MulMvQ8_0 => "mul_mv_q8_0",
         }
     }
 
@@ -1277,12 +1326,50 @@ impl Op {
                 ("vdiv", "x / r"),
             ],
             Op::Matmul => &[("mmad", "cube MAC")],
+
+            // A matvec is a matmul with N=1, and the cube is where the `ne00`
+            // reduction is free. Utilisation is the honest caveat: at N=1 only
+            // one column of the cube's N-tile is live (`channel_block` is 16),
+            // so a short-K matvec may well lose to a vector-unit
+            // `vvmul` + `vsum` pair. The batched call — `ne1 > 1`, i.e. prefill
+            // — is a true matmul and the cube is unambiguously right.
+            //
+            // Which side wins for decode's N=1 is a MEASUREMENT, and it has not
+            // been made: no board has been reachable since 2026-08-25. Nothing
+            // here should be read as a claim that it was.
+            Op::MulMv => &[("mmad", "cube MAC, N=1 (A[ne01,ne00] . x[ne00])")],
+
+            // Q8_0 is the case where the cube's native dtype pays: `cube_dtype`
+            // is s8, so the int8 quants feed the MAC directly and there is no
+            // dequantise-to-f16 pass before it.
+            //
+            // What that buys has to be paid for at the block boundary. Each
+            // 32-element block of K carries its own f16 scale `d`, so the scale
+            // varies WITHIN the reduction and cannot be applied to the finished
+            // dot product. The K-reduction is therefore split at QK8_0=32: one
+            // MAC per block, scale that block's partial, accumulate. Three
+            // instructions per 32 elements of K, and they are listed rather
+            // than folded because that cost is the whole trade-off — hiding it
+            // behind one `mul_mv_q8_0` entry would misreport the instruction
+            // mix to the scheduler and to anyone reading the listing.
+            //
+            // Staging the 34-byte blocks so `qs` reaches the cube operand and
+            // `d` reaches the vector unit is UB addressing, which the manifest
+            // assigns to pypto, not to this emitter.
+            Op::MulMvQ8_0 => &[
+                ("mmad", "cube MAC over one QK8_0=32 block of K, on the int8 quants directly"),
+                ("vsemad", "scale that block's partial by its f16 d  (a=d, b=0)"),
+                ("vvadd", "accumulate the scaled partial into the running K sum"),
+            ],
         }
     }
 
     /// Ops that run on the cube rather than the vector engine.
     fn is_cube(self) -> bool {
-        matches!(self, Op::Matmul | Op::MatmulTransposed)
+        matches!(
+            self,
+            Op::Matmul | Op::MatmulTransposed | Op::MulMv | Op::MulMvQ8_0
+        )
     }
 }
 
@@ -1779,14 +1866,23 @@ mod tests {
     /// (0x41, elementwise, vector unit). That is the worst failure a lowering
     /// can have: it compiles, it runs, and it computes a different tensor.
     ///
-    /// Refusal is the correct behaviour here, not a placeholder — the emitter
+    /// Refusal was the correct behaviour, not a placeholder — the emitter
     /// already refuses every name it does not know, and a wrong answer is worse
-    /// than a compile error. If a cube lowering for these ever lands, this test
-    /// should change to assert THAT, never to delete the assertion.
+    /// than a compile error.
+    ///
+    /// The two `mul_mv` spellings below have since been given a real cube
+    /// lowering, so per this test's own standing instruction they now assert
+    /// THAT rather than being deleted. What must never come back is the third
+    /// state: classified as something, lowered to elementwise `vvmul`.
     #[test]
     fn a_generic_probe_never_captures_a_kernel_it_cannot_lower() {
+        // Lowered now — and specifically NOT to Op::Mul.
+        assert_eq!(Op::classify("__tile_mul_mv_q8_0_f32"), Some(Op::MulMvQ8_0));
+        assert_eq!(Op::classify("__tile_mul_mv_f32_f32"), Some(Op::MulMv));
+        // Still refused: routing and codebook dequantisation are capabilities
+        // this op program does not have, and matrix-matrix is a separate
+        // tiling problem nobody has measured.
         for callee in [
-            "__tile_mul_mv_q8_0_f32",
             "__tile_mul_mv_id_q8_0_f32",
             "__tile_mul_mv_id_iq2_xxs_pair_swiglu_f32",
             "__tile_mul_mm_q8_0_f32",
@@ -1799,9 +1895,98 @@ mod tests {
                 "{callee} must be refused, not lowered to elementwise mul"
             );
         }
+        // A paired matvec has two destinations and one instruction cannot carry
+        // both. Refused rather than half-computed.
+        assert_eq!(Op::classify("__tile_mul_mv_f16_f32_pair_4"), None);
+        // Whatever else changes, none of the family may become Op::Mul again.
+        for callee in [
+            "__tile_mul_mv_q8_0_f32",
+            "__tile_mul_mv_id_q8_0_f32",
+            "__tile_mul_mm_q8_0_f32",
+        ] {
+            assert_ne!(Op::classify(callee), Some(Op::Mul), "{callee}");
+        }
         // The plain elementwise ops these shadow must still work.
         assert_eq!(Op::classify("__tile_mul_f32"), Some(Op::Mul));
         assert_eq!(Op::classify("__tile_mul_f16"), Some(Op::Mul));
+    }
+
+    /// The dense and q8_0 matvecs reach the cube; the rest of the family does
+    /// not reach anything.
+    ///
+    /// This is the other half of `a_generic_probe_never_captures_a_kernel_it_
+    /// cannot_lower`. That test pins what must be REFUSED; this one pins what
+    /// must be lowered, so a later edit cannot "fix" the refusal by widening a
+    /// probe until the MoE and codebook spellings fall into a dense matvec.
+    #[test]
+    fn the_mul_mv_family_splits_into_lowered_and_refused() {
+        for callee in [
+            "__tile_mul_mv_f32_f32",
+            "__tile_mul_mv_f16_f32",
+            "__tile_mul_mv_f32_f32_reduce",
+            "__tile_mul_mv_f16_f32_4_reduce",
+            "__tile_mul_mv_f32_f32_short",
+            "__tile_mul_mv_ext_f16_f32_r1_4",
+        ] {
+            assert_eq!(Op::classify(callee), Some(Op::MulMv), "{callee}");
+        }
+        for callee in ["__tile_mul_mv_q8_0_f32", "__tile_mul_mv_ext_q8_0_f32_r1_2"] {
+            assert_eq!(Op::classify(callee), Some(Op::MulMvQ8_0), "{callee}");
+        }
+        // Routed, codebook-quantised and matrix-matrix stay refused. Each of
+        // these names a capability the op program cannot express -- routing is
+        // a gather, iq2_xxs is a codebook -- so lowering them to a dense matvec
+        // would compute the wrong thing quietly, which is the failure this
+        // whole deny-list exists to prevent.
+        for callee in [
+            "__tile_mul_mv_id_q8_0_f32",
+            "__tile_mul_mv_id_iq2_xxs_f32",
+            "__tile_mul_mv_id_iq2_xxs_pair_swiglu_f32",
+            "__tile_mul_mm_q8_0_f32",
+            "__tile_mul_mm_id_map0_ne20_16_full",
+        ] {
+            assert_eq!(Op::classify(callee), None, "{callee} must stay refused");
+        }
+        // And the elementwise op whose probe used to swallow all of the above.
+        assert_eq!(Op::classify("__tile_mul_f32"), Some(Op::Mul));
+    }
+
+    /// Both matvecs run on the cube, and q8_0 pays for the s8 operand path with
+    /// a three-instruction block loop.
+    #[test]
+    fn the_q8_0_matvec_states_its_per_block_cost() {
+        assert!(Op::MulMv.is_cube() && Op::MulMvQ8_0.is_cube());
+        assert_eq!(Op::MulMv.intrinsics(), vec!["mmad"]);
+        // The scale lives inside the K reduction (one f16 `d` per 32-element
+        // block), so it cannot be applied to the finished dot product. Folding
+        // this to a single entry would misreport the instruction mix.
+        assert_eq!(
+            Op::MulMvQ8_0.intrinsics(),
+            vec!["mmad", "vsemad", "vvadd"],
+            "the per-block scale-and-accumulate must stay visible"
+        );
+    }
+
+    /// Nothing in either lowering is below the evidence bar.
+    ///
+    /// `encode` refuses anything under `OwnerSpecified`, but this emitter hands
+    /// off mnemonics rather than words, so that gate never fires here -- which
+    /// is exactly why the manifest carries `unattested_intrinsics`. A matvec
+    /// built on an unattested opcode would ship as a plausible name over a
+    /// layout nobody has confirmed.
+    #[test]
+    fn the_matvec_lowerings_use_only_attested_intrinsics() {
+        for op in [Op::MulMv, Op::MulMvQ8_0] {
+            for m in op.intrinsics() {
+                let i = pico_isa::by_name(m).unwrap_or_else(|| panic!("{m} not in the ISA table"));
+                assert!(
+                    i.is_emittable(),
+                    "{}: {m} is {:?}, below OwnerSpecified",
+                    op.name(),
+                    i.status
+                );
+            }
+        }
     }
 
     /// The same bug in its second form: probe order, not a missing probe.
@@ -2007,7 +2192,7 @@ module {
     fn every_op_variant_is_in_the_all_list() {
         // `Op::ALL` drives the signature catalog, so a variant missing from it
         // silently disappears from everything reasoning backwards.
-        assert_eq!(Op::ALL.len(), 34);
+        assert_eq!(Op::ALL.len(), 36);
         let mut seen: Vec<&str> = Op::ALL.iter().map(|o| o.tile_name()).collect();
         seen.sort_unstable();
         seen.dedup();
