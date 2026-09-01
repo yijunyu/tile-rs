@@ -4,11 +4,6 @@
 
 The same kernel lowers to **15 backends** through a pluggable registry — NVIDIA/AMD GPUs, Apple GPUs (Metal), Vulkan/SPIR-V, AWS Trainium, Huawei Ascend, and more. **Eight are validated end-to-end on real hardware today** — Apple Metal, Vulkan (MoltenVK), Huawei Ascend NPU, NVIDIA GPU, Google TPU, AWS Trainium, Intel Gaudi, and the portable `linalg`→CPU bridge (five with published [pu-rs.org](https://pu-rs.org) benchmark entries); the rest are codegen-proven and scaffolded for on-hardware bring-up.
 
-**[tile-rs next to Mojo 1.0](docs/mojo-1.0-comparison.md)** — sixteen kernels on an
-Apple M1 Ultra, the one target both projects support: 15 of 16 faster, one tie,
-median gap 4.7%. Plus the five-backend Ascend 910B2 table, all generated from the
-same source.
-
 ## Features
 
 - **Write once, target many** — a single Rust tile DSL (`tile_std`) lowers to 15 codegen backends through MLIR
@@ -21,10 +16,9 @@ same source.
 
 The same `tile_std` kernel lowers to each backend below, selected with `TILERS_CODEGEN_PATH`. Every backend is proven by a **codegen generality matrix** — each `convert_mlir_to_<backend>` turns one shared MLIR module into syntactically-marked target source (15/15 tested). **On-HW** marks backends whose generated kernels are additionally validated end-to-end against a CPU reference on real hardware — via the [pu-rs.org](https://pu-rs.org) leaderboard (Metal, Ascend, NVIDIA, TPU, Trainium) and/or standalone runs (Vulkan on MoltenVK; Gaudi on a cloud instance; the `linalg` bridge on CPU).
 
-<!-- Link a backend's cell below only once that backend's repository is public. -->
 | Backend | `TILERS_CODEGEN_PATH` | Target language | Codegen | On-HW |
 |---------|----------------------|-----------------|:------:|-------|
-| [Apple GPU](https://github.com/yijunyu/tile-rs-metal) | `metal`   | Metal Shading Language       | ✅ | ✅ M2 Max / M4 |
+| Apple GPU       | `metal`   | Metal Shading Language       | ✅ | ✅ M2 Max / M4 |
 | Vulkan          | `vulkan`  | GLSL → SPIR-V                | ✅ | ✅ Apple Silicon (MoltenVK) |
 | Ascend NPU      | `cpp`, `pto` | AscendC C++ / PTO-MLIR    | ✅ | ✅ 910B |
 | NVIDIA GPU      | `cuda`    | CUDA C                       | ✅ | ✅ T4 / H20 |

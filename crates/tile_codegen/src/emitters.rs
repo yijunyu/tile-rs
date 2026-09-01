@@ -2,7 +2,7 @@
 //!
 //! GATE: `feature = "emitters"`. These files import `crate::mlir_parse` (the
 //! std-only parser, included by `lib.rs` under the same feature) and are part of
-//! the LLVM-20 codegen crate, so this module compiles on an LLVM-20 host — NOT in a
+//! the LLVM-20 codegen crate, so this module compiles on adablue/910c — NOT in a
 //! bare macOS build. The inclusion set mirrors `crates/mlir_to_aie_tests`
 //! (the established no-NPU emitter test harness).
 //!
@@ -10,8 +10,8 @@
 //! (the 14 uniform open targets). AscendC/PTO are NOT here — they are closed and
 //! live in `crate::ascend`.
 
-// `mlir_to_gpu` is declared at crate root (in lib.rs) because `mlir_to_musa`
-// imports it as `crate::mlir_to_gpu`; re-export its entry point from here.
+#[path = "../../rustc_codegen_tile/src/mlir_to_gpu.rs"]
+mod gpu;
 #[path = "../../rustc_codegen_tile/src/mlir_to_musa.rs"]
 mod musa;
 #[path = "../../rustc_codegen_tile/src/mlir_to_spirv.rs"]
@@ -41,7 +41,7 @@ pub use aie::convert_mlir_to_aie;
 pub use bang::convert_mlir_to_bang;
 pub use csl::convert_mlir_to_csl;
 pub use gaudi::convert_mlir_to_gaudi;
-pub use crate::mlir_to_gpu::convert_mlir_to_gpu;
+pub use gpu::convert_mlir_to_gpu;
 pub use hexagon::convert_mlir_to_hexagon;
 pub use linalg::convert_mlir_to_linalg;
 pub use msl::convert_mlir_to_msl;
