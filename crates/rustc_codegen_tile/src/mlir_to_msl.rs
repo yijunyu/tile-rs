@@ -14341,6 +14341,10 @@ mod emit_tail_tests {
         check(|o| emit_absmax_msl(o, "float"), "uint gid = row * tcount + tid;", "emit_absmax_msl");
     }
     #[test]
+    fn t_emit_add_inplace_batched_msl() {
+        check(|o| emit_add_inplace_batched_msl(o), "a[off]+=b[off];", "emit_add_inplace_batched_msl");
+    }
+    #[test]
     fn t_emit_argmax_msl() {
         check(|o| emit_argmax_msl(o, "float"), "uint base = row * num_elements;  // num_elements reused as cols", "emit_argmax_msl");
     }
@@ -14379,6 +14383,26 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_attention_prefill_msl() {
         check(|o| emit_attention_prefill_msl(o), "const uint q_off = qi * num_heads * head_dim + head * head_dim;", "emit_attention_prefill_msl");
+    }
+    #[test]
+    fn t_emit_attn_decode_batched_msl() {
+        check(|o| emit_attn_decode_batched_msl(o), "kernel void attn_decode_batched(", "emit_attn_decode_batched_msl");
+    }
+    #[test]
+    fn t_emit_attn_decode_combine_msl() {
+        check(|o| emit_attn_decode_combine_msl(o), "out[hg*dh+e] = (l > 0.0f) ? (acc/l) : 0.0f;", "emit_attn_decode_combine_msl");
+    }
+    #[test]
+    fn t_emit_attn_decode_splitk_msl() {
+        check(|o| emit_attn_decode_splitk_msl(o), "threadgroup float red[256]; threadgroup float s_sh;", "emit_attn_decode_splitk_msl");
+    }
+    #[test]
+    fn t_emit_attn_decode_splitk_v2_msl() {
+        check(|o| emit_attn_decode_splitk_v2_msl(o), "device const float4* q4 = (device const float4*)(q + hg*128);", "emit_attn_decode_splitk_v2_msl");
+    }
+    #[test]
+    fn t_emit_attn_decode_v4_batched_msl() {
+        check(|o| emit_attn_decode_v4_batched_msl(o), "kernel void attn_decode_v4_batched(", "emit_attn_decode_v4_batched_msl");
     }
     #[test]
     fn t_emit_bin_fuse_f32_msl() {
@@ -14646,6 +14670,10 @@ mod emit_tail_tests {
         check(|o| emit_kv_cache_update_prefill_msl(o), "uint dst_idx = head * max_seq * head_dim + (start_pos + si) * head_dim + d;", "emit_kv_cache_update_prefill_msl");
     }
     #[test]
+    fn t_emit_kv_write_batched_msl() {
+        check(|o| emit_kv_write_batched_msl(o), "caches[h*max_seq*head_dim+pos*head_dim+d]=srcs[h*head_dim+d];", "emit_kv_write_batched_msl");
+    }
+    #[test]
     fn t_emit_l2dist_msl() {
         check(|o| emit_l2dist_msl(o, "float"), "if (tid == 0) p2[q_row * num_codes + k] = sdata[0];", "emit_l2dist_msl");
     }
@@ -14656,6 +14684,10 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_matmul_f16_msl() {
         check(|o| emit_matmul_f16_msl(o), "for (uint n = tid; n < N; n += tcount) {", "emit_matmul_f16_msl");
+    }
+    #[test]
+    fn t_emit_matmul_f16_simdgroup_msl() {
+        check(|o| emit_matmul_f16_simdgroup_msl(o), "simdgroup_multiply_accumulate(acc, a, b, acc);", "emit_matmul_f16_simdgroup_msl");
     }
     #[test]
     fn t_emit_matmul_transposed_msl() {
@@ -14672,6 +14704,26 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_matvec_f16_msl() {
         check(|o| emit_matvec_f16_msl(o), "for (uint s = 0; s < num_simd_groups; s++) total += shared[s];", "emit_matvec_f16_msl");
+    }
+    #[test]
+    fn t_emit_matvec_i8_v4_msl() {
+        check(|o| emit_matvec_i8_v4_msl(o), "sum += dot(a4[i], float4(w4[i]));", "emit_matvec_i8_v4_msl");
+    }
+    #[test]
+    fn t_emit_matvec_i8_v4_batched_msl() {
+        check(|o| emit_matvec_i8_v4_batched_msl(o), "float acc[8] = {0,0,0,0,0,0,0,0};", "emit_matvec_i8_v4_batched_msl");
+    }
+    #[test]
+    fn t_emit_matvec_q4k_coop_msl() {
+        check(|o| emit_matvec_q4k_coop_msl(o), "kernel void matvec_q4k_coop(", "emit_matvec_q4k_coop_msl");
+    }
+    #[test]
+    fn t_emit_matvec_q4k_msl() {
+        check(|o| emit_matvec_q4k_msl(o), "device const uchar *wr = p0 + (ulong)row * (ulong)n_blk * 144ul;", "emit_matvec_q4k_msl");
+    }
+    #[test]
+    fn t_emit_matvec_q4k_reg_msl() {
+        check(|o| emit_matvec_q4k_reg_msl(o), "const int first_row = ((int)tgpig.x * 2 + (int)sgitg) * 4;", "emit_matvec_q4k_reg_msl");
     }
     #[test]
     fn t_emit_max_msl() {
@@ -14715,6 +14767,10 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_mul_mv_f16_f32_pair_4_msl() {
         check(|o| emit_mul_mv_f16_f32_pair_4_msl(o), "const uint64_t offset0 = (uint64_t)(r0 + row) * (uint64_t)nb01 + (uint64_t)(i12 / r2) * (uint64_t)nb02 + (uint64_t)(i13 / r3) * (uint64_t)nb03;", "emit_mul_mv_f16_f32_pair_4_msl");
+    }
+    #[test]
+    fn t_emit_mul_mv_gate_up_swiglu_q4_K_f32_msl() {
+        check(|o| emit_mul_mv_gate_up_swiglu_q4_K_f32_msl(o), "Dense: no ids/token demux. gate_w=p0, up_w=p1, x=p2", "emit_mul_mv_gate_up_swiglu_q4_K_f32_msl");
     }
     #[test]
     fn t_emit_mul_mv_id_iq2_xxs_f32_msl() {
@@ -14761,6 +14817,14 @@ mod emit_tail_tests {
         check(|o| emit_mul_mv_q8_0_f32_msl(o), "const uint64_t offset0 = (uint64_t)(r0 + (uint)row) * (uint64_t)nb01 + (uint64_t)(i12 / r2) * (uint64_t)nb02 + (uint64_t)(i13 / r3) * (uint64_t)nb03;", "emit_mul_mv_q8_0_f32_msl");
     }
     #[test]
+    fn t_emit_mul_mv_qkv_q4_K_f32_msl() {
+        check(|o| emit_mul_mv_qkv_q4_K_f32_msl(o), "Map first_row -> (matrix weights, output buffer, local out row).", "emit_mul_mv_qkv_q4_K_f32_msl");
+    }
+    #[test]
+    fn t_emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl() {
+        check(|o| emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl(o), "threadgroup float xs[4096];", "emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl");
+    }
+    #[test]
     fn t_emit_mul_mv_t_t_4_disp_msl() {
         check(|o| emit_mul_mv_t_t_4_disp_msl(o, false), "const uint64_t offset0 = (uint64_t)(r0 + row) * (uint64_t)nb01 + (uint64_t)(i12 / r2) * (uint64_t)nb02 + (uint64_t)(i13 / r3) * (uint64_t)nb03;", "emit_mul_mv_t_t_4_disp_msl");
         check(|o| emit_mul_mv_t_t_4_disp_msl(o, true), "", "emit_mul_mv_t_t_4_disp_msl#v0");
@@ -14796,6 +14860,18 @@ mod emit_tail_tests {
         check(|o| emit_mul_mv_t_t_short_msl(o, true), "", "emit_mul_mv_t_t_short_msl#v0");
     }
     #[test]
+    fn t_emit_partition_cell_msl() {
+        // The destination is the LAST buffer (p{n-1}), never a hardcoded p1:
+        // under the default qualifier rule only the last buffer is writable.
+        check(|o| emit_partition_cell_msl(o, 4), "p3[r * tile_cols + c] = p0[base + r * src_cols + c];", "emit_partition_cell_msl#p3");
+        check(|o| emit_partition_cell_msl(o, 2), "p1[r * tile_cols + c] = p0[base + r * src_cols + c];", "emit_partition_cell_msl#p1");
+    }
+    #[test]
+    fn t_emit_partition_cell_store_msl() {
+        check(|o| emit_partition_cell_store_msl(o, 4), "p3[base + r * src_cols + c] = p0[r * tile_cols + c];", "emit_partition_cell_store_msl#p3");
+        check(|o| emit_partition_cell_store_msl(o, 2), "p1[base + r * src_cols + c] = p0[r * tile_cols + c];", "emit_partition_cell_store_msl#p1");
+    }
+    #[test]
     fn t_emit_quantize_msl() {
         check(|o| emit_quantize_msl(o, "float"), "uint gid = row * tcount + tid;", "emit_quantize_msl");
     }
@@ -14821,6 +14897,14 @@ mod emit_tail_tests {
         check(|o| emit_rms_norm_msl(o, "float"), "if (simd_group == 0 && simd_lane < MAX_SG) rms_shared[simd_lane] = (", "emit_rms_norm_msl");
     }
     #[test]
+    fn t_emit_rms_norm_mul_batched_msl() {
+        check(|o| emit_rms_norm_mul_batched_msl(o), "s=simd_sum(s); if(sl==0)sh[si]=s;", "emit_rms_norm_mul_batched_msl");
+    }
+    #[test]
+    fn t_emit_rms_norm_mul_v4_batched_msl() {
+        check(|o| emit_rms_norm_mul_v4_batched_msl(o), "float4 v=x4[i]; s+=dot(v,v);", "emit_rms_norm_mul_v4_batched_msl");
+    }
+    #[test]
     fn t_emit_rope_dsv4_msl() {
         check(|o| emit_rope_dsv4_msl(o), "float corr_lo = floor((float)n_dims * log((float)n_ctx_orig / (beta_fast * 2.0f * M_PI_F)) / (2.0f * log(freq_base)));", "emit_rope_dsv4_msl");
     }
@@ -14829,12 +14913,20 @@ mod emit_tail_tests {
         check(|o| emit_rope_inplace_msl(o), "float freq = 1.0f / pow(theta, 2.0f * float(i) / float(head_dim));", "emit_rope_inplace_msl");
     }
     #[test]
+    fn t_emit_rope_inplace_split_msl() {
+        check(|o| emit_rope_inplace_split_msl(o), "uint total_pairs = num_heads * half_dim;", "emit_rope_inplace_split_msl");
+    }
+    #[test]
     fn t_emit_rope_msl() {
         check(|o| emit_rope_msl(o, "float"), "float freq = 1.0f / pow(10000.0f, 2.0f * (float)i / (float)cols);", "emit_rope_msl");
     }
     #[test]
     fn t_emit_rope_prefill_msl() {
         check(|o| emit_rope_prefill_msl(o), "float freq = 1.0f / pow(theta, 2.0f * float(i) / float(head_dim));", "emit_rope_prefill_msl");
+    }
+    #[test]
+    fn t_emit_rope_split_batched_msl() {
+        check(|o| emit_rope_split_batched_msl(o), "ps[base+i]=x0*ca-x1*sa; ps[base+half_dim+i]=x1*ca+x0*sa;", "emit_rope_split_batched_msl");
     }
     #[test]
     fn t_emit_sample_top_p_msl() {
@@ -14868,6 +14960,10 @@ mod emit_tail_tests {
     #[test]
     fn t_emit_silu_msl() {
         check(|o| emit_silu_msl(o), "p1[gid] = v / (1.0f + exp(-v));", "emit_silu_msl");
+    }
+    #[test]
+    fn t_emit_silu_mul_batched_msl() {
+        check(|o| emit_silu_mul_batched_msl(o), "o[off]=(x/(1.0f+exp(-x)))*u[off];", "emit_silu_mul_batched_msl");
     }
     #[test]
     fn t_emit_silu_mul_msl() {
