@@ -8176,6 +8176,119 @@ module {
     }
 
     #[test]
+    fn test_pto_partition_cell_lowers_to_partition_view() {
+        // Cell (1,1) of a 16x32 partition of a 32x64 tile: base offsets are
+        // [row=16, col=32], supplied DIRECTLY (never via the flat-offset decode,
+        // which mis-derives the row when Tc != C).
+        let mlir = r#"
+module {
+  llvm.func @part_cell(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    %t = llvm.call @__tile_load_f32(%arg0, %c32, %c64) : (!llvm.ptr<1>, i32, i32) -> i32
+    %cell = llvm.call @__tile_partition_cell_f32(%t, %c1, %c1, %c16, %c32) : (i32, i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg1, %cell, %c16, %c32) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let pto = convert_mlir_to_pto(mlir).expect("partition cell PTO-MLIR");
+        assert!(
+            pto.contains("offsets = [%c16, %c32]"),
+            "cell (1,1) of a 16x32 partition must sit at [row=16, col=32]:\n{}",
+            pto
+        );
+        assert!(
+            pto.contains("sizes = [%c16, %c32]"),
+            "cell extent must be the tile 16x32:\n{}",
+            pto
+        );
+    }
+
+    #[test]
+    fn test_pto_partition_cell_store_lowers_to_tstore_view() {
+        // The _mut form is a store DESTINATION: it must emit a pto.tstore into a
+        // partition_view (a tload here would silently drop the write), and the
+        // view must COVER the cell (rows/cols raised to the grid the index
+        // implies: max(16, (1+1)*16) x max(32, (1+1)*32) = 32x64).
+        let mlir = r#"
+module {
+  llvm.func @part_cell_store(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    %t = llvm.call @__tile_load_f32(%arg0, %c16, %c32) : (!llvm.ptr<1>, i32, i32) -> i32
+    %dst = llvm.call @__tile_partition_cell_mut_f32(%t, %c1, %c1, %c16, %c32) : (i32, i32, i32, i32, i32) -> i32
+    llvm.return
+  }
+}
+"#;
+        let pto = convert_mlir_to_pto(mlir).expect("partition cell store PTO-MLIR");
+        assert!(
+            pto.contains("pto.tstore ins("),
+            "the _mut form must STORE (a tload silently drops the write):\n{}",
+            pto
+        );
+        assert!(
+            pto.contains("offsets = [%c16, %c32]"),
+            "cell (1,1) store base must be [row=16, col=32]:\n{}",
+            pto
+        );
+        assert!(
+            !pto.contains("pto.tload ins(%dst"),
+            "store destination must not also be loaded:\n{}",
+            pto
+        );
+    }
+
+    #[test]
+    fn test_pto_partition_cell_thm_partdisj_rejections() {
+        // thm:partdisj's hypotheses are ENFORCED, not assumed: a ragged split, a
+        // zero extent, or an out-of-grid cell has no established disjointness
+        // and must fail closed with a diagnostic naming the theorem.
+        let base = |ci: &str, cj: &str, tr: &str, tc: &str, rows: u32, cols: u32| {
+            format!(
+                "module {{\n  \
+                 llvm.func @k(%arg0: !llvm.ptr<1>) attributes {{hacc.entry}} {{\n    \
+                 %t = llvm.call @__tile_load_f32(%arg0, %c{rows}, %c{cols}) : (!llvm.ptr<1>, i32, i32) -> i32\n    \
+                 %cell = llvm.call @__tile_partition_cell_f32(%t, {ci}, {cj}, {tr}, {tc}) : (i32, i32, i32, i32, i32) -> i32\n    \
+                 llvm.return\n  }}\n}}\n"
+            )
+        };
+        // Ragged: 32x65 does not divide into 16x32 cells.
+        let err = convert_mlir_to_pto(&base("%c1", "%c1", "%c16", "%c32", 32, 65))
+            .expect_err("ragged partition must not lower");
+        assert!(err.contains("ragged") && err.contains("partdisj"), "{}", err);
+        // Zero extent: Tr=0 violates Tr>0.
+        let err = convert_mlir_to_pto(&base("%c1", "%c1", "%c0", "%c32", 32, 64))
+            .expect_err("zero-extent tile must not lower");
+        assert!(err.contains("positive"), "{}", err);
+        // Out-of-grid: cell (2,1) of a 2x2 grid (32x64 / 16x32) is outside.
+        let err = convert_mlir_to_pto(&base("%c2", "%c1", "%c16", "%c32", 32, 64))
+            .expect_err("out-of-grid cell must not lower");
+        assert!(err.contains("outside the 2x2 grid"), "{}", err);
+    }
+
+    #[test]
+    fn test_pto_validate_tile_shape_arch_bounds() {
+        // Plain row-major data tile: in bounds on every arch (16x8 f32, footprint 512B).
+        assert!(validate_tile_shape::<A2A3>(16, 8, "f32", "rows=16, cols=8").is_ok());
+        assert!(validate_tile_shape::<A5>(16, 8, "f32", "rows=16, cols=8").is_ok());
+        // C2: a row spanning multiple fractals must stride on 512B — 144 f32 cols
+        // = 576B is misaligned.
+        let err = validate_tile_shape::<A2A3>(16, 144, "f32", "rows=16, cols=144")
+            .expect_err("misaligned multi-fractal row must fail");
+        assert!(err.contains("(C2)"), "{}", err);
+        // C3: a5 (not a2a3) requires 16-aligned rows for NZ/cube tiles.
+        let err = validate_tile_shape::<A5>(17, 8, "f16", "rows=17, cols=8")
+            .expect_err("17-row f16 tile on a5 must fail row16");
+        assert!(err.contains("not 16-aligned (C3"), "{}", err);
+        assert!(validate_tile_shape::<A2A3>(17, 8, "f16", "rows=17, cols=8").is_ok());
+        // C3-reduce: col_major reduction tiles need rows*sizeof % 32 == 0 (4 f32
+        // rows = 16B fails; 8 rows = 32B passes).
+        let red = |rows: u32| format!("rows={rows}, cols=1, blayout=col_major, slayout=none_box");
+        let err = validate_tile_shape::<A2A3>(4, 1, "f32", &red(4))
+            .expect_err("4-row col_major f32 reduction must fail 32B align");
+        assert!(err.contains("C3-reduce"), "{}", err);
+        assert!(validate_tile_shape::<A2A3>(8, 1, "f32", &red(8)).is_ok());
+    }
+
+    #[test]
     fn test_pto_matmul_i8_unknown_errs() {
         // matmul_i8: (c0, a, b, scale_ptr, m, k, n) — unknown A tile.
         let call = "%r = llvm.call @__tile_matmul_i8_acc_i32_dequant_f16(%c0, %undef, %undef2, %arg1, %c16, %c16, %c16) : (i32, i32, i32, !llvm.ptr<1>, i32, i32, i32) -> i32";
