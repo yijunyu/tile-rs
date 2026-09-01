@@ -1015,11 +1015,24 @@ pub enum Op {
     /// `mul_mv` where A is `block_q8_0 { half d; int8_t qs[32] }` — 34 B per
     /// 32-element block of K, `ne00 % 32 == 0`.
     MulMvQ8_0,
+    /// Softmax over `score = x*scale + mask` — the attention mask, added
+    /// before the max. Slope is 1; the ALiBi form is separate.
+    SoftmaxMask,
+    /// Softmax over `score = x*scale + slope*mask`, `slope` a host-supplied
+    /// per-launch scalar (the caller computes `pow(base, exp)` per head).
+    SoftmaxAlibi,
+    /// Softmax with an attention sink: the row max starts at `sink[row]` and
+    /// the denominator gains `exp(sink[row] - m)`. The sink is not written.
+    SoftmaxSink,
+    /// Mask add and sink fold-in together.
+    SoftmaxMaskSink,
+    /// ALiBi slope-mask and sink fold-in together.
+    SoftmaxAlibiSink,
 }
 
 impl Op {
     /// Every operation this emitter knows how to lower.
-    pub const ALL: [Op; 36] = [
+    pub const ALL: [Op; 41] = [
         Op::Load,
         Op::Store,
         Op::Add,
@@ -1056,6 +1069,11 @@ impl Op {
         Op::Matmul,
         Op::MulMv,
         Op::MulMvQ8_0,
+        Op::SoftmaxMask,
+        Op::SoftmaxAlibi,
+        Op::SoftmaxSink,
+        Op::SoftmaxMaskSink,
+        Op::SoftmaxAlibiSink,
     ];
 
     /// The tile-API name, as it appears in a listing and a manifest.
@@ -1121,6 +1139,29 @@ impl Op {
         "__tile_mul_mv_iq2_",
     ];
 
+    /// Read the softmax feature set out of the mnemonic.
+    ///
+    /// The features are orthogonal and combine, so they are tested
+    /// independently rather than matched as whole spellings. `_strided` is
+    /// deliberately NOT a feature: strides are `nb01`/`nb1` row addressing,
+    /// which the manifest assigns to pypto, and the arithmetic is unchanged.
+    fn classify_softmax(callee: &str) -> Option<Op> {
+        if !callee.contains("__tile_softmax") {
+            return None;
+        }
+        let sink = callee.ends_with("_sink");
+        let alibi = callee.contains("_alibi_");
+        let mask = callee.contains("_mask_");
+        Some(match (alibi, mask, sink) {
+            (true, _, true) => Op::SoftmaxAlibiSink,
+            (true, _, false) => Op::SoftmaxAlibi,
+            (false, true, true) => Op::SoftmaxMaskSink,
+            (false, true, false) => Op::SoftmaxMask,
+            (false, false, true) => Op::SoftmaxSink,
+            (false, false, false) => Op::Softmax,
+        })
+    }
+
     fn classify(callee: &str) -> Option<Op> {
         if Op::NO_LOWERING.iter().any(|p| callee.contains(p)) {
             return None;
@@ -1135,6 +1176,15 @@ impl Op {
         // the reason the sweep is run after a change and not only before one.
         if callee.contains("__tile_mul_mv") && callee.contains("_pair") {
             return None;
+        }
+        // Softmax is read by FEATURE, not by probe. Its variants compose --
+        // `_mask_f16_sink` is mask AND sink -- and a longest-substring table
+        // cannot express that: `_mask_` is longer than `_sink`, so the table
+        // would match the mask, return SoftmaxMask, and drop the sink. That is
+        // how all ten of these came to lower to plain `softmax`, computing
+        // attention with no mask, no ALiBi bias and no sink at all.
+        if let Some(op) = Op::classify_softmax(callee) {
+            return Some(op);
         }
         // Probes are matched LONGEST-FIRST, computed rather than assumed. This
         // used to rely on table order and the order was wrong: `__tile_matmul_`
@@ -1238,6 +1288,11 @@ impl Op {
             Op::Matmul => "matmul",
             Op::MulMv => "mul_mv",
             Op::MulMvQ8_0 => "mul_mv_q8_0",
+            Op::SoftmaxMask => "softmax_mask",
+            Op::SoftmaxAlibi => "softmax_alibi",
+            Op::SoftmaxSink => "softmax_sink",
+            Op::SoftmaxMaskSink => "softmax_mask_sink",
+            Op::SoftmaxAlibiSink => "softmax_alibi_sink",
         }
     }
 
@@ -1311,12 +1366,99 @@ impl Op {
                 ("vlut", "sigmoid(x)"),
                 ("vvmul", "x * sigmoid(x)"),
             ],
+            // The kernel's input `scale` costs nothing here: `vsemad` is
+            // a*x + b, so it carries a=scale alongside b=-m. That is only
+            // legitimate because `rowmax` commutes with a POSITIVE scale
+            // (m = rowmax(x*scale) = scale*rowmax(x)), and the attention scale
+            // 1/sqrt(d) is positive. A negative scale would need the max taken
+            // after scaling, and this lowering would be wrong.
             Op::Softmax => &[
                 ("vmax", "m = rowmax(x)"),
-                ("vsemad", "x - m  (scalar multiply-add, a=1 b=-m)"),
-                ("vexp", "e = exp(x - m)"),
+                ("vsemad", "x*scale - m  (a=scale, b=-m)"),
+                ("vexp", "e = exp(x*scale - m)"),
                 ("vsum", "s = rowsum(e)"),
                 ("vdiv", "e / s"),
+            ],
+
+            // score = x*scale + mask.
+            //
+            // The mask is a TENSOR added after the scale, so it cannot ride on
+            // the vsemad the way the scale does, and it must land before the
+            // max -- a masked-out position is -inf and changes m. Lowering
+            // this to plain softmax computed attention with no mask at all,
+            // silently: every position attended to every other one.
+            Op::SoftmaxMask => &[
+                ("vsemad", "xs = x*scale  (a=scale, b=0)"),
+                ("vvadd", "score = xs + mask"),
+                ("vmax", "m = rowmax(score)"),
+                ("vsemad", "score - m  (a=1, b=-m)"),
+                ("vexp", "e = exp(score - m)"),
+                ("vsum", "s = rowsum(e)"),
+                ("vdiv", "e / s"),
+            ],
+
+            // score = x*scale + slope*mask, `slope` a per-launch scalar the
+            // host computes per head. One more vsemad than the plain mask:
+            // the bias is scaled before it is added.
+            Op::SoftmaxAlibi => &[
+                ("vsemad", "xs = x*scale  (a=scale, b=0)"),
+                ("vsemad", "b = slope*mask  (a=slope, b=0)"),
+                ("vvadd", "score = xs + b"),
+                ("vmax", "m = rowmax(score)"),
+                ("vsemad", "score - m  (a=1, b=-m)"),
+                ("vexp", "e = exp(score - m)"),
+                ("vsum", "s = rowsum(e)"),
+                ("vdiv", "e / s"),
+            ],
+
+            // The sink enters TWICE and neither place is the output.
+            //
+            // The row max is initialised to sink[row], so m = max(rowmax, sink)
+            // -- which changes every exponent in the row, not just one term.
+            // Then the denominator gains exp(sink - m). The sink itself is
+            // never written, so only `e` is divided. Dropping it inflated
+            // every probability in the row by the mass the sink should have
+            // held.
+            Op::SoftmaxSink => &[
+                ("vsemad", "xs = x*scale  (a=scale, b=0)"),
+                ("vmax", "m0 = rowmax(xs)"),
+                ("vvmax", "m = max(m0, sink)  -- lmax is initialised to the sink"),
+                ("vsemad", "xs - m  (a=1, b=-m)"),
+                ("vexp", "e = exp(xs - m)"),
+                ("vsum", "s = rowsum(e)"),
+                ("vsemad", "sink - m  (a=1, b=-m)"),
+                ("vexp", "es = exp(sink - m)"),
+                ("vvadd", "d = s + es  -- the denominator gains the sink term"),
+                ("vdiv", "e / d  -- the sink is not written"),
+            ],
+
+            Op::SoftmaxMaskSink => &[
+                ("vsemad", "xs = x*scale  (a=scale, b=0)"),
+                ("vvadd", "score = xs + mask"),
+                ("vmax", "m0 = rowmax(score)"),
+                ("vvmax", "m = max(m0, sink)"),
+                ("vsemad", "score - m  (a=1, b=-m)"),
+                ("vexp", "e = exp(score - m)"),
+                ("vsum", "s = rowsum(e)"),
+                ("vsemad", "sink - m  (a=1, b=-m)"),
+                ("vexp", "es = exp(sink - m)"),
+                ("vvadd", "d = s + es"),
+                ("vdiv", "e / d"),
+            ],
+
+            Op::SoftmaxAlibiSink => &[
+                ("vsemad", "xs = x*scale  (a=scale, b=0)"),
+                ("vsemad", "b = slope*mask  (a=slope, b=0)"),
+                ("vvadd", "score = xs + b"),
+                ("vmax", "m0 = rowmax(score)"),
+                ("vvmax", "m = max(m0, sink)"),
+                ("vsemad", "score - m  (a=1, b=-m)"),
+                ("vexp", "e = exp(score - m)"),
+                ("vsum", "s = rowsum(e)"),
+                ("vsemad", "sink - m  (a=1, b=-m)"),
+                ("vexp", "es = exp(sink - m)"),
+                ("vvadd", "d = s + es"),
+                ("vdiv", "e / d"),
             ],
             Op::RmsNorm => &[
                 ("vvmul", "x * x"),
@@ -1911,6 +2053,80 @@ mod tests {
         assert_eq!(Op::classify("__tile_mul_f16"), Some(Op::Mul));
     }
 
+    /// Every softmax feature in the mnemonic reaches the lowering.
+    ///
+    /// All ten of these used to lower to plain `softmax`: the substring table
+    /// matched `__tile_softmax_` and stopped, so a masked attention softmax
+    /// computed with no mask, ALiBi lost its positional bias, and the sink
+    /// lost the mass it should have held. It compiled and ran, like every
+    /// other bug in this file's history.
+    #[test]
+    fn every_softmax_feature_survives_classification() {
+        use Op::*;
+        for (callee, want) in [
+            ("__tile_softmax_f32", Softmax),
+            ("__tile_softmax_f16", Softmax),
+            // Strides are nb01/nb1 row addressing, which the manifest assigns
+            // to pypto. The arithmetic is unchanged, so this is NOT a feature.
+            ("__tile_softmax_f32_4_strided", Softmax),
+            ("__tile_softmax_f32_scalar_strided", Softmax),
+            ("__tile_softmax_f32_4_mask_f16", SoftmaxMask),
+            ("__tile_softmax_f32_4_mask_f32", SoftmaxMask),
+            ("__tile_softmax_f32_scalar_mask_f16", SoftmaxMask),
+            ("__tile_softmax_f32_4_alibi_f16", SoftmaxAlibi),
+            ("__tile_softmax_f32_scalar_alibi_f32", SoftmaxAlibi),
+            ("__tile_softmax_f32_4_sink", SoftmaxSink),
+            ("__tile_softmax_f32_scalar_sink", SoftmaxSink),
+            // The composed spellings are the ones a longest-substring table
+            // cannot reach: `_mask_` is longer than `_sink`, so it would win
+            // and the sink would vanish.
+            ("__tile_softmax_f32_4_mask_f16_sink", SoftmaxMaskSink),
+            ("__tile_softmax_f32_scalar_mask_f32_sink", SoftmaxMaskSink),
+            ("__tile_softmax_f32_4_alibi_f16_sink", SoftmaxAlibiSink),
+            ("__tile_softmax_f32_scalar_alibi_f32_sink", SoftmaxAlibiSink),
+        ] {
+            assert_eq!(Op::classify(callee), Some(want), "{callee}");
+        }
+    }
+
+    /// The mask must be added BEFORE the max, and the sink must enter twice.
+    ///
+    /// Order is the correctness property, not just presence. A masked-out
+    /// position is -inf and so changes the row max; adding the mask after the
+    /// max would give a different, wrong answer while still using every
+    /// instruction this test could otherwise check for.
+    #[test]
+    fn the_mask_lands_before_the_max_and_the_sink_enters_twice() {
+        let pos = |op: Op, m: &str| op.intrinsics().iter().position(|x| *x == m);
+        for op in [Op::SoftmaxMask, Op::SoftmaxMaskSink, Op::SoftmaxAlibi, Op::SoftmaxAlibiSink] {
+            let add = pos(op, "vvadd").expect("the mask add");
+            let max = pos(op, "vmax").expect("the row max");
+            assert!(add < max, "{}: mask must be added before the max", op.name());
+        }
+        // ALiBi scales the bias before adding it, so it carries one more
+        // vsemad than the plain mask path.
+        let n = |op: Op| op.intrinsics().iter().filter(|x| **x == "vsemad").count();
+        assert_eq!(n(Op::SoftmaxAlibi), n(Op::SoftmaxMask) + 1);
+
+        // The sink changes the max AND the denominator. Two exponentials is
+        // the signature: one for the row, one for exp(sink - m).
+        for op in [Op::SoftmaxSink, Op::SoftmaxMaskSink, Op::SoftmaxAlibiSink] {
+            let i = op.intrinsics();
+            assert_eq!(i.iter().filter(|x| **x == "vexp").count(), 2, "{}", op.name());
+            assert!(i.contains(&"vvmax"), "{}: max(rowmax, sink)", op.name());
+            assert!(
+                pos(op, "vvmax").unwrap() < pos(op, "vexp").unwrap(),
+                "{}: the sink must reach the max before any exponential",
+                op.name()
+            );
+        }
+        // And no sink-free variant may carry the sink machinery.
+        for op in [Op::Softmax, Op::SoftmaxMask, Op::SoftmaxAlibi] {
+            assert!(!op.intrinsics().contains(&"vvmax"), "{}", op.name());
+            assert_eq!(op.intrinsics().iter().filter(|x| **x == "vexp").count(), 1);
+        }
+    }
+
     /// The dense and q8_0 matvecs reach the cube; the rest of the family does
     /// not reach anything.
     ///
@@ -2192,7 +2408,7 @@ module {
     fn every_op_variant_is_in_the_all_list() {
         // `Op::ALL` drives the signature catalog, so a variant missing from it
         // silently disappears from everything reasoning backwards.
-        assert_eq!(Op::ALL.len(), 36);
+        assert_eq!(Op::ALL.len(), 41);
         let mut seen: Vec<&str> = Op::ALL.iter().map(|o| o.tile_name()).collect();
         seen.sort_unstable();
         seen.dedup();
