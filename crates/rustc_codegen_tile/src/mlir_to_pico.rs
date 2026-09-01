@@ -1028,11 +1028,14 @@ pub enum Op {
     SoftmaxMaskSink,
     /// ALiBi slope-mask and sink fold-in together.
     SoftmaxAlibiSink,
+    /// RMSNorm followed by a per-element learned weight:
+    /// `y[i] = (x[i] * rsqrt(mean + eps)) * w[i]`.
+    RmsNormMul,
 }
 
 impl Op {
     /// Every operation this emitter knows how to lower.
-    pub const ALL: [Op; 41] = [
+    pub const ALL: [Op; 42] = [
         Op::Load,
         Op::Store,
         Op::Add,
@@ -1074,6 +1077,7 @@ impl Op {
         Op::SoftmaxSink,
         Op::SoftmaxMaskSink,
         Op::SoftmaxAlibiSink,
+        Op::RmsNormMul,
     ];
 
     /// The tile-API name, as it appears in a listing and a manifest.
@@ -1194,6 +1198,10 @@ impl Op {
         const TABLE: &[(&str, Op)] = &[
             ("__tile_load_", Op::Load),
             ("__tile_store_", Op::Store),
+            // Longest-match puts `_mul_` ahead of the plain probe. Without the
+            // more specific entry the weight multiply vanished: the row was
+            // normalised and then written without ever being scaled by `w`.
+            ("__tile_rms_norm_mul_", Op::RmsNormMul),
             ("__tile_rms_norm_", Op::RmsNorm),
             ("__tile_softmax_", Op::Softmax),
             ("__tile_matmul_", Op::Matmul),
@@ -1293,6 +1301,7 @@ impl Op {
             Op::SoftmaxSink => "softmax_sink",
             Op::SoftmaxMaskSink => "softmax_mask_sink",
             Op::SoftmaxAlibiSink => "softmax_alibi_sink",
+            Op::RmsNormMul => "rms_norm_mul",
         }
     }
 
@@ -1466,6 +1475,23 @@ impl Op {
                 ("vsemad", "s/n + eps"),
                 ("vsqrt", "r = sqrt(s/n + eps)"),
                 ("vdiv", "x / r"),
+            ],
+
+            // `y[i] = (x[i] * rsqrt(mean + eps)) * w[i]` — the norm, then a
+            // per-element LEARNED weight. `w` is a trained parameter, so
+            // dropping it does not perturb the result, it discards part of the
+            // model: every RMSNorm in the network would run unweighted.
+            //
+            // One extra `vvmul` over the plain form, and it is elementwise
+            // against a vector rather than a scalar, so `vsemad` cannot absorb
+            // it the way it absorbs `eps`.
+            Op::RmsNormMul => &[
+                ("vvmul", "x * x"),
+                ("vsum", "s = rowsum(x*x)"),
+                ("vsemad", "s/n + eps"),
+                ("vsqrt", "r = sqrt(s/n + eps)"),
+                ("vdiv", "xn = x / r"),
+                ("vvmul", "y = xn * w  -- the learned per-element weight"),
             ],
             Op::Matmul => &[("mmad", "cube MAC")],
 
@@ -2053,6 +2079,33 @@ mod tests {
         assert_eq!(Op::classify("__tile_mul_f16"), Some(Op::Mul));
     }
 
+    /// RMSNorm's learned weight is part of the model, not a detail.
+    ///
+    /// `__tile_rms_norm_mul_f32_4` computes `(x * rsqrt(mean+eps)) * w`, and
+    /// the shorter `__tile_rms_norm_` probe used to capture it — so every
+    /// RMSNorm in a network ran unweighted. `w` is trained, so dropping it does
+    /// not perturb the result, it discards part of the model.
+    #[test]
+    fn rms_norm_keeps_its_learned_weight() {
+        assert_eq!(Op::classify("__tile_rms_norm_mul_f32_4"), Some(Op::RmsNormMul));
+        assert_eq!(Op::classify("__tile_rms_norm_f32_4"), Some(Op::RmsNorm));
+        assert_eq!(Op::classify("__tile_rms_norm_f32"), Some(Op::RmsNorm));
+
+        // The weight multiply is elementwise against a VECTOR, so `vsemad`
+        // cannot absorb it the way it absorbs the scalar eps: it is a second
+        // vvmul, and it must come after the division.
+        let i = Op::RmsNormMul.intrinsics();
+        assert_eq!(i.iter().filter(|x| **x == "vvmul").count(), 2);
+        assert_eq!(Op::RmsNorm.intrinsics().iter().filter(|x| **x == "vvmul").count(), 1);
+        let last = i.iter().rposition(|x| *x == "vvmul").unwrap();
+        let div = i.iter().position(|x| *x == "vdiv").unwrap();
+        assert!(last > div, "the weight scales the NORMALISED row, not the raw one");
+
+        // The fused QKV form has two source/destination pairs and one
+        // instruction cannot carry both — same reason `mul_mv_pair` is refused.
+        assert_eq!(Op::classify("__tile_qkv_rms_norm_f32_4"), None);
+    }
+
     /// Every softmax feature in the mnemonic reaches the lowering.
     ///
     /// All ten of these used to lower to plain `softmax`: the substring table
@@ -2408,7 +2461,7 @@ module {
     fn every_op_variant_is_in_the_all_list() {
         // `Op::ALL` drives the signature catalog, so a variant missing from it
         // silently disappears from everything reasoning backwards.
-        assert_eq!(Op::ALL.len(), 41);
+        assert_eq!(Op::ALL.len(), 42);
         let mut seen: Vec<&str> = Op::ALL.iter().map(|o| o.tile_name()).collect();
         seen.sort_unstable();
         seen.dedup();
