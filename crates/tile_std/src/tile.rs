@@ -223,25 +223,6 @@ extern "C" {
         seq_len: u32, head_dim: u32,
     ) -> u32;
 
-    /// Causal fused attention: softmax(mask(Q @ K^T / sqrt(d))) @ V, where
-    /// `mask` sets every entry above the diagonal to -inf.
-    /// Q: (S × D), K: (S × D), V: (S × D) → out: (S × D)
-    ///
-    /// Distinct from `__tile_attention_f32` + an explicit mask op because
-    /// causality is a **compile-time** property here: a backend may skip the
-    /// above-diagonal work entirely rather than computing and discarding it.
-    /// The elision is exact — a masked entry contributes `exp(-inf) == +0.0`
-    /// to both the softmax denominator and the V accumulation, and never
-    /// wins the row maximum (row `r` always retains the finite entry `r`).
-    ///
-    /// A separate intrinsic name rather than a flag argument: a backend that
-    /// does not implement causality fails to lower this call instead of
-    /// silently computing full attention, which would be numerically wrong.
-    pub fn __tile_attention_causal_f32(
-        dst: u32, q: u32, k: u32, v: u32,
-        seq_len: u32, head_dim: u32,
-    ) -> u32;
-
     // ── Transformer building-block intrinsics ───────────────────────
 
     /// SiLU/Swish activation: silu(x) = x * sigmoid(x).
@@ -2428,25 +2409,6 @@ pub fn tile_attention_f32<const S: usize, const D: usize>(
     Tile { buf_id, _phantom: PhantomData }
 }
 
-/// Causal scaled dot-product attention: row `r` attends to keys `0..=r`.
-///
-/// Equivalent to [`tile_attention_f32`] followed by a causal mask, but
-/// causality is known at compile time, so a backend may skip the
-/// above-diagonal work instead of computing and discarding it. Results are
-/// bit-identical to the mask-after form: masked entries contribute exactly
-/// `+0.0` to the softmax sum and to the value accumulation.
-#[inline(always)]
-pub fn tile_attention_causal_f32<const S: usize, const D: usize>(
-    q: Tile<S, D, f32>,
-    k: Tile<S, D, f32>,
-    v: Tile<S, D, f32>,
-) -> Tile<S, D, f32> {
-    let buf_id = unsafe {
-        __tile_attention_causal_f32(0, q.buf_id, k.buf_id, v.buf_id, S as u32, D as u32)
-    };
-    Tile { buf_id, _phantom: PhantomData }
-}
-
 // ── Transformer building-block wrappers ─────────────────────────────
 
 /// SiLU/Swish: silu(x) = x * sigmoid(x).
@@ -3390,11 +3352,6 @@ pub mod safe {
     pub fn tile_attention_f32<const S: usize, const D: usize>(
         q: Tile<S, D, f32>, k: Tile<S, D, f32>, v: Tile<S, D, f32>,
     ) -> Tile<S, D, f32> { unsafe { super::tile_attention_f32(q, k, v) } }
-
-    #[inline(always)]
-    pub fn tile_attention_causal_f32<const S: usize, const D: usize>(
-        q: Tile<S, D, f32>, k: Tile<S, D, f32>, v: Tile<S, D, f32>,
-    ) -> Tile<S, D, f32> { unsafe { super::tile_attention_causal_f32(q, k, v) } }
 
     #[inline(always)]
     pub fn tile_rope_f32<const R: usize, const C: usize>(

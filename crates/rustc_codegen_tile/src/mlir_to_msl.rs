@@ -42,36 +42,14 @@
 // internal function names; nothing dispatches on them, so the casing has no bearing on
 // correctness.
 #![allow(non_snake_case)]
+use crate::mlir_parse::{emit_unrolled_k_accumulation, DEFAULT_K_UNROLL};
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::mlir_parse::{emit_unrolled_k_accumulation, DEFAULT_K_UNROLL};
 use crate::mlir_to_pto::{
     extract_call_args, extract_result_ssa, is_builtin_helper, parse_const_arg, parse_module,
-    FuncArg, MlirFunc, MlirModule,
+    FuncArg, MlirFunc,
 };
-
-/// Apple GPU override, measured on this kernel rather than inherited.
-///
-/// `DEFAULT_K_UNROLL` (4) comes from upstream MLX PR #3843, which measured it
-/// on the *steel attention* K-loop. Swept on this scalar `matmul_transposed`
-/// body at DeepSeek-R1-Distill-Qwen3-1.5B shapes (K=1536, N=1536 and 8960,
-/// M=512 and 2048) on an Apple GPU, the curve is:
-///
-/// ```text
-///   factor:   1      4      8      16     32     64
-///   speedup:  1.00x  3.6x   3.7x   5.1x   5.0x   4.3x
-/// ```
-///
-/// 16 wins on every shape, 32 ties it, and 64 regresses — the classic
-/// unroll curve, where instruction-level parallelism stops paying once
-/// register pressure and I-cache footprint dominate. Keeping the inherited 4
-/// would have left ~40% on the table, which is the whole reason this is a
-/// per-backend knob instead of one shared constant.
-///
-/// Bit-exactness is independent of the factor (see
-/// `emit_unrolled_k_accumulation`), so this is a pure scheduling choice.
-const MATMUL_TRANSPOSED_K_UNROLL: usize = 16;
 
 // Re-use kernel classification from the SPIR-V module so the two backends
 // stay in sync.  The types are identical — only the emitter differs.
@@ -84,6 +62,21 @@ enum KernelType {
     Exp,
     Scale,
     Copy,
+    /// A composed chain of elementwise ops, GENERATED from the MLIR rather than
+    /// selected by name. `chain_body` holds the emitted statements. Set only when
+    /// EVERY op in the body was understood; a single unknown op leaves the kernel
+    /// type alone so an unrecognised module can never silently lower to a wrong
+    /// expression (the failure mode canned emitters have: they ignore the MLIR).
+    ElementwiseChain,
+    /// A matvec COMPOSED from the module: load x load -> mul -> reduce_sum -> store.
+    /// Generated from the SSA dataflow, not selected by intrinsic name.
+    MatvecChain,
+    /// Elementwise compute over PARTITION CELLS: cell addressing from the partition,
+    /// expression composed from the module. Grout's `add_2d_f16` shape.
+    PartitionChain,
+    /// `mma` over PARTITION CELLS: simdgroup matmul, per-operand cell bases, source-width
+    /// row strides. Grout's `gemm_f16` shape.
+    GemmChain,
     LayerNorm,   // 3-pass: mean → variance → normalise+affine
     L2Dist,      // VQ: ‖x - c‖² distance matrix row
     Argmin,      // VQ: argmin over codebook axis
@@ -126,8 +119,8 @@ enum KernelType {
     TokenAccept, // select final tokens → (R,1) u32
     // Transformer ops
     Attention,   // fused scaled dot-product attention: Q@K^T → scale → softmax → @V
-    AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     AttentionGqa, // grouped query attention: num_heads != num_kv_heads
+    AttentionCausal, // causal SDPA: row r attends to keys 0..=r; above-diagonal work never computed
     Rope,        // rotary position embeddings
     RopeDsv4,    // DS4 partial-RoPE: copy n_nope prefix, rotate tail with YaRN
     Dsv4Ratio4Shift, // DS4 KV ratio-4 recurrent-state shift: state[i]=state[4w+i] for two buffers
@@ -361,6 +354,48 @@ struct MslContext {
     kernel_type: KernelType,
     tile_width: u32,
     dtype: String,
+    /// Statements for `ElementwiseChain`, in order, plus the final store.
+    chain_body: Vec<String>,
+    /// For `MatvecChain`: (row-major operand alias, shared operand alias, dst alias,
+    /// whether the row operand needs an f16->f32 cast).
+    matvec: Option<(String, String, String, bool)>,
+    /// True when `PartitionChain` writes back through a MUTABLE partition view: the
+    /// target buffer is read AND written (rope_f16's in-place rotate), so it cannot carry
+    /// the `const` qualifier the read-only partitioned operands get.
+    partition_writeback: bool,
+    /// For `PartitionChain`: the writebacks composed by [`analyze_partition_chain`].
+    partition_chain: Option<PartitionChainInfo>,
+    /// For `GemmChain`: the operands and layout composed by [`analyze_gemm_chain`].
+    gemm_chain: Option<GemmChainInfo>,
+}
+
+/// Elementwise compute over partition cells, with one or more writebacks.
+///
+/// Multiple stores are what split-half RoPE needs: `y_lo` into cell (0,0) and `y_hi` into
+/// cell (0,1), each from its own cell-indexed address. A single writeback silently kept the
+/// last store and computed half the operation.
+#[derive(Clone, Debug, PartialEq)]
+struct PartitionChainInfo {
+    /// `(destination address expression, value expression)`, in program order.
+    stores: Vec<(String, String)>,
+}
+
+/// A matmul composed from partition cells: which buffers, where each cell starts, and how
+/// each operand is laid out in memory.
+#[derive(Clone, Debug, PartialEq)]
+struct GemmChainInfo {
+    a: String,
+    b: String,
+    dst: String,
+    /// Cell offsets, each measured in its OWN source row stride (`lda` / `ldb`).
+    base_a: String,
+    base_b: String,
+    a_f16: bool,
+    b_f16: bool,
+    /// True when B came from a PERMUTED partition view, i.e. it is stored `[N][K]` rather
+    /// than the `[K][N]` the mma consumes. Lowered as a transposed `simdgroup_load`, which
+    /// is a different read pattern -- NOT something a row stride can express.
+    b_permuted: bool,
 }
 
 impl MslContext {
@@ -373,6 +408,11 @@ impl MslContext {
             kernel_type: KernelType::Copy,
             tile_width: 256,
             dtype: "f32".into(),
+            chain_body: Vec::new(),
+            matvec: None,
+            partition_chain: None,
+            partition_writeback: false,
+            gemm_chain: None,
         }
     }
 
@@ -388,85 +428,8 @@ impl MslContext {
 
 /// Convert MLIR text into MSL source suitable for `xcrun metal -c` or
 /// `metal::Device::new_library_with_source()`.
-/// Intrinsics that do not select a kernel body: data movement, allocation and
-/// constant materialization. Any number of these may appear in one kernel.
-fn is_structural_intrinsic(name: &str) -> bool {
-    name.starts_with("__tile_load")
-        || name.starts_with("__tile_store")
-        || name.starts_with("__tile_buf_alloc")
-        || name.starts_with("__tile_pipe_barrier")
-        || name.starts_with("__tile_const")
-        || name.starts_with("__tile_view")
-}
-
-/// Ordered pairs of compute intrinsics this emitter folds into ONE kernel
-/// body. The second op is applied to the first op's result before it reaches
-/// memory — an epilogue fusion — so both intrinsics are accounted for even
-/// though a single `KernelType` is selected.
-///
-/// Adding a pair here is the supported way to lift a new epilogue fusion into
-/// this backend: implement the fused `KernelType`, promote it in the
-/// intrinsic match (see `KernelType::SiLUMul`), and declare the pair below so
-/// the multi-op guard admits it.
-const FUSED_COMPUTE_PAIRS: &[(&str, &str)] = &[
-    // KernelType::SiLUMul — gated MLP activation, out = silu(gate) * up.
-    ("__tile_silu_f32", "__tile_mul_f32"),
-];
-
-/// Reject kernels that chain compute intrinsics this emitter cannot fold.
-///
-/// This backend selects ONE `KernelType` per kernel and emits that op's body;
-/// an unrecognized second compute intrinsic is silently ignored. A kernel
-/// written as `matmul` then `silu` therefore emitted only one of the two and
-/// stored a result that was never computed — a silent miscompile with no
-/// diagnostic. Failing closed converts it into an error naming both ops.
-///
-/// Recognized epilogue fusions (`FUSED_COMPUTE_PAIRS`) are exempt: they are
-/// genuinely both emitted, into one body.
-///
-/// Note the asymmetry with the PTO backend, which composes freely — its
-/// `analyze_body` walks every line and emits ops in sequence. Lifting a
-/// general epilogue fusion here needs that composition model first; until
-/// then each fusion is an explicit, tested pair.
-fn reject_unfusable_compute_chains(module: &MlirModule) -> Result<(), String> {
-    for func in &module.functions {
-        if !func.is_entry {
-            continue;
-        }
-        let mut seen: Vec<&str> = Vec::new();
-        for line in &func.body_lines {
-            let Some(at) = line.find("@__tile_") else { continue };
-            let rest = &line[at + 1..];
-            let end = rest.find('(').unwrap_or(rest.len());
-            let name = &rest[..end];
-            if is_structural_intrinsic(name) {
-                continue;
-            }
-            if !seen.contains(&name) {
-                seen.push(name);
-            }
-        }
-        if seen.len() == 2 && FUSED_COMPUTE_PAIRS.contains(&(seen[0], seen[1])) {
-            continue;
-        }
-        if seen.len() > 1 {
-            return Err(format!(
-                "kernel @{} chains {} compute intrinsics ({}) that this emitter \
-                 cannot fold into one body; all but one would be silently \
-                 dropped. Use a fused tile_std op, split the kernel, or add the \
-                 pair to FUSED_COMPUTE_PAIRS with a fused KernelType.",
-                func.name,
-                seen.len(),
-                seen.join(", ")
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub fn convert_mlir_to_msl(mlir_text: &str) -> Result<String, String> {
     let module = parse_module(mlir_text)?;
-    reject_unfusable_compute_chains(&module)?;
     let mut out = String::with_capacity(4096);
     let mut count = 0;
 
@@ -477,6 +440,27 @@ pub fn convert_mlir_to_msl(mlir_text: &str) -> Result<String, String> {
     writeln!(out).unwrap();
     writeln!(out, "#include <metal_stdlib>").unwrap();
     writeln!(out, "using namespace metal;").unwrap();
+
+    // A composed matvec declares NSG/NXPSG as function constants so it sits on the SAME
+    // tuning surface as the hand-written matvec (`specialized_pipeline` binds indices
+    // 600/601). The engine's own .metal sources carry this preamble for their kernels;
+    // `dump_msl` output is compiled standalone, so emit it here.
+    //
+    // Defaults are supplied so the kernel still compiles and runs when a caller binds no
+    // constant values -- otherwise adding the constants would break every existing caller.
+    let needs_fc_mul_mv = module.functions.iter().any(|f| {
+        f.is_entry
+            && f.body_lines.iter().any(|l| {
+                l.contains("__tile_reduce_sum") || l.contains("__tile_sum_rows")
+            })
+            && f.body_lines.iter().any(|l| l.contains("__tile_mul"))
+    });
+    if needs_fc_mul_mv {
+        writeln!(out).unwrap();
+        writeln!(out, "#define FC_MUL_MV 600").unwrap();
+        writeln!(out, "constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];").unwrap();
+        writeln!(out, "constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];").unwrap();
+    }
     writeln!(out).unwrap();
 
     // Pre-scan for kernels that need E4M3FN helpers in the file prelude.
@@ -542,6 +526,98 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
 
     classify_body(&func.body_lines, &mut ctx);
 
+    // A composed elementwise chain is GENERATED from the module, so it takes precedence
+    // over the single-KernelType classification above, which would otherwise reduce the
+    // whole function to whichever one op it recognised last.
+    // A matvec contains a multiply, so it must be tried BEFORE the elementwise chain --
+    // otherwise the chain claims the mul, the reduction goes unconsumed, and the
+    // cross-lane audit refuses a module that is in fact composable.
+    if let Some(mv) = analyze_matvec_chain(func, &ctx) {
+        ctx.matvec = Some(mv);
+        ctx.kernel_type = KernelType::MatvecChain;
+    } else if analyze_elementwise_chain_checked(func, &mut ctx)? {
+        ctx.kernel_type = KernelType::ElementwiseChain;
+    }
+
+    // A partitioned matmul is composable and is NOT an elementwise chain -- one output
+    // element sums a whole row against a whole column. Try it first.
+    if let Some(gc) = analyze_gemm_chain(func, &ctx) {
+        ctx.gemm_chain = Some(gc);
+        ctx.kernel_type = KernelType::GemmChain;
+    } else
+    // A partitioned kernel that also computes is composable -- try that before the audit
+    // below decides the copy body cannot express it.
+    if let Some(pc) = analyze_partition_chain(func, &ctx) {
+        // A writeback addresses its destination with the cell base; a plain store does not.
+        // ANY cell-addressed store makes the buffer read-and-written, so the `const`
+        // qualifier has to go -- checking only the first store would leave a kernel whose
+        // second writeback targets a const buffer, which Metal rejects at compile time.
+        ctx.partition_writeback =
+            pc.stores.iter().any(|(dst, _)| dst.contains("tile_rows * src_cols"));
+        ctx.partition_chain = Some(pc);
+        ctx.kernel_type = KernelType::PartitionChain;
+    }
+
+    // A partition COPY kernel (`PartitionCell` is documented as "copy one cell") that is
+    // handed compute ops cannot express them: it emits correct cell addressing with a copy
+    // body, silently dropping the arithmetic and the second operand. Same silent-wrong
+    // class as the dropped reductions above, one category over.
+    if matches!(ctx.kernel_type, KernelType::PartitionCell | KernelType::PartitionCellStore) {
+        let compute: Vec<String> = func
+            .body_lines
+            .iter()
+            .filter_map(|l| {
+                let i = l.find("llvm.call @")? + "llvm.call @".len();
+                let rest = &l[i..];
+                let end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                let callee = &rest[..end];
+                let is_compute = chain_op(callee).is_some() || is_cross_lane_op(callee);
+                // A cast alone is representable (the copy can carry it); anything that
+                // combines or reduces values is not.
+                let is_cast = callee.starts_with("__tile_cast_");
+                (is_compute && !is_cast).then(|| callee.to_string())
+            })
+            .collect();
+        if !compute.is_empty() {
+            return Err(format!(
+                "kernel `{}` partitions its inputs but also computes {:?}; `{:?}` copies a \
+                 single cell and cannot express that, so the arithmetic would be silently \
+                 dropped. Compose the partition addressing with the compute instead.",
+                func.name, compute, ctx.kernel_type
+            ));
+        }
+    }
+
+    // A cross-lane op (reduction / matmul) that no handler claimed means the emitted body
+    // will silently have the WRONG SHAPE -- N-to-1 lowered as N-to-N. That is how a matvec
+    // previously became a bare elementwise multiply, and a reduce-only module a copy.
+    // Refuse loudly instead; an emitter that quietly drops a reduction looks like success.
+    if !consumes_cross_lane(&ctx.kernel_type) {
+        let unclaimed: Vec<String> = func
+            .body_lines
+            .iter()
+            .filter_map(|l| {
+                let i = l.find("llvm.call @")? + "llvm.call @".len();
+                let rest = &l[i..];
+                let end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                let callee = &rest[..end];
+                is_cross_lane_op(callee).then(|| callee.to_string())
+            })
+            .collect();
+        if !unclaimed.is_empty() {
+            return Err(format!(
+                "kernel `{}` contains cross-lane op(s) {:?} but classified as {:?}, whose \
+                 body does not consume them -- the reduction would be silently dropped. \
+                 Add a handler rather than lowering the remaining ops alone.",
+                func.name, unclaimed, ctx.kernel_type
+            ));
+        }
+    }
+
     // Batched (M=8) non-matmul kernels have exotic signatures (2D/3D grid position
     // attributes, in-place buffers, many params) that the generic signature machinery
     // does not produce. Emit the complete `kernel void NAME(...) { ... }` verbatim and
@@ -585,8 +661,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::TokenAccept => 4,   // draft, target, probs, out
         // Transformer ops
         KernelType::Attention  => 4,    // q, k, v, out
-        KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::AttentionGqa => 4,  // q, k, v, out
+        KernelType::AttentionCausal => 4, // q, k, v, out
         KernelType::Rope       => 2,    // src, dst
         KernelType::RopeDsv4   => 4,    // src, pos(int), src2_freq(float, optional), dst
         KernelType::Dsv4Ratio4Shift => 2, // state_kv, state_score
@@ -915,7 +991,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         || ctx.kernel_type == KernelType::MatvecQ4KReg
         || ctx.kernel_type == KernelType::MatvecQ4KCoop;
     for i in 0..num_bufs {
-        let qualifier = if all_buffers_writable { "" }
+        let qualifier = if ctx.kernel_type == KernelType::PartitionChain && ctx.partition_writeback { "" }
+            else if all_buffers_writable { "" }
             else if is_rope_inplace { "" } // every buffer writable; p0 is in-place
             else if last_two_writable { if i + 2 < num_bufs { "const" } else { "" } }
             else if last_three_writable { if i + 3 < num_bufs { "const" } else { "" } }
@@ -955,6 +1032,30 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             else if is_split_weighted_sum_norm4 { if i == 1 || i == 2 { "float" } else { "char" } }
             else if is_argsort_f32_i32 { if i == 0 { "char" } else { "int" } }
             else if is_argsort_merge_f32_i32 { if i == 0 { "char" } else { "int" } }
+            // GemmChain: simdgroup_half8x8 loads need half operands; the result is float.
+            else if let (KernelType::GemmChain, Some(gc)) =
+                (&ctx.kernel_type, &ctx.gemm_chain)
+            {
+                // Per-operand, from the module: the engine dispatches f16 weights against
+                // f32 activations, and hardcoding half/half emitted the wrong signature.
+                match i {
+                    0 => if gc.a_f16 { "half" } else { "float" },
+                    1 => if gc.b_f16 { "half" } else { "float" },
+                    _ => "float",
+                }
+            }
+            // MatvecChain carries a MIXED signature: the weight buffer is whatever the
+            // module's load said (half for an f16 GGUF), the activation and output are
+            // float. A single module-wide `msl_type` cannot express that, so the composed
+            // matvec declares its own per-buffer types from the analysed dataflow.
+            else if let (KernelType::MatvecChain, Some((row, _, dst, needs_cast))) =
+                (&ctx.kernel_type, &ctx.matvec)
+            {
+                let me = format!("p{i}");
+                if &me == row && *needs_cast { "half" }
+                else if &me == dst { "float" }
+                else { "float" }
+            }
             else { msl_type };
         writeln!(out,
             "    device {}{} {}* p{} [[ buffer({}) ]],",
@@ -981,14 +1082,6 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& code_dim     [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& num_codes    [[ buffer({}) ]],", params_idx + 2).unwrap();
         }
-        KernelType::Argmin => {
-            // Scans the codebook axis of an (N x num_codes) distance matrix, so
-            // it needs num_codes for both the row stride and the loop bound.
-            // Previously fell through to the catch-all, which declares only
-            // num_elements -- see emit_argmin_msl.
-            writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
-            writeln!(out, "    constant uint& num_codes    [[ buffer({}) ]],", params_idx + 1).unwrap();
-        }
         KernelType::ScatterAdd => {
             writeln!(out, "    constant uint& num_elements [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& code_dim     [[ buffer({}) ]],", params_idx + 1).unwrap();
@@ -1003,7 +1096,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& rows         [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& cols         [[ buffer({}) ]],", params_idx + 2).unwrap();
         }
-        KernelType::PartitionCell | KernelType::PartitionCellStore => {
+        KernelType::PartitionChain | KernelType::PartitionCell | KernelType::PartitionCellStore => {
             writeln!(out, "    constant uint& src_cols   [[ buffer({}) ]],", params_idx).unwrap();
             writeln!(out, "    constant uint& tile_rows  [[ buffer({}) ]],", params_idx + 1).unwrap();
             writeln!(out, "    constant uint& tile_cols  [[ buffer({}) ]],", params_idx + 2).unwrap();
@@ -2009,6 +2102,17 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             writeln!(out, "    constant uint& K            [[ buffer({}) ]],", params_idx + 3).unwrap();
         }
         // Decode-optimized ops
+        // GemmChain: matmul extents, the SOURCE row stride of each operand (lda/ldb --
+        // distinct from N/K, since a column-partitioned cell is not contiguous), the cell
+        // tile extents, and the runtime cell index.
+        KernelType::GemmChain => {
+            for (k, nm) in ["M", "K", "N", "lda", "ldb", "tile_rows", "tile_cols", "cell_i", "cell_j"]
+                .iter()
+                .enumerate()
+            {
+                writeln!(out, "    constant uint& {:<11} [[ buffer({}) ]],", nm, params_idx + k).unwrap();
+            }
+        }
         KernelType::MatvecF16 => {
             // p0=activation(f32), p1=weight(half, N×K), p2=output(f32)
             // M always 1 for decode, K=input dim, N=output dim
@@ -2114,7 +2218,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     // PartitionCell takes its cell index (i,j) from the dispatch grid: that is exactly what
     // cuTile's `partition.load([pid.0, pid.1])` means, so the grid IS the index and no
     // uniform is needed for it. Requires the 3-D tgpig binding.
-    let needs_3d_grid = matches!(ctx.kernel_type, KernelType::PartitionCell | KernelType::PartitionCellStore | KernelType::RopeDsv4 | KernelType::Dsv4RopeTailF32 | KernelType::FlashAttnExtPad | KernelType::FlashAttnExtBlk | KernelType::FlashAttnExtF16Dk512Dv512 | KernelType::FlashAttnExtVecF16Dk512Dv512);
+    let needs_3d_grid = matches!(ctx.kernel_type, KernelType::GemmChain | KernelType::PartitionChain | KernelType::PartitionCell | KernelType::PartitionCellStore | KernelType::RopeDsv4 | KernelType::Dsv4RopeTailF32 | KernelType::FlashAttnExtPad | KernelType::FlashAttnExtBlk | KernelType::FlashAttnExtF16Dk512Dv512 | KernelType::FlashAttnExtVecF16Dk512Dv512);
     let needs_simd_attrs_only = matches!(ctx.kernel_type, KernelType::Dsv4IndexerScoreOneDirect | KernelType::FlashAttnExtVecReduce | KernelType::Dsv4HcSplitWeightedSumNorm4);
     let needs_2d_grid_simd = matches!(ctx.kernel_type, KernelType::Dsv4IndexerScoresTiledF32 | KernelType::Dsv4IndexerScoresTiled | KernelType::Dsv4IndexedMixedAttentionH8 | KernelType::Dsv4IndexedMixedAttentionH8Rb4);
     // 2D grid, no per-thread attrs: the whole simdgroup cooperates via the
@@ -2225,7 +2329,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         // PartitionCell computes its own base from the grid geometry (i*Tr*C + j*Tc),
         // which is the address map the mechanization reasons about; the generic
         // `base = row * num_elements` prologue would both shadow it and be wrong.
-                KernelType::PartitionCell
+                KernelType::GemmChain
+            | KernelType::PartitionChain
+            | KernelType::PartitionCell
             | KernelType::PartitionCellStore
     | KernelType::MatmulF16Simdgroup   // uses tgpig, no row/base
             | KernelType::Rope | KernelType::RopeInplace | KernelType::RopeInplaceSplit | KernelType::RopePrefill
@@ -2420,7 +2526,7 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::MulMmIdIq2XxsF32
             | KernelType::MulMmIdIq2XxsF16
     );
-    if !is_cooperative && !has_own_indexing {
+    if !is_cooperative && !has_own_indexing && ctx.kernel_type != KernelType::ElementwiseChain {
         writeln!(out, "    uint base = row * num_elements;").unwrap();
     }
     writeln!(out).unwrap();
@@ -2475,8 +2581,8 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::TokenAccept  => emit_token_accept_msl(out, msl_type),
         // Transformer ops
         KernelType::Attention    => emit_attention_msl(out, msl_type),
-        KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::AttentionGqa => emit_attention_gqa_msl(out, msl_type),
+        KernelType::AttentionCausal => emit_attention_causal_msl(out, msl_type),
         KernelType::Rope         => emit_rope_msl(out, msl_type),
         KernelType::RopeDsv4     => emit_rope_dsv4_msl(out),
         KernelType::Dsv4Ratio4Shift => emit_dsv4_ratio4_shift_msl(out),
@@ -2600,6 +2706,10 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::StepF32Scalar => emit_unary_f32_msl(out, "x > 0.0f ? 1.0f : 0.0f"),
         KernelType::ExpF32Scalar => emit_unary_f32_msl(out, "exp(x)"),
         KernelType::LogF32Scalar => emit_unary_f32_msl(out, "log(x)"),
+        KernelType::GemmChain => emit_gemm_chain_msl(out, &ctx),
+        KernelType::PartitionChain => emit_partition_chain_msl(out, &ctx),
+        KernelType::MatvecChain => emit_matvec_chain_msl(out, &ctx),
+        KernelType::ElementwiseChain => emit_elementwise_chain_msl(out, &ctx),
         KernelType::SwigluF32 => emit_swiglu_f32_msl(out),
         KernelType::MulMvF32F32Short => emit_mul_mv_t_t_short_msl(out, false),
         KernelType::MulMvF32F32Setup => emit_mul_mv_t_t_setup_msl(out, false),
@@ -2710,6 +2820,911 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Body classifier (identical logic to mlir_to_spirv — kept in sync)
 // ---------------------------------------------------------------------------
+
+/// Elementwise ops that compose into a single expression tree.
+///
+/// Each entry maps an intrinsic to a Metal expression template. `{0}`/`{1}` are the
+/// operand expressions. Unary ops take one operand, binary two; `arity` disambiguates.
+/// Names are matched with and without a `_f32`/`_f16` suffix so both the bridge's
+/// untyped spelling (`__tile_add_f`) and the emitter's typed one (`__tile_add_f32`)
+/// resolve to the same node.
+/// Whether an unmodelled intrinsic is close enough to the elementwise namespace that
+/// silently handing it to a canned emitter would be a bug worth surfacing.
+///
+/// This is an ALLOWLIST of per-element math names, not a blocklist of structured ones.
+/// A blocklist fails open: every intrinsic it forgot (`__tile_topk_f32`,
+/// `__tile_embedding_f32`, `__tile_matvec_qblock`) reads as elementwise and the chain
+/// pass errors on kernels it has no business judging. Failing closed means an
+/// unrecognised name simply declines the chain path, which is the pre-existing
+/// behaviour, and only a name that really looks like scalar math raises.
+fn looks_elementwise_name(callee: &str) -> bool {
+    let base = callee
+        .strip_suffix("_f32")
+        .or_else(|| callee.strip_suffix("_f16"))
+        .or_else(|| callee.strip_suffix("_f"))
+        .unwrap_or(callee);
+    const ELEMENTWISE: &[&str] = &[
+        "__tile_add", "__tile_sub", "__tile_mul", "__tile_div", "__tile_neg",
+        "__tile_exp", "__tile_log", "__tile_sqrt", "__tile_rsqrt", "__tile_tanh",
+        "__tile_abs", "__tile_sin", "__tile_cos", "__tile_sigmoid", "__tile_silu",
+        "__tile_relu", "__tile_pow", "__tile_fmod", "__tile_recip",
+        "__tile_floor", "__tile_ceil", "__tile_round", "__tile_sign", "__tile_step",
+        "__tile_softplus", "__tile_erf", "__tile_asin", "__tile_acos", "__tile_atan",
+        "__tile_sinh", "__tile_cosh", "__tile_square", "__tile_cbrt",
+    ];
+    ELEMENTWISE.contains(&base)
+}
+
+fn chain_op(name: &str) -> Option<(usize, &'static str)> {
+    // Casts carry BOTH types in the name, so they must be matched before any suffix
+    // stripping -- `__tile_cast_f16_f32` would otherwise strip to `__tile_cast_f16`
+    // and miss. They are identity here: the generated body accumulates in float
+    // regardless of storage type, and the load/store do the conversion.
+    match name {
+        "__tile_cast_f16_f32" | "__tile_cast_f32_f16" | "__tile_cast_bf16_f32"
+        | "__tile_cast_f32_bf16" => return Some((1, "{0}")),
+        _ => {}
+    }
+    // Strip the element-type suffix so one table serves both spellings.
+    let base = name
+        .strip_suffix("_f32")
+        .or_else(|| name.strip_suffix("_f16"))
+        .or_else(|| name.strip_suffix("_f"))
+        .unwrap_or(name);
+    Some(match base {
+        "__tile_add" => (2, "({0} + {1})"),
+        "__tile_sub" => (2, "({0} - {1})"),
+        "__tile_mul" => (2, "({0} * {1})"),
+        "__tile_div" => (2, "({0} / {1})"),
+        "__tile_max" => (2, "fmax({0}, {1})"),
+        "__tile_min" => (2, "fmin({0}, {1})"),
+        "__tile_neg" => (1, "(-{0})"),
+        "__tile_exp" => (1, "exp({0})"),
+        "__tile_log" => (1, "log({0})"),
+        "__tile_sqrt" => (1, "sqrt({0})"),
+        "__tile_rsqrt" => (1, "rsqrt({0})"),
+        "__tile_tanh" => (1, "tanh({0})"),
+        "__tile_abs" => (1, "fabs({0})"),
+        "__tile_sin" => (1, "sin({0})"),
+        "__tile_cos" => (1, "cos({0})"),
+        "__tile_sigmoid" => (1, "(1.0f / (1.0f + exp(-{0})))"),
+        "__tile_softplus" => (1, "log(1.0f + exp({0}))"),
+        "__tile_relu" => (1, "fmax({0}, 0.0f)"),
+        "__tile_recip" => (1, "(1.0f / {0})"),
+        "__tile_floor" => (1, "floor({0})"),
+        "__tile_ceil" => (1, "ceil({0})"),
+        "__tile_round" => (1, "round({0})"),
+        "__tile_sign" => (1, "sign({0})"),
+        "__tile_step" => (1, "({0} > 0.0f ? 1.0f : 0.0f)"),
+        "__tile_square" => (1, "({0} * {0})"),
+        "__tile_erf" => (1, "erf({0})"),
+        "__tile_asin" => (1, "asin({0})"),
+        "__tile_acos" => (1, "acos({0})"),
+        "__tile_atan" => (1, "atan({0})"),
+        "__tile_sinh" => (1, "sinh({0})"),
+        "__tile_cosh" => (1, "cosh({0})"),
+        "__tile_cbrt" => (1, "cbrt({0})"),
+        "__tile_pow" => (2, "pow({0}, {1})"),
+        "__tile_fmod" => (2, "fmod({0}, {1})"),
+        "__tile_silu" => (1, "({0} / (1.0f + exp(-{0})))"),
+        _ => return None,
+    })
+}
+
+/// Build a composed elementwise body from the MLIR, or return `false` if anything in
+/// the function is not a recognised elementwise op.
+///
+/// This is a GENERATED path: the emitted expression is assembled from the ops actually
+/// present in the module. It exists because `classify_body` otherwise reduces a whole
+/// function to one `KernelType` and emits a canned body per type, so a multi-op chain
+/// (a SwiGLU spelled as neg/exp/add/div/mul, say) collapsed to whichever single op was
+/// recognised last.
+/// `Ok(true)` composed, `Ok(false)` not an elementwise module, `Err` an elementwise
+/// module containing an op this pass does not model -- which must be surfaced, not
+/// quietly handed to a canned emitter that would ignore the MLIR entirely.
+fn analyze_elementwise_chain_checked(
+    func: &MlirFunc,
+    ctx: &mut MslContext,
+) -> Result<bool, String> {
+    use std::collections::HashMap;
+    // SSA name -> Metal expression computed so far.
+    let mut expr: HashMap<String, String> = HashMap::new();
+    // SSA name -> the `pN` alias it was loaded from, for tracking the store target.
+    let mut ops = 0usize;
+    let mut pending_loads: Vec<(String, String)> = Vec::new();
+    let mut use_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut store: Option<(String, String)> = None; // (dst alias, value expr)
+
+    for line in &func.body_lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("^") || line.contains("llvm.return") {
+            continue;
+        }
+        // Shape/count constants feed the wrapper, not the expression.
+        if line.contains("llvm.mlir.constant(") && !line.contains("!llvm.ptr") {
+            continue;
+        }
+        if !line.contains("llvm.call @") {
+            return Ok(false);
+        }
+        let callee = {
+            let start = match line.find("llvm.call @") { Some(x) => x + "llvm.call @".len(), None => return Ok(false) };
+            let rest = &line[start..];
+            let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        let args = match extract_call_args(line) { Some(a) => a, None => return Ok(false) };
+        let result = extract_result_ssa(line);
+
+        let base = callee
+            .strip_suffix("_f32")
+            .or_else(|| callee.strip_suffix("_f16"))
+            .or_else(|| callee.strip_suffix("_f"))
+            .unwrap_or(&callee)
+            .to_string();
+
+        if base == "__tile_load" {
+            // load(ptr, rows, cols) -> element read from that buffer at gid
+            let (r, ptr) = match (result, args.first()) { (Some(r), Some(p)) => (r, p.trim().to_string()), _ => return Ok(false) };
+            let alias = match ctx.ptr_aliases.get(&ptr) { Some(a) => a.clone(), None => return Ok(false) };
+            // Defer the decision to bind: a value used once inlines as `pN[gid]`, a value
+            // used more than once (silu reads its input twice) gets a local so the device
+            // read happens once. `pending_loads` records the candidates.
+            pending_loads.push((r.clone(), alias.clone()));
+            expr.insert(r, format!("{alias}[gid]"));
+            continue;
+        }
+        if base == "__tile_fill" {
+            // constant splat; the bridge drops the literal, so only the 1.0 identity
+            // used by sigmoid/silu denominators is safe to assume. Anything else would
+            // be a guess, and guessing a constant silently changes the arithmetic.
+            let r = match result { Some(r) => r, None => return Ok(false) };
+            expr.insert(r, "1.0f".to_string());
+            continue;
+        }
+        if base == "__tile_store" {
+            // store(ptr, value, rows, cols)
+            let ptr = match args.first() { Some(p) => p.trim().to_string(), None => return Ok(false) };
+            let val = match args.get(1) { Some(v) => v.trim().to_string(), None => return Ok(false) };
+            let alias = match ctx.ptr_aliases.get(&ptr) { Some(a) => a.clone(), None => return Ok(false) };
+            let e = match expr.get(&val) { Some(e) => e.clone(), None => return Ok(false) };
+            store = Some((alias, e));
+            continue;
+        }
+
+        let (arity, tmpl) = match chain_op(&callee) {
+            Some(x) => x,
+            None => {
+                // Not an elementwise op. Almost always this means the module is some
+                // other kernel shape (matmul, attention, a quantised matvec) that the
+                // classifier below handles -- so decline the chain path and let it run.
+                //
+                // The one case worth shouting about is a module that is otherwise pure
+                // elementwise and uses a name in the elementwise NAMESPACE we have not
+                // modelled: there, falling through means a canned emitter picks the body
+                // by some other op's name and silently ignores the MLIR.
+                if callee.starts_with("__tile_") && looks_elementwise_name(&callee) {
+                    return Err(format!(
+                        "elementwise chain contains unmodelled op `{callee}`; \
+                         add it to chain_op() rather than lowering it by name"
+                    ));
+                }
+                return Ok(false);
+            }
+        };
+        let r = match result { Some(r) => r, None => return Ok(false) };
+        if let Some(a) = args.first() {
+            *use_count.entry(a.trim().to_string()).or_insert(0) += tmpl.matches("{0}").count();
+        }
+        let a0 = match args.first().and_then(|a| expr.get(a.trim())) { Some(e) => e.clone(), None => return Ok(false) };
+        let built = if arity == 1 {
+            tmpl.replace("{0}", &a0)
+        } else {
+            if let Some(a) = args.get(1) {
+                *use_count.entry(a.trim().to_string()).or_insert(0) += tmpl.matches("{1}").count();
+            }
+            let a1 = match args.get(1).and_then(|a| expr.get(a.trim())) { Some(e) => e.clone(), None => return Ok(false) };
+            tmpl.replace("{0}", &a0).replace("{1}", &a1)
+        };
+        expr.insert(r, built);
+        ops += 1;
+    }
+
+    // Require a real composition with a store: a bare copy is already handled, and
+    // claiming the chain path for it would only churn output.
+    let (dst, value) = match store { Some(x) => x, None => return Ok(false) };
+    if ops < 2 { return Ok(false); }
+
+    let mut decls: Vec<String> = Vec::new();
+    let mut value = value;
+    let mut n_bound = 0usize;
+    for (ssa, alias) in &pending_loads {
+        if use_count.get(ssa).copied().unwrap_or(0) <= 1 {
+            continue; // single use: leave it inlined as `pN[gid]`
+        }
+        let local = if n_bound == 0 { "v".to_string() } else { format!("v{n_bound}") };
+        n_bound += 1;
+        decls.push(format!("        float {local} = {alias}[gid];"));
+        value = value.replace(&format!("{alias}[gid]"), &local);
+    }
+
+    ctx.chain_body.clear();
+    // Flat map over the vector: ceil(n / tcount) threadgroups of tcount threads each.
+    ctx.chain_body.push("    uint gid = row * tcount + tid;".to_string());
+    ctx.chain_body.push("    if (gid < num_elements) {".to_string());
+    for d in &decls {
+        ctx.chain_body.push(d.clone());
+    }
+    ctx.chain_body.push(format!("        {dst}[gid] = {value};"));
+    ctx.chain_body.push("    }".to_string());
+    Ok(true)
+}
+
+/// Recognise a matvec composed from primitives: two loads, an optional cast, a multiply,
+/// a row reduction, a store.
+///
+/// Returns `(row_operand, shared_operand, dst, needs_cast)` where `row_operand` is the
+/// buffer indexed per output row (the weight matrix) and `shared_operand` is read
+/// identically by every row (the activation vector). The distinction is decided by which
+/// operand feeds the reduction through the multiply, not by argument position, so an MLIR
+/// module with the operands swapped produces swapped output.
+///
+/// GENERATED: every field comes from the module's dataflow. `None` whenever the shape does
+/// not match exactly -- a partial match must decline rather than emit something plausible.
+fn analyze_matvec_chain(
+    func: &MlirFunc,
+    ctx: &MslContext,
+) -> Option<(String, String, String, bool)> {
+    use std::collections::HashMap;
+    // SSA -> (buffer alias, is_cast_of_f16)
+    let mut loaded: HashMap<String, (String, bool)> = HashMap::new();
+    let mut cast_of: HashMap<String, String> = HashMap::new();
+    let mut mul_of: Option<(String, String, String)> = None; // (result, lhs, rhs)
+    let mut reduced: Option<(String, String)> = None; // (result, operand)
+    let mut stored: Option<(String, String)> = None; // (dst alias, value)
+
+    for line in &func.body_lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('^') || line.contains("llvm.return") {
+            continue;
+        }
+        if line.contains("llvm.mlir.constant(") {
+            continue;
+        }
+        let idx = line.find("llvm.call @")?;
+        let rest = &line[idx + "llvm.call @".len()..];
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        let callee = &rest[..end];
+        let args = extract_call_args(line)?;
+        let result = extract_result_ssa(line);
+
+        // Casts name BOTH types, so they must be matched before suffix stripping --
+        // `__tile_cast_f16_f32` would otherwise strip to `__tile_cast_f16` and miss.
+        let base = if callee.starts_with("__tile_cast_") {
+            "__tile_cast"
+        } else {
+            callee
+                .strip_suffix("_f32")
+                .or_else(|| callee.strip_suffix("_f16"))
+                .or_else(|| callee.strip_suffix("_f"))
+                .unwrap_or(callee)
+        };
+
+        match base {
+            "__tile_load" => {
+                let r = result?;
+                let ptr = args.first()?.trim();
+                let alias = ctx.ptr_aliases.get(ptr)?.clone();
+                loaded.insert(r, (alias, callee.contains("f16")));
+            }
+            "__tile_cast" => {
+                let r = result?;
+                cast_of.insert(r, args.first()?.trim().to_string());
+            }
+            "__tile_mul" => {
+                let r = result?;
+                mul_of = Some((r, args.first()?.trim().to_string(), args.get(1)?.trim().to_string()));
+            }
+            "__tile_reduce_sum" | "__tile_sum_rows" => {
+                let r = result?;
+                reduced = Some((r, args.first()?.trim().to_string()));
+            }
+            "__tile_store" => {
+                let ptr = args.first()?.trim();
+                let alias = ctx.ptr_aliases.get(ptr)?.clone();
+                stored = Some((alias, args.get(1)?.trim().to_string()));
+            }
+            // Anything else means this is not a plain matvec.
+            _ => return None,
+        }
+    }
+
+    // The chain must be exactly: store(reduce(mul(load, load))).
+    let (mul_res, lhs, rhs) = mul_of?;
+    let (red_res, red_src) = reduced?;
+    let (dst, stored_val) = stored?;
+    if red_src != mul_res || stored_val != red_res {
+        return None;
+    }
+
+    // Resolve each multiply operand back to a loaded buffer, through a cast if present.
+    let resolve = |ssa: &str| -> Option<(String, bool)> {
+        if let Some(v) = loaded.get(ssa) {
+            return Some((v.0.clone(), false));
+        }
+        let src = cast_of.get(ssa)?;
+        let v = loaded.get(src)?;
+        Some((v.0.clone(), v.1))
+    };
+    let (a_alias, a_cast) = resolve(&lhs)?;
+    let (b_alias, b_cast) = resolve(&rhs)?;
+    if a_alias == b_alias {
+        return None; // a squared-sum, not a matvec
+    }
+
+    // The WEIGHT is the f16-cast operand when exactly one is cast (weights are stored
+    // half, activations float). Otherwise fall back to operand order, which is what the
+    // module itself asserts.
+    let (row, shared, needs_cast) = match (a_cast, b_cast) {
+        (true, false) => (a_alias, b_alias, true),
+        (false, true) => (b_alias, a_alias, true),
+        _ => (a_alias, b_alias, false),
+    };
+    Some((row, shared, dst, needs_cast))
+}
+
+/// Recognise elementwise compute over PARTITION CELLS -- Grout's `add_2d_f16` shape.
+///
+/// The module partitions one or more buffers, selects a cell from each with the block id,
+/// computes an elementwise expression over those cells, and stores the result. Returns
+/// `(expression, dst alias)` where the expression reads each partitioned operand at its
+/// cell-local offset.
+///
+/// GENERATED: operands and expression both come from the module's dataflow, so changing an
+/// op upstream changes the emitted text. `None` unless the shape matches exactly -- a
+/// partial match must decline, not emit something plausible.
+fn analyze_partition_chain(func: &MlirFunc, ctx: &MslContext) -> Option<PartitionChainInfo> {
+    use std::collections::HashMap;
+    // SSA -> expression for a value available at the current cell.
+    let mut expr: HashMap<String, String> = HashMap::new();
+    // partition-view SSA -> buffer alias it views.
+    let mut views: HashMap<String, String> = HashMap::new();
+    let mut ops = 0usize;
+    let mut consts: HashMap<String, i64> = HashMap::new();
+    // Every writeback, in program order. Split-half RoPE writes BOTH halves (y_lo to cell
+    // (0,0) and y_hi to cell (0,1)), so a single slot silently kept whichever store came
+    // last -- half the operation, no diagnostic.
+    let mut stores: Vec<(String, String, bool)> = Vec::new();
+    let mut saw_partition = false;
+
+    for line in &func.body_lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('^') || line.contains("llvm.return") {
+            continue;
+        }
+        if line.contains("llvm.mlir.constant(") {
+            // Record it: a cell index of `%z` where %z = 0 is the literal 0, NOT the block
+            // id. Treating every SSA index as the block id re-collapses (i, j).
+            if let Some(r) = extract_result_ssa(line) {
+                if let Some(open) = line.find("llvm.mlir.constant(") {
+                    let rest = &line[open + "llvm.mlir.constant(".len()..];
+                    let digits: String =
+                        rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = digits.parse::<i64>() {
+                        consts.insert(r, n);
+                    }
+                }
+            }
+            continue;
+        }
+        let idx = line.find("llvm.call @")?;
+        let rest = &line[idx + "llvm.call @".len()..];
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        let callee = &rest[..end];
+        let args = extract_call_args(line).unwrap_or_default();
+        let result = extract_result_ssa(line);
+
+        // block id: consumed by the cell addressing, contributes no value expression.
+        if callee.starts_with("__tile_block_id") {
+            continue;
+        }
+        // partition view: remember which buffer it views.
+        if callee.starts_with("__tile_partition_") && !callee.contains("cell") {
+            let r = result?;
+            let ptr = args.first()?.trim();
+            let alias = ctx.ptr_aliases.get(ptr)?.clone();
+            views.insert(r, alias);
+            saw_partition = true;
+            continue;
+        }
+        // A MUTABLE partition view (`partition_full_mut`) is both a view and a store
+        // target. rope_f16 reads a cell, rotates it, and writes back into the same cell;
+        // the unique per-cell borrow is what makes that sound without `unsafe`.
+        if callee.contains("partition_cell_mut") {
+            let r = result?;
+            let ptr = args.first()?.trim();
+            let alias = ctx.ptr_aliases.get(ptr)?.clone();
+            views.insert(r, alias);
+            saw_partition = true;
+            continue;
+        }
+        // cell selection: the value is that buffer read at the cell-local offset.
+        if callee.contains("partition_cell") {
+            let r = result?;
+            let v = args.first()?.trim();
+            let alias = views.get(v)?.clone();
+            // The bridge carries the cell index as operands 1 and 2 (f904097). Each operand
+            // gets its OWN base: one shared kernel-level base is correct only when every
+            // operand reads the same cell -- true of add_2d_f16 by luck, false of any
+            // kernel combining different cells (gemm_f16's A-row against B-column).
+            let idx_expr = |a: Option<&String>, is_row: bool| -> String {
+                match a.map(|x| x.trim()) {
+                    Some(v) if v.parse::<i64>().is_ok() => v.to_string(),
+                    // A constant-valued SSA is that constant -- `%z` where %z = 0 means
+                    // cell 0 on that axis, not the block id.
+                    Some(v) if consts.contains_key(v) => consts[v].to_string(),
+                    // A non-constant SSA index is supplied at runtime. Callers bind it via
+                    // the cell_i/cell_j uniforms, falling back to the dispatch coordinate
+                    // when unbound -- the convention the existing PartitionCell kernels use.
+                    // Reading tgpig alone ignores an explicitly bound cell.
+                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                        if is_row { "((cell_i != 0u) ? cell_i : tgpig.x)".to_string() }
+                        else { "((cell_j != 0u) ? cell_j : tgpig.y)".to_string() }
+                    }
+                    _ => "0".to_string(),
+                }
+            };
+            // Two arities exist: the pre-f904097 form (view, idx, rows, cols) carried a
+            // single index with the axis lost, and the current form (view, i, j, rows,
+            // cols) carries both. Distinguish by length -- assuming position reads `rows`
+            // as `j` and mis-addresses every legacy module.
+            let (ci, cj) = if args.len() >= 5 {
+                (idx_expr(args.get(1), true), idx_expr(args.get(2), false))
+            } else {
+                // Legacy 4-arg form: one index, axis lost. Honour BOTH uniforms so a
+                // caller binding an explicit (i, j) still addresses the cell it asked for.
+                (
+                    idx_expr(args.get(1), true),
+                    "((cell_j != 0u) ? cell_j : 0u)".to_string(),
+                )
+            };
+            expr.insert(
+                r,
+                format!(
+                    "{alias}[(({ci}) * tile_rows * src_cols + ({cj}) * tile_cols) \
+                     + r * src_cols + c]"
+                ),
+            );
+            continue;
+        }
+        // A PLAIN (non-partitioned) load: rope_f16 reads cos/sin tables that are not
+        // partitioned, alongside the partitioned q cell. Without this the analyser
+        // declines the whole kernel, and the audit then refuses it.
+        if callee.starts_with("__tile_load") {
+            let r = result?;
+            let ptr = args.first()?.trim();
+            let alias = ctx.ptr_aliases.get(ptr)?.clone();
+            // Not cell-indexed: read at the same (r, c) the cell walk uses.
+            expr.insert(r, format!("{alias}[r * tile_cols + c]"));
+            continue;
+        }
+        if callee.starts_with("__tile_store") {
+            let ptr = args.first()?.trim();
+            let val = args.get(1)?.trim().to_string();
+            // The target is one of three things, in decreasing specificity:
+            //
+            //  1. A partition CELL -- its address expression is already in `expr`, carrying
+            //     that cell's OWN (i, j). This is what lets two stores land in different
+            //     cells: y_lo -> (0,0), y_hi -> (0,1). Resolving a cell through its view
+            //     instead would give both stores the same base and write one half twice.
+            //  2. A partition VIEW -- write at the shared cell base (the in-place rope
+            //     writeback, where the target cell is the one being read).
+            //  3. A plain buffer pointer -- write at (r, c).
+            let dst_expr = if let Some(cell_addr) = expr.get(ptr) {
+                cell_addr.clone()
+            } else if let Some(alias) = ctx.ptr_aliases.get(ptr) {
+                format!("{alias}[r * tile_cols + c]")
+            } else {
+                let alias = views.get(ptr)?.clone();
+                format!(
+                    "{alias}[(((cell_i != 0u) ? cell_i : tgpig.x) * tile_rows * src_cols \
+                     + ((cell_j != 0u) ? cell_j : tgpig.y) * tile_cols) + r * src_cols + c]"
+                )
+            };
+            // Reject a duplicate target: two stores to the SAME address are a
+            // read-modify-write hazard the single-pass emit below cannot order, and are
+            // more likely a mis-lowering than an intent.
+            if stores.iter().any(|(d, _, _)| *d == dst_expr) {
+                return None;
+            }
+            stores.push((dst_expr, val, false));
+            continue;
+        }
+        // everything else must be elementwise compute over already-available values.
+        let (arity, tmpl) = chain_op(callee)?;
+        let r = result?;
+        let a0 = expr.get(args.first()?.trim())?.clone();
+        let built = if arity == 1 {
+            tmpl.replace("{0}", &a0)
+        } else {
+            let a1 = expr.get(args.get(1)?.trim())?.clone();
+            tmpl.replace("{0}", &a0).replace("{1}", &a1)
+        };
+        expr.insert(r, built);
+        ops += 1;
+    }
+
+    if !saw_partition || ops == 0 {
+        return None;
+    }
+    if stores.is_empty() {
+        return None;
+    }
+    // Resolve each stored SSA to its value expression, keeping program order.
+    let resolved: Option<Vec<(String, String)>> = stores
+        .iter()
+        .map(|(dst, val, _)| expr.get(val).map(|v| (dst.clone(), v.clone())))
+        .collect();
+    Some(PartitionChainInfo { stores: resolved? })
+}
+
+/// Recognise `mma` over partition cells -- Grout's `gemm_f16` shape.
+///
+/// Returns `(a_alias, b_alias, dst_alias, a_base, b_base)` where each base is an expression
+/// over that operand's OWN cell index. A matmul is not an elementwise chain -- one output
+/// element sums a full row against a full column -- so this is a separate composition,
+/// as `MatvecChain` was for reductions.
+fn analyze_gemm_chain(
+    func: &MlirFunc,
+    ctx: &MslContext,
+) -> Option<GemmChainInfo> {
+    use std::collections::HashMap;
+    let mut vals: HashMap<String, (String, String)> = HashMap::new(); // ssa -> (alias, base)
+    let mut views: HashMap<String, String> = HashMap::new();
+    let mut consts: HashMap<String, i64> = HashMap::new();
+    // Element type per view/value, read from the load intrinsic: the engine's prefill
+    // matmul is f16 weights x f32 activations, so the operands can differ.
+    let mut view_f16: HashMap<String, bool> = HashMap::new();
+    let mut val_f16: HashMap<String, bool> = HashMap::new();
+    // Whether a view (and so any cell of it) came from a PERMUTED partition. The engine
+    // stores weights [d_out][d_in] while the mma consumes [K][N]; conflating the two
+    // emits a kernel that reads the wrong element on every load.
+    let mut view_perm: HashMap<String, bool> = HashMap::new();
+    let mut val_perm: HashMap<String, bool> = HashMap::new();
+    let mut mma: Option<(String, String, String)> = None;
+    let mut store: Option<(String, String)> = None;
+    let mut saw_cell = false;
+
+    for line in &func.body_lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('^') || line.contains("llvm.return") {
+            continue;
+        }
+        if line.contains("llvm.mlir.constant(") {
+            if let Some(r) = extract_result_ssa(line) {
+                if let Some(open) = line.find("llvm.mlir.constant(") {
+                    let rest = &line[open + "llvm.mlir.constant(".len()..];
+                    let d: String =
+                        rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = d.parse::<i64>() {
+                        consts.insert(r, n);
+                    }
+                }
+            }
+            continue;
+        }
+        let idx = line.find("llvm.call @")?;
+        let rest = &line[idx + "llvm.call @".len()..];
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        let callee = &rest[..end];
+        let args = extract_call_args(line).unwrap_or_default();
+        let result = extract_result_ssa(line);
+
+        if callee.starts_with("__tile_block_id") {
+            continue;
+        }
+        if callee.starts_with("__tile_partition_") && !callee.contains("cell") {
+            let r = result?;
+            // The partition intrinsic carries the element type; a cell inherits it. The
+            // engine's prefill matmul is f16 weights x f32 activations, so assuming both
+            // operands are half emits the wrong signature for the real call.
+            view_f16.insert(r.clone(), callee.contains("f16"));
+            // `__tile_partition_perm_*` is a DIFFERENT read pattern, not a stride variant.
+            view_perm.insert(r.clone(), callee.contains("_perm"));
+            views.insert(r, ctx.ptr_aliases.get(args.first()?.trim())?.clone());
+            continue;
+        }
+        if callee.contains("partition_cell") {
+            let r = result?;
+            let v = args.first()?.trim();
+            let alias = views.get(v)?.clone();
+            val_f16.insert(r.clone(), *view_f16.get(v).unwrap_or(&false));
+            val_perm.insert(r.clone(), *view_perm.get(v).unwrap_or(&false));
+            // Per-operand base from this cell's OWN (i, j). Resolving constants matters:
+            // a `%z` that is 0 means cell 0 on that axis, not the block id.
+            let idx_expr = |a: Option<&String>, is_row: bool| -> String {
+                match a.map(|x| x.trim()) {
+                    Some(v) if v.parse::<i64>().is_ok() => v.to_string(),
+                    Some(v) if consts.contains_key(v) => consts[v].to_string(),
+                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                        if is_row { "cell_i".to_string() } else { "cell_j".to_string() }
+                    }
+                    _ => "0".to_string(),
+                }
+            };
+            let (ci, cj) = if args.len() >= 5 {
+                (idx_expr(args.get(1), true), idx_expr(args.get(2), false))
+            } else {
+                (idx_expr(args.get(1), true), "0".to_string())
+            };
+            // A cell (i, j) starts i tile-rows down and j tile-cols across, measured in the
+            // SOURCE row stride -- supplied per operand below. Under a permuted view the
+            // stored axes are swapped, so the cell's own indices swap with them: (i, j)
+            // addresses the [N][K] buffer, not the logical [K][N] one.
+            let base = if *view_perm.get(v).unwrap_or(&false) {
+                format!("({cj}) * tile_cols * {{LD}} + ({ci}) * tile_rows")
+            } else {
+                format!("({ci}) * tile_rows * {{LD}} + ({cj}) * tile_cols")
+            };
+            vals.insert(r, (alias, base));
+            saw_cell = true;
+            continue;
+        }
+        if callee.starts_with("__tile_load") {
+            let r = result?;
+            let alias = ctx.ptr_aliases.get(args.first()?.trim())?.clone();
+            val_f16.insert(r.clone(), callee.contains("f16"));
+            vals.insert(r, (alias, "0".to_string()));
+            continue;
+        }
+        if callee.starts_with("__tile_fill") {
+            continue; // the zero accumulator
+        }
+        if callee.contains("matmul") || callee.contains("mma") {
+            mma = Some((
+                result?,
+                args.first()?.trim().to_string(),
+                args.get(1)?.trim().to_string(),
+            ));
+            continue;
+        }
+        if callee.starts_with("__tile_store") {
+            let alias = ctx.ptr_aliases.get(args.first()?.trim())?.clone();
+            store = Some((alias, args.get(1)?.trim().to_string()));
+            continue;
+        }
+        return None;
+    }
+
+    if !saw_cell {
+        return None; // a plain matmul; the existing simdgroup emitter owns it
+    }
+    let (mma_res, lhs, rhs) = mma?;
+    let (dst, stored) = store?;
+    if stored != mma_res {
+        return None;
+    }
+    let (a_alias, a_base) = vals.get(&lhs)?.clone();
+    let (b_alias, b_base) = vals.get(&rhs)?.clone();
+    if a_alias == b_alias {
+        return None;
+    }
+    // A permuted A operand is a distinct read pattern that nothing has verified, so refuse
+    // it rather than silently emit the untransposed load and compute the wrong answer.
+    if *val_perm.get(&lhs).unwrap_or(&false) {
+        return None;
+    }
+    // Each operand's base is measured in its OWN source row stride.
+    Some(GemmChainInfo {
+        a: a_alias,
+        b: b_alias,
+        dst,
+        base_a: a_base.replace("{LD}", "lda"),
+        base_b: b_base.replace("{LD}", "ldb"),
+        a_f16: *val_f16.get(&lhs).unwrap_or(&true),
+        b_f16: *val_f16.get(&rhs).unwrap_or(&true),
+        b_permuted: *val_perm.get(&rhs).unwrap_or(&false),
+    })
+}
+
+/// Emit the partition-cell matmul composed by [`analyze_gemm_chain`].
+///
+/// The row stride passed to `simdgroup_load` is the SOURCE width (`lda`/`ldb`), not the cell
+/// width. A cell partitioned along columns is not contiguous -- its rows sit `src_cols`
+/// apart -- and using the cell width walks into the neighbouring cell on every row. That is
+/// the defect that made the first attempt compute 773/1024 lanes wrong.
+fn emit_gemm_chain_msl(out: &mut String, ctx: &MslContext) {
+    let GemmChainInfo { a, b, dst, base_a, base_b, b_permuted, .. } = match &ctx.gemm_chain {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    writeln!(out, "    // mma over partition cells (thm:partdisj grid).").unwrap();
+    writeln!(out, "    // Per-operand bases; row strides are the SOURCE widths lda/ldb, not").unwrap();
+    writeln!(out, "    // the cell widths -- a column-partitioned cell is not contiguous.").unwrap();
+    writeln!(out, "    uint base_a = {base_a};").unwrap();
+    writeln!(out, "    uint base_b = {base_b};").unwrap();
+    writeln!(out, "    uint m0 = tgpig.y * 8u;").unwrap();
+    writeln!(out, "    uint n0 = tgpig.x * 8u;").unwrap();
+    writeln!(out, "    if (m0 >= M || n0 >= N) return;").unwrap();
+    writeln!(out, "    simdgroup_half8x8 acc = simdgroup_half8x8(0.0h);").unwrap();
+    writeln!(out, "    for (uint k0 = 0u; k0 < K; k0 += 8u) {{").unwrap();
+    writeln!(out, "        simdgroup_half8x8 av, bv;").unwrap();
+    writeln!(out, "        simdgroup_load(av, {a} + base_a + m0 * lda + k0, lda);").unwrap();
+    if b_permuted {
+        // B comes from a permuted view: stored [N][K] (row per output), while the mma wants
+        // a K x N fragment. `transpose=true` reads it in that order directly -- no copy, and
+        // NOT expressible as a stride, since ldb sets row distance, not which axis is
+        // contiguous. Row n starts at n * ldb, so the k offset is the in-row one.
+        writeln!(out, "        simdgroup_load(bv, {b} + base_b + n0 * ldb + k0, ldb, ulong2(0, 0), true);").unwrap();
+    } else {
+        writeln!(out, "        simdgroup_load(bv, {b} + base_b + k0 * ldb + n0, ldb);").unwrap();
+    }
+    writeln!(out, "        simdgroup_multiply_accumulate(acc, av, bv, acc);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup half mm_scratch[64];").unwrap();
+    writeln!(out, "    simdgroup_store(acc, mm_scratch, 8);").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    for (uint idx = _tid_v.x; idx < 64u; idx += 32u) {{").unwrap();
+    writeln!(out, "        uint rr = idx / 8u, cc = idx % 8u;").unwrap();
+    writeln!(out, "        if (m0 + rr < M && n0 + cc < N) {dst}[(m0 + rr) * N + (n0 + cc)] = mm_scratch[rr * 8u + cc];").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Emit the partition-cell compute composed by [`analyze_partition_chain`].
+///
+/// Cell addressing is the `PartitionCell` form (`base` from the cell index, one row per
+/// grid-z); the body is the composed expression rather than a copy.
+fn emit_partition_chain_msl(out: &mut String, ctx: &MslContext) {
+    let info = match &ctx.partition_chain {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    writeln!(out, "    // Elementwise compute over partition cells (thm:partdisj grid).").unwrap();
+    writeln!(out, "    // Each operand carries its OWN base, from its own (i, j) -- see the").unwrap();
+    writeln!(out, "    // expression below. A single shared base mis-addresses any kernel").unwrap();
+    writeln!(out, "    // that reads different cells per operand.").unwrap();
+    writeln!(out, "    uint r = tgpig.z;").unwrap();
+    writeln!(out, "    if (r < tile_rows) {{").unwrap();
+    writeln!(out, "        for (uint c = _tid_v.x; c < tile_cols; c += _tc_v.x) {{").unwrap();
+    if info.stores.len() == 1 {
+        let (dst, value) = &info.stores[0];
+        writeln!(out, "            {dst} = {value};").unwrap();
+    } else {
+        // Compute EVERY value before writing ANY of them. These kernels are in-place --
+        // split-half RoPE reads x_lo and x_hi and writes both halves back -- so storing
+        // y_lo first would clobber the x_lo that y_hi still needs, and the second half
+        // would be computed from the rotated value instead of the original.
+        writeln!(out, "            // All values first: these writebacks are in-place, so").unwrap();
+        writeln!(out, "            // storing one before computing the rest would feed a").unwrap();
+        writeln!(out, "            // already-written operand into the remaining stores.").unwrap();
+        for (i, (_, value)) in info.stores.iter().enumerate() {
+            writeln!(out, "            float _pc_v{i} = {value};").unwrap();
+        }
+        for (i, (dst, _)) in info.stores.iter().enumerate() {
+            writeln!(out, "            {dst} = _pc_v{i};").unwrap();
+        }
+    }
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Emit the matvec composed by [`analyze_matvec_chain`].
+///
+/// Same reduction skeleton as `emit_sum_rows_msl` -- float4 stride loop, `simd_sum`,
+/// threadgroup cross-SIMD tree -- with the second operand folded into the accumulate. The
+/// row operand is offset by `base` (one row per threadgroup); the shared operand is not.
+fn emit_matvec_chain_msl(out: &mut String, ctx: &MslContext) {
+    let (row, shared, dst, needs_cast) = match &ctx.matvec {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    let rd = if needs_cast { "(float)" } else { "" };
+    let vec4 = if needs_cast { "half4" } else { "float4" };
+    writeln!(out, "    // Composed matvec: one threadgroup per output row.").unwrap();
+    writeln!(out, "    //   {row} is indexed per row (weights), {shared} is shared (activations).").unwrap();
+    writeln!(out, "    // NSG/NXPSG arrive as function constants 600/601, the same tuning").unwrap();
+    writeln!(out, "    // surface the hand-written matvec exposes, so a search harness").unwrap();
+    writeln!(out, "    // reaches this kernel identically.").unwrap();
+    writeln!(out, "    // NSG/NXPSG are declared so this kernel sits on the same tuning").unwrap();
+    writeln!(out, "    // surface as the hand-written matvec, and a caller binding constants").unwrap();
+    writeln!(out, "    // 600/601 gets a distinct specialization. They do NOT narrow the").unwrap();
+    writeln!(out, "    // accumulate stride: every thread in the threadgroup must read its").unwrap();
+    writeln!(out, "    // share, and striding by NSG*32 silently drops lanes above that span").unwrap();
+    writeln!(out, "    // (measured max_rel_err 5.7 at NSG=1). In the hand-written kernel NSG").unwrap();
+    writeln!(out, "    // selects how many ROWS a threadgroup owns -- a dispatch-geometry").unwrap();
+    writeln!(out, "    // choice the caller makes, not one this loop can reinterpret.").unwrap();
+    writeln!(out, "    (void)FC_mul_mv_nsg; (void)FC_mul_mv_nxpsg;").unwrap();
+    writeln!(out, "    float local_sum = 0.0f;").unwrap();
+    writeln!(out).unwrap();
+    // float4 fast path on BOTH operands; scalar tail when the extent is not a multiple
+    // of 4. Mirrors emit_sum_rows_msl's structure, extended to two inputs.
+    writeln!(out, "    if ((num_elements % 4u) == 0u) {{").unwrap();
+    writeln!(out, "        device const {vec4}* wv = (device const {vec4}*)({row} + base);").unwrap();
+    writeln!(out, "        device const float4* xv = (device const float4*)({shared});").unwrap();
+    writeln!(out, "        uint n4 = num_elements / 4u;").unwrap();
+    writeln!(out, "        for (uint i = tid; i < n4; i += tcount) {{").unwrap();
+    writeln!(out, "            float4 a = float4(wv[i]);").unwrap();
+    writeln!(out, "            float4 b = xv[i];").unwrap();
+    writeln!(out, "            local_sum += a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }} else {{").unwrap();
+    writeln!(out, "        for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "            local_sum += {rd}{row}[base + i] * {shared}[i];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    local_sum = simd_sum(local_sum);").unwrap();
+    writeln!(out, "    constexpr uint MAX_SG = 1024 / 32;").unwrap();
+    writeln!(out, "    threadgroup float mv_shared[MAX_SG];").unwrap();
+    writeln!(out, "    uint simd_lane = tid % 32;").unwrap();
+    writeln!(out, "    uint simd_group = tid / 32;").unwrap();
+    writeln!(out, "    uint num_sg = (tcount + 31u) / 32u;").unwrap();
+    writeln!(out, "    if (simd_group == 0 && simd_lane < MAX_SG) mv_shared[simd_lane] = 0.0f;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (simd_lane == 0) mv_shared[simd_group] = local_sum;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (simd_group == 0) {{").unwrap();
+    writeln!(out, "        float v = (simd_lane < num_sg) ? mv_shared[simd_lane] : 0.0f;").unwrap();
+    writeln!(out, "        v = simd_sum(v);").unwrap();
+    writeln!(out, "        if (simd_lane == 0) {dst}[row] = v;").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Emit the body assembled by [`analyze_elementwise_chain`].
+fn emit_elementwise_chain_msl(out: &mut String, ctx: &MslContext) {
+    for l in &ctx.chain_body {
+        writeln!(out, "{l}").unwrap();
+    }
+}
+
+/// Cross-lane ops: one output depends on many inputs. Losing one of these silently
+/// changes a kernel's shape (N-to-1 becomes N-to-N), which is how a matvec previously
+/// lowered to a bare elementwise multiply and a reduce-only module to a copy.
+fn is_cross_lane_op(callee: &str) -> bool {
+    let base = callee
+        .strip_suffix("_f32")
+        .or_else(|| callee.strip_suffix("_f16"))
+        .or_else(|| callee.strip_suffix("_f"))
+        .unwrap_or(callee);
+    matches!(
+        base,
+        "__tile_reduce_sum" | "__tile_reduce_max" | "__tile_reduce_min"
+            | "__tile_sum_rows" | "__tile_matmul" | "__tile_mma"
+    )
+}
+
+/// Kernel types that consume a cross-lane op inside their own body. Seeing a reduction in
+/// these modules is expected, so the audit below must not fire on them.
+fn consumes_cross_lane(kt: &KernelType) -> bool {
+    let n = format!("{kt:?}");
+    n.starts_with("MulMv")
+        || n.starts_with("MulMm")
+        || n.starts_with("Dsv4")
+        || n.starts_with("FlashAttn")
+        || n.starts_with("SoftMax")
+        || n.starts_with("Attention")
+        || n.starts_with("AttnDecode")
+        || n.contains("RmsNorm")
+        || n.contains("Reduce")
+        || n.contains("SumRows")
+        || n.contains("Softmax")
+        || n.contains("Argmax")
+        || n.contains("Argmin")
+        || n.contains("Sort")
+        || n.contains("Topk")
+        || n.contains("L2Dist")
+        || n.contains("LayerNorm")
+        || n.contains("Matvec")
+        || n.contains("MatvecChain")
+        || n.contains("Matmul")
+        || n.contains("Mma")
+        || n.contains("Gemm")
+        || n.contains("Dot")
+        || n.contains("Swiglu")
+        || n.contains("GateUpSiLU")
+        || n.contains("Scan")
+        || n.contains("Sample")
+        || n.contains("Norm")
+}
 
 fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
     let mut store_map: HashMap<String, String> = HashMap::new();
@@ -2860,6 +3875,16 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_div_f32"        | "__tile_div_f16"        => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Div; } }
                 "__tile_reduce_max_f32" | "__tile_reduce_max_f16" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::ReduceMax; } }
                 "__tile_sum_rows_f32"   => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::SumRows; } }
+                // A row-wise reduce IS `sum_rows`; the skeleton already existed but was
+                // reachable only under the `sum_rows` spelling. cutile_bridge emits
+                // `__tile_reduce_sum_f`, and mlir_to_msl matched neither the untyped form
+                // nor `reduce_sum` at all -- so a matvec (mul + reduce) silently lowered to
+                // just the multiply. Accept every spelling that reaches the same skeleton.
+                "__tile_reduce_sum_f32" | "__tile_reduce_sum_f16" | "__tile_reduce_sum_f"
+                | "__tile_sum_rows_f"
+                    => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::SumRows; } }
+                "__tile_reduce_max_f"
+                    => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::ReduceMax; } }
                 "__tile_repeat_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Repeat; } }
                 "__tile_get_rows_f32"   => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::GetRows; } }
                 "__tile_set_rows_f32"   => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::SetRows; } }
@@ -2874,8 +3899,8 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                 "__tile_token_accept_f32"  => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::TokenAccept; } }
                 // Transformer ops
                 "__tile_attention_f32"     => { ctx.kernel_type = KernelType::Attention; }
-                "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_attention_gqa_f32" => { ctx.kernel_type = KernelType::AttentionGqa; }
+                "__tile_attention_causal_f32" => { ctx.kernel_type = KernelType::AttentionCausal; }
                 "__tile_rope_f32"          => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Rope; } }
                 "__tile_rope_dsv4_f32"     => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::RopeDsv4; } }
                 "__tile_dsv4_ratio4_shift_f32" => { if ctx.kernel_type == KernelType::Copy { ctx.kernel_type = KernelType::Dsv4Ratio4Shift; } }
@@ -3156,13 +4181,23 @@ fn emit_softmax_msl(out: &mut String, msl_type: &str) {
 
 /// Element-wise binary op: dispatched with one thread per element (gid-based).
 /// No batch dimension needed for pointwise ops.
+///
+/// The global index is `row * tcount + tid`, NOT the `base = row * num_elements` prelude the
+/// surrounding scaffold emits. That prelude means "row of a 2-D tile, `num_elements` = cols"
+/// (see the argmax emitter), which is right for row-per-threadgroup kernels and wrong for a
+/// flat 1-D op where `num_elements` is the TOTAL: threadgroup 1 would start at
+/// `1 * num_elements`, already past the end, so every group but the first writes nothing.
+/// At n=4096 over 16 groups that left 3840 of 4096 elements untouched. It went unnoticed
+/// because the standalone harness dispatched a single threadgroup, making `row` always 0.
 fn emit_binop_msl(out: &mut String, op: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) p2[gid] = p0[gid] {} p1[gid];", op).unwrap();
 }
 
+/// Element-wise unary op. Same flat global index as [`emit_binop_msl`] -- see the note there
+/// on why `base` is wrong for pointwise kernels.
 fn emit_unary_msl(out: &mut String, func_name: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
+    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) p1[gid] = {}(p0[gid]);", func_name).unwrap();
 }
 
@@ -3802,55 +4837,6 @@ fn emit_attention_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    for (uint d = 0; d < dim; ++d) {{").unwrap();
     writeln!(out, "        {} acc = ({})0.0;", msl_type, msl_type).unwrap();
     writeln!(out, "        for (uint j = 0; j < seq; ++j)").unwrap();
-    writeln!(out, "            acc += scores[j] * p2[j * dim + d];").unwrap();
-    writeln!(out, "        p3[q_row * dim + d] = acc;").unwrap();
-    writeln!(out, "    }}").unwrap();
-}
-
-/// Causal attention: row `q_row` attends to keys `0..=q_row` only.
-///
-/// Same buffers and params as `emit_attention_msl`. The single difference is
-/// the key bound: `k_end = q_row + 1` replaces `seq` in all three phases, so
-/// the above-diagonal scores are never computed rather than computed and
-/// masked. That is bit-identical to masking after the fact:
-///
-///   * a masked score is `-inf`, so `exp(score - smax) == +0.0` — it adds
-///     exactly zero to `ssum` and contributes `0.0 * V[j,d]` to `acc`;
-///   * `-inf` never wins the row maximum, because row `q_row` always keeps
-///     the finite diagonal entry `k_col == q_row`;
-///   * the retained entries are visited in the same ascending order, so the
-///     summation order of every surviving term is unchanged.
-///
-/// Work drops from `S²` to `S(S+1)/2` score-dot-products — just under half
-/// for large S.
-fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
-    writeln!(out, "    // Causal attention: one thread per output row, local scores buffer").unwrap();
-    writeln!(out, "    // (avoids aliasing the score scratch with the output tensor).").unwrap();
-    writeln!(out, "    if (tid != 0) return;").unwrap();
-    writeln!(out, "    constexpr uint MAX_SEQ = 1024;").unwrap();
-    writeln!(out, "    {} scores[MAX_SEQ];", msl_type).unwrap();
-    writeln!(out, "    float inv_scale = rsqrt((float)dim);").unwrap();
-    writeln!(out, "    uint q_row = row;").unwrap();
-    writeln!(out, "    if (q_row >= rows) return;").unwrap();
-    writeln!(out, "    // Causal bound: keys above the diagonal are skipped, not masked.").unwrap();
-    writeln!(out, "    uint k_end = min(q_row + 1u, seq);").unwrap();
-    writeln!(out, "    // Step 1: scores[k] = (Q[q_row] . K[k]) / sqrt(dim), k <= q_row").unwrap();
-    writeln!(out, "    for (uint k_col = 0; k_col < k_end; ++k_col) {{").unwrap();
-    writeln!(out, "        {} s = ({})0.0;", msl_type, msl_type).unwrap();
-    writeln!(out, "        for (uint d = 0; d < dim; ++d)").unwrap();
-    writeln!(out, "            s += p0[q_row * dim + d] * p1[k_col * dim + d];").unwrap();
-    writeln!(out, "        scores[k_col] = s * ({})inv_scale;", msl_type).unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    // Step 2: softmax over the causal prefix").unwrap();
-    writeln!(out, "    {} smax = scores[0];", msl_type).unwrap();
-    writeln!(out, "    for (uint j = 1; j < k_end; ++j) smax = max(smax, scores[j]);").unwrap();
-    writeln!(out, "    {} ssum = ({})0.0;", msl_type, msl_type).unwrap();
-    writeln!(out, "    for (uint j = 0; j < k_end; ++j) {{ scores[j] = exp(scores[j] - smax); ssum += scores[j]; }}").unwrap();
-    writeln!(out, "    for (uint j = 0; j < k_end; ++j) scores[j] /= ssum;").unwrap();
-    writeln!(out, "    // Step 3: out[q_row, d] = sum_j scores[j] * V[j, d], j <= q_row").unwrap();
-    writeln!(out, "    for (uint d = 0; d < dim; ++d) {{").unwrap();
-    writeln!(out, "        {} acc = ({})0.0;", msl_type, msl_type).unwrap();
-    writeln!(out, "        for (uint j = 0; j < k_end; ++j)").unwrap();
     writeln!(out, "            acc += scores[j] * p2[j * dim + d];").unwrap();
     writeln!(out, "        p3[q_row * dim + d] = acc;").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -12444,22 +13430,70 @@ fn emit_matmul_transposed_msl(out: &mut String) {
     writeln!(out, "    uint m = gid / N;").unwrap();
     writeln!(out, "    uint n = gid % N;").unwrap();
     writeln!(out, "    float acc = 0.0f;").unwrap();
-    // K-loop unroll via the declared knob (see DEFAULT_K_UNROLL). Every
-    // factor emits the same accumulation order, so this is bit-exact.
-    let mut k_loop = Vec::new();
-    emit_unrolled_k_accumulation(
-        &mut k_loop, MATMUL_TRANSPOSED_K_UNROLL, "acc", "k", "K", "uint", "    ",
-        |i| format!("p0[m * K + {}] * p1[n * K + {}]", i, i),
-    );
-    for line in k_loop {
-        writeln!(out, "{}", line).unwrap();
-    }
+    writeln!(out, "    uint k = 0;").unwrap();
+    writeln!(out, "    for (; k + 3 < K; k += 4) {{").unwrap();
+    writeln!(out, "        acc += p0[m * K + k]     * p1[n * K + k];").unwrap();
+    writeln!(out, "        acc += p0[m * K + k + 1] * p1[n * K + k + 1];").unwrap();
+    writeln!(out, "        acc += p0[m * K + k + 2] * p1[n * K + k + 2];").unwrap();
+    writeln!(out, "        acc += p0[m * K + k + 3] * p1[n * K + k + 3];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    for (; k < K; k++)").unwrap();
+    writeln!(out, "        acc += p0[m * K + k] * p1[n * K + k];").unwrap();
     writeln!(out, "    p2[m * N + n] = acc;").unwrap();
 }
 
 /// GQA (Grouped Query Attention): Q has num_heads, K/V have num_kv_heads.
 /// Each group of (num_heads/num_kv_heads) Q heads shares one KV head.
 /// Includes causal masking and scaled dot-product softmax.
+/// Causal attention: row `q_row` attends to keys `0..=q_row` only.
+///
+/// Same buffers and params as `emit_attention_msl`. The single difference is
+/// the key bound: `k_end = q_row + 1` replaces `seq` in all three phases, so
+/// the above-diagonal scores are never computed rather than computed and
+/// masked. That is bit-identical to masking after the fact:
+///
+///   * a masked score is `-inf`, so `exp(score - smax) == +0.0` — it adds
+///     exactly zero to `ssum` and contributes `0.0 * V[j,d]` to `acc`;
+///   * `-inf` never wins the row maximum, because row `q_row` always keeps
+///     the finite diagonal entry `k_col == q_row`;
+///   * the retained entries are visited in the same ascending order, so the
+///     summation order of every surviving term is unchanged.
+///
+/// Work drops from `S²` to `S(S+1)/2` score-dot-products — just under half
+/// for large S.
+fn emit_attention_causal_msl(out: &mut String, msl_type: &str) {
+    writeln!(out, "    // Causal attention: one thread per output row, local scores buffer").unwrap();
+    writeln!(out, "    // (avoids aliasing the score scratch with the output tensor).").unwrap();
+    writeln!(out, "    if (tid != 0) return;").unwrap();
+    writeln!(out, "    constexpr uint MAX_SEQ = 1024;").unwrap();
+    writeln!(out, "    {} scores[MAX_SEQ];", msl_type).unwrap();
+    writeln!(out, "    float inv_scale = rsqrt((float)dim);").unwrap();
+    writeln!(out, "    uint q_row = row;").unwrap();
+    writeln!(out, "    if (q_row >= rows) return;").unwrap();
+    writeln!(out, "    // Causal bound: keys above the diagonal are skipped, not masked.").unwrap();
+    writeln!(out, "    uint k_end = min(q_row + 1u, seq);").unwrap();
+    writeln!(out, "    // Step 1: scores[k] = (Q[q_row] . K[k]) / sqrt(dim), k <= q_row").unwrap();
+    writeln!(out, "    for (uint k_col = 0; k_col < k_end; ++k_col) {{").unwrap();
+    writeln!(out, "        {} s = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "        for (uint d = 0; d < dim; ++d)").unwrap();
+    writeln!(out, "            s += p0[q_row * dim + d] * p1[k_col * dim + d];").unwrap();
+    writeln!(out, "        scores[k_col] = s * ({})inv_scale;", msl_type).unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    // Step 2: softmax over the causal prefix").unwrap();
+    writeln!(out, "    {} smax = scores[0];", msl_type).unwrap();
+    writeln!(out, "    for (uint j = 1; j < k_end; ++j) smax = max(smax, scores[j]);").unwrap();
+    writeln!(out, "    {} ssum = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "    for (uint j = 0; j < k_end; ++j) {{ scores[j] = exp(scores[j] - smax); ssum += scores[j]; }}").unwrap();
+    writeln!(out, "    for (uint j = 0; j < k_end; ++j) scores[j] /= ssum;").unwrap();
+    writeln!(out, "    // Step 3: out[q_row, d] = sum_j scores[j] * V[j, d], j <= q_row").unwrap();
+    writeln!(out, "    for (uint d = 0; d < dim; ++d) {{").unwrap();
+    writeln!(out, "        {} acc = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "        for (uint j = 0; j < k_end; ++j)").unwrap();
+    writeln!(out, "            acc += scores[j] * p2[j * dim + d];").unwrap();
+    writeln!(out, "        p3[q_row * dim + d] = acc;").unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
 fn emit_attention_gqa_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    // GQA: one workgroup per head").unwrap();
     writeln!(out, "    uint head = row;").unwrap();
@@ -12607,6 +13641,40 @@ module {
         assert!(msl.contains("buffer(2)"), "missing binding 2");
         // No shared memory needed for pointwise
         assert!(!msl.contains("threadgroup float"), "unexpected shared memory in add kernel");
+        // The index must be the FLAT global one. `base = row * num_elements` scales by the
+        // TOTAL element count, so threadgroup 1 starts past the end and every group but the
+        // first writes nothing -- 3840 of 4096 elements left untouched at n=4096 over 16
+        // groups. Asserting only the expression (as this test once did) cannot see that;
+        // the standalone harness dispatched one threadgroup, pinning `row` to 0.
+        assert!(msl.contains("uint gid = row * tcount + tid;"), "add must use the flat global index:\n{msl}");
+        assert!(!msl.contains("uint gid = base + tid;"), "add uses the row-scaled base:\n{msl}");
+    }
+
+    /// A pointwise op dispatched over MANY threadgroups must cover every element.
+    ///
+    /// Guards the whole canned pointwise family, not just `add`: they share
+    /// [`emit_binop_msl`] / [`emit_unary_msl`], so one wrong prelude broke all of them at
+    /// once while every per-op test still passed on its expression check.
+    #[test]
+    fn test_msl_pointwise_ops_use_flat_global_index() {
+        let sub = add_mlir().replace("__tile_add_", "__tile_sub_");
+        let mul = add_mlir().replace("__tile_add_", "__tile_mul_");
+        for (mlir, what) in [
+            (add_mlir().to_string(), "add"),
+            (sub, "sub"),
+            (mul, "mul"),
+            (exp_mlir().to_string(), "exp"),
+        ] {
+            let msl = convert_mlir_to_msl(&mlir).unwrap();
+            assert!(
+                msl.contains("uint gid = row * tcount + tid;"),
+                "{what}: not the flat global index -- multi-threadgroup dispatch would drop elements:\n{msl}"
+            );
+            assert!(
+                !msl.contains("uint gid = base + tid;"),
+                "{what}: row-scaled base reinstated:\n{msl}"
+            );
+        }
     }
 
     #[test]
@@ -13111,6 +14179,28 @@ module {
     }
 
     #[test]
+    fn test_msl_matmul_f16_simdgroup() {
+        // Phase 2: mma -> simdgroup_matrix_multiply_accumulate lowering.
+        // Same fixture, but the callee is __tile_matmul_simdgroup_f16.
+        let mlir = matmul_f16_mlir().replace("__tile_matmul_f16", "__tile_matmul_simdgroup_f16");
+        let msl = convert_mlir_to_msl(&mlir).unwrap();
+        assert!(msl.contains("uint2 tgpig"), "simdgroup kernel needs 2D grid tgpig");
+        assert!(msl.contains("simdgroup_half8x8"), "missing simdgroup tile type");
+        assert!(msl.contains("simdgroup_multiply_accumulate(acc, a, b, acc)"), "missing MMA intrinsic");
+        assert!(msl.contains("simdgroup_load"), "missing simdgroup_load");
+        assert!(msl.contains("simdgroup_store"), "missing simdgroup_store");
+        // Phase 8: masked-tail store — store to threadgroup scratch, then a bounds-guarded
+        // copy to global (safe for unaligned M/N). No raw store straight to p2.
+        assert!(msl.contains("mm_scratch"), "masked-tail store needs a threadgroup scratch tile");
+        assert!(msl.contains("simdgroup_store(acc, mm_scratch, 8)"), "must store to scratch, not global");
+        assert!(msl.contains("m0 + r < M && n0 + c < N"), "must bounds-guard the tail copy");
+        assert!(!msl.contains("simdgroup_store(acc, p2"), "must NOT store the full tile to global");
+        // Must NOT carry the scalar-path preamble that references `row`.
+        assert!(!msl.contains("uint base = row"), "simdgroup path must not emit row-based preamble");
+        assert!(!msl.contains("half acc = 0.0h"), "simdgroup path must not emit the scalar loop");
+    }
+
+    #[test]
     fn test_msl_fill() {
         let mlir = r#"
 module {
@@ -13388,55 +14478,6 @@ module {
         assert!(msl.contains("rows"), "attention must have rows param:\n{}", msl);
         assert!(msl.contains("seq"),  "attention must have seq param:\n{}", msl);
         assert!(msl.contains("dim"),  "attention must have dim param:\n{}", msl);
-        // The non-causal emitter must NOT bound the key loop — it is the
-        // control arm for the causal elision test below.
-        assert!(!msl.contains("k_end"), "plain attention must not emit a causal bound:\n{}", msl);
-    }
-
-    /// P1 (monotone-predicate block elision) on Metal: the causal op must
-    /// bound every key loop by the diagonal instead of computing the full
-    /// score matrix and masking it.
-    #[test]
-    fn test_msl_attention_causal_elides_above_diagonal() {
-        let mlir = r#"
-module {
-  llvm.func @attn_causal_test(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
-    ^bb0:
-    %rows = llvm.mlir.constant(4 : i32) : i32
-    %seq  = llvm.mlir.constant(16 : i32) : i32
-    %dim  = llvm.mlir.constant(64 : i32) : i32
-    %q = llvm.call @__tile_load_f32(%arg0, %rows, %dim) : (!llvm.ptr<1>, i32, i32) -> i32
-    %k = llvm.call @__tile_load_f32(%arg1, %seq,  %dim) : (!llvm.ptr<1>, i32, i32) -> i32
-    %v = llvm.call @__tile_load_f32(%arg2, %seq,  %dim) : (!llvm.ptr<1>, i32, i32) -> i32
-    %res = llvm.call @__tile_attention_causal_f32(%q, %k, %v, %rows, %seq, %dim) : (i32, i32, i32, i32, i32, i32) -> i32
-    llvm.call @__tile_store_f32(%arg3, %res, %rows, %dim) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
-}
-"#;
-        let msl = convert_mlir_to_msl(mlir).unwrap();
-        // The causal bound exists and is the diagonal.
-        assert!(msl.contains("uint k_end = min(q_row + 1u, seq);"),
-            "causal attention must derive the diagonal key bound:\n{}", msl);
-        // All three phases (scores, softmax, V accumulation) respect it.
-        assert!(msl.contains("for (uint k_col = 0; k_col < k_end; ++k_col)"),
-            "score loop must stop at the diagonal:\n{}", msl);
-        assert!(msl.contains("for (uint j = 1; j < k_end; ++j) smax"),
-            "row max must run over the causal prefix only:\n{}", msl);
-        assert!(msl.contains("for (uint j = 0; j < k_end; ++j) scores[j] /= ssum;"),
-            "softmax normalize must run over the causal prefix only:\n{}", msl);
-        assert!(msl.contains("for (uint j = 0; j < k_end; ++j)\n            acc += scores[j]"),
-            "V accumulation must run over the causal prefix only:\n{}", msl);
-        // The elision must REPLACE masking, not accompany it: no -inf/-MAXFLOAT
-        // write, no runtime causal uniform. Work is skipped, never discarded.
-        assert!(!msl.contains("MAXFLOAT"),
-            "causal attention must skip above-diagonal work, not mask it:\n{}", msl);
-        assert!(!msl.contains("constant uint& causal"),
-            "causality is compile-time here; no runtime uniform:\n{}", msl);
-        // Same buffer/param contract as the non-causal op (q, k, v, out).
-        assert!(msl.contains("rows"), "causal attention must have rows param:\n{}", msl);
-        assert!(msl.contains("seq"),  "causal attention must have seq param:\n{}", msl);
-        assert!(msl.contains("dim"),  "causal attention must have dim param:\n{}", msl);
     }
 
     #[test]
@@ -13584,57 +14625,13 @@ module {
         assert!(msl.contains("gid = row * tcount + tid"), "must compute flat gid:\n{}", msl);
         assert!(msl.contains("gid / N"), "must derive row from flat gid:\n{}", msl);
         assert!(msl.contains("gid % N"), "must derive col from flat gid:\n{}", msl);
-        // K-loop unrolled by the backend's declared knob, whatever it is set to.
-        // Asserting the knob is honoured (rather than a literal factor) keeps
-        // this test valid when the factor is retuned for a new target.
-        assert!(
-            msl.contains(&format!(
-                "k + {} < K; k += {}",
-                MATMUL_TRANSPOSED_K_UNROLL - 1, MATMUL_TRANSPOSED_K_UNROLL
-            )),
-            "K-loop must be unrolled by MATMUL_TRANSPOSED_K_UNROLL ({}):\n{}",
-            MATMUL_TRANSPOSED_K_UNROLL, msl
-        );
-        // ...and must still emit the scalar tail for a non-multiple K.
-        assert!(msl.contains("for (; k < K; k++) {"), "missing scalar tail:\n{}", msl);
-    }
-
-    /// P2 groundwork: a chain this emitter cannot fold must fail loudly.
-    /// Before the guard, `matmul` then `silu` emitted only the silu and stored
-    /// a value the kernel never computed — a silent miscompile.
-    #[test]
-    fn test_msl_unfusable_compute_chain_is_rejected() {
-        let mlir = r#"
-module {
-  llvm.func @mm_silu(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
-    ^bb0:
-    %m = llvm.mlir.constant(32 : i32) : i32
-    %a = llvm.call @__tile_load_f32(%arg0, %m, %m) : (!llvm.ptr<1>, i32, i32) -> i32
-    %b = llvm.call @__tile_load_f32(%arg1, %m, %m) : (!llvm.ptr<1>, i32, i32) -> i32
-    %c = llvm.call @__tile_matmul_f32(%a, %b, %m, %m, %m) : (i32, i32, i32, i32, i32) -> i32
-    %d = llvm.call @__tile_silu_f32(%c, %m, %m) : (i32, i32, i32) -> i32
-    llvm.call @__tile_store_f32(%arg2, %d, %m, %m) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
-}
-"#;
-        let err = convert_mlir_to_msl(mlir).expect_err("unfusable chain must not lower");
-        assert!(err.contains("__tile_matmul_f32") && err.contains("__tile_silu_f32"),
-            "error must name both ops:\n{}", err);
-        assert!(err.contains("silently"), "error must explain the hazard:\n{}", err);
-    }
-
-    /// The declared epilogue fusion still lowers: the guard must not regress
-    /// recognized pairs. This is the executable definition of "fusable".
-    #[test]
-    fn test_msl_declared_fusion_pair_still_lowers() {
-        assert!(FUSED_COMPUTE_PAIRS.contains(&("__tile_silu_f32", "__tile_mul_f32")),
-            "silu+mul must be a declared epilogue fusion");
+        // 4x unroll
+        assert!(msl.contains("k + 3 < K; k += 4"), "must have 4x loop unroll:\n{}", msl);
     }
 
     #[test]
     fn test_msl_silu_mul_fusion() {
-        // SiLU followed by Mul should fuse into a single SiLUMul kernel
+            // SiLU followed by Mul should fuse into a single SiLUMul kernel
         let mlir = r#"
 module {
   llvm.func @gated_mlp(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
@@ -13755,25 +14752,22 @@ module {
     // Uses CARGO_MANIFEST_DIR to locate templates portably — works whether
     // compiled from rustc_codegen_tile or mlir_to_aie_tests.
 
-    /// Locate a golden `.metal` template, or `None` if the `deepseek_metal`
-    /// fixture crate is not present in the tree (it lives outside the open
-    /// `tile_codegen` workspace). Callers skip the assertion when absent so the
-    /// suite stays green whether or not the closed fixtures are checked out.
-    fn read_template(name: &str) -> Option<String> {
+    fn read_template(name: &str) -> String {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let base = std::path::Path::new(&manifest);
         // Walk up to crates/ then into deepseek_metal/templates/ — the LLM
         // inference MSL templates (inference_kernels.metal, matmul_transposed.metal)
         // live there; tile_metal_py holds a different (batch/vq) template set.
         let templates = base.parent().unwrap().join("deepseek_metal").join("templates");
-        std::fs::read_to_string(templates.join(name)).ok()
+        std::fs::read_to_string(templates.join(name))
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", name, e))
     }
 
     // -- matmul_transposed.metal --
 
     #[test]
     fn test_template_matmul_transposed_signature() {
-        let Some(src) = read_template("matmul_transposed.metal") else { return };
+        let src = read_template("matmul_transposed.metal");
         assert!(src.contains("kernel void matmul_transposed("), "missing matmul_transposed kernel");
         assert!(src.contains("device const float* A"), "missing A buffer");
         assert!(src.contains("device const float* B"), "missing B buffer");
@@ -13785,7 +14779,7 @@ module {
 
     #[test]
     fn test_template_matmul_transposed_inner_loop() {
-        let Some(src) = read_template("matmul_transposed.metal") else { return };
+        let src = read_template("matmul_transposed.metal");
         assert!(src.contains("B[col * K + k]"), "matmul_transposed must access B in transposed layout");
         assert!(src.contains("A[row * K + k]"), "matmul_transposed must access A row-major");
         assert!(src.contains("C[row * N + col]"), "must write C row-major");
@@ -13793,7 +14787,7 @@ module {
 
     #[test]
     fn test_template_matmul_transposed_unroll() {
-        let Some(src) = read_template("matmul_transposed.metal") else { return };
+        let src = read_template("matmul_transposed.metal");
         assert!(src.contains("k + 3 < K; k += 4"), "missing 4x loop unroll");
         assert!(src.contains("A[row * K + k + 1]"), "missing unroll offset +1");
         assert!(src.contains("A[row * K + k + 2]"), "missing unroll offset +2");
@@ -13802,7 +14796,7 @@ module {
 
     #[test]
     fn test_template_matmul_transposed_bias() {
-        let Some(src) = read_template("matmul_transposed.metal") else { return };
+        let src = read_template("matmul_transposed.metal");
         assert!(src.contains("kernel void matmul_transposed_bias("), "missing bias variant");
         assert!(src.contains("device const float* bias"), "missing bias buffer");
         assert!(src.contains("float sum = bias[col]"), "bias must initialize sum");
@@ -13810,7 +14804,7 @@ module {
 
     #[test]
     fn test_template_matmul_transposed_tiled() {
-        let Some(src) = read_template("matmul_transposed.metal") else { return };
+        let src = read_template("matmul_transposed.metal");
         assert!(src.contains("kernel void matmul_transposed_tiled("), "missing tiled variant");
         assert!(src.contains("threadgroup float tileA"), "missing shared memory tileA");
         assert!(src.contains("threadgroup float tileB"), "missing shared memory tileB");
@@ -13824,7 +14818,7 @@ module {
 
     #[test]
     fn test_template_bf16_to_f32() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void bf16_to_f32("), "missing bf16_to_f32 kernel");
         assert!(src.contains("device const ushort* src"), "bf16 must use ushort input");
         assert!(src.contains("uint(src[gid]) << 16"), "bf16 conversion: shift left 16");
@@ -13833,7 +14827,7 @@ module {
 
     #[test]
     fn test_template_embedding() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void embedding("), "missing embedding kernel");
         assert!(src.contains("device const float*  table"), "missing table buffer");
         assert!(src.contains("device const uint*   tokens"), "missing tokens buffer");
@@ -13842,21 +14836,21 @@ module {
 
     #[test]
     fn test_template_elementwise_mul() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void elementwise_mul("), "missing elementwise_mul kernel");
         assert!(src.contains("a[gid] * b[gid]"), "elementwise_mul must multiply pointwise");
     }
 
     #[test]
     fn test_template_elementwise_add() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void elementwise_add("), "missing elementwise_add kernel");
         assert!(src.contains("a[gid] + b[gid]"), "elementwise_add must add pointwise");
     }
 
     #[test]
     fn test_template_attention_gqa() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void attention_gqa("), "missing attention_gqa kernel");
         assert!(src.contains("num_heads / num_kv_heads"), "GQA must compute group_size");
         assert!(src.contains("head / group_size"), "GQA must map Q head to KV head");
@@ -13868,7 +14862,7 @@ module {
 
     #[test]
     fn test_template_attention_gqa_buffers() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("device const float* Q   [[ buffer(0) ]]"), "missing Q buffer");
         assert!(src.contains("device const float* K   [[ buffer(1) ]]"), "missing K buffer");
         assert!(src.contains("device const float* V   [[ buffer(2) ]]"), "missing V buffer");
@@ -13880,7 +14874,7 @@ module {
 
     #[test]
     fn test_template_argmax_last() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void argmax_last("), "missing argmax_last kernel");
         assert!(src.contains("(seq_len - 1) * vocab"), "argmax must offset to last row");
         assert!(src.contains("threadgroup float smax"), "argmax must use shared max buffer");
@@ -13891,14 +14885,14 @@ module {
 
     #[test]
     fn test_template_copy_row() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void copy_row("), "missing copy_row kernel");
         assert!(src.contains("dst[dst_row * cols + gid] = src[src_row * cols + gid]"), "copy_row must copy indexed row");
     }
 
     #[test]
     fn test_template_rope_single() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         assert!(src.contains("kernel void rope_single("), "missing rope_single kernel");
         assert!(src.contains("device float*       x"), "rope_single must be in-place");
         assert!(src.contains("constant float&     theta"), "rope_single must have theta param");
@@ -13911,14 +14905,14 @@ module {
 
     #[test]
     fn test_template_kernel_count() {
-        let Some(src) = read_template("inference_kernels.metal") else { return };
+        let src = read_template("inference_kernels.metal");
         let kernel_count = src.matches("kernel void ").count();
         assert_eq!(kernel_count, 9, "inference_kernels.metal should have 9 kernels, found {}", kernel_count);
     }
 
     #[test]
     fn test_template_matmul_kernel_count() {
-        let Some(src) = read_template("matmul_transposed.metal") else { return };
+        let src = read_template("matmul_transposed.metal");
         let kernel_count = src.matches("kernel void ").count();
         assert_eq!(kernel_count, 3, "matmul_transposed.metal should have 3 kernels, found {}", kernel_count);
     }
@@ -13940,6 +14934,355 @@ module {
   }
 }
 "#
+    }
+
+    fn matvec_i8_v4_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @matvec_i8_v4(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_matvec_i8_v4(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+
+    #[test]
+    fn test_msl_matvec_i8_v4() {
+        let msl = convert_mlir_to_msl(matvec_i8_v4_mlir()).unwrap();
+        // int8 weight, per-row fp16 scale, float4/char4 vectorized loads
+        assert!(msl.contains("char* p1"), "p1 (weights) must be char* (int8)");
+        assert!(msl.contains("half* p3"), "p3 (scale) must be half*");
+        assert!(msl.contains("float* p0"), "p0 (activation) must be float*");
+        assert!(msl.contains("float* p2"), "p2 (output) must be float*");
+        assert!(msl.contains("float4* a4"), "must vectorize activation as float4");
+        assert!(msl.contains("char4*  w4") || msl.contains("char4* w4"), "must vectorize weight as char4");
+        assert!(msl.contains("dot(a4[i], float4(w4[i]))"), "must use vectorized dot");
+        assert!(msl.contains("simd_sum(sum)"), "missing simd_sum reduction");
+        assert!(msl.contains("total * float(p3[row])"), "must apply per-row scale");
+    }
+
+    fn matvec_i8_v4_batched_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @matvec_i8b(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_matvec_i8_v4_batched(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_matvec_i8_v4_batched() {
+        let msl = convert_mlir_to_msl(matvec_i8_v4_batched_mlir()).unwrap();
+        assert!(msl.contains("const uint M = 8u"), "must be batched M=8");
+        assert!(msl.contains("acc[8]"), "must have 8 accumulators");
+        assert!(msl.contains("p0 + m*K"), "must offset activation per stream");
+        assert!(msl.contains("p2[m*N + n]"), "must write per-stream output");
+        assert!(msl.contains("simd_sum"), "must use simd_sum reduction");
+        assert!(msl.contains("shared_m"), "must use the 32*M reduction array");
+    }
+
+    // Batched (M=8) non-matmul kernels: minimal MLIR that calls the intrinsic to
+    // set the kernel type; the emit fn writes the full kernel verbatim.
+    fn batched_nonmatmul_mlir(intrinsic: &str) -> String {
+        format!(
+            r#"
+module {{
+  llvm.func @batched_k(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {{hacc.entry}} {{
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @{}(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }}
+}}
+"#,
+            intrinsic
+        )
+    }
+
+    #[test]
+    fn test_msl_rms_norm_mul_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_rms_norm_mul_batched")).unwrap();
+        assert!(msl.contains("kernel void rms_norm_mul_batched("), "missing kernel name");
+        assert!(msl.contains("uint stream=gpig.y"), "must read stream from 2D grid .y");
+        assert!(msl.contains("x+stream*stream_stride"), "must offset x by stream*stream_stride");
+        assert!(msl.contains("rsqrt(sh[0]/float(n)+eps)"), "must compute rms scale");
+        assert!(msl.contains("simd_sum"), "must use simd_sum reduction");
+        assert!(msl.contains("threadgroup float sh[32]"), "must use sh[32] reduction array");
+    }
+
+    #[test]
+    fn test_msl_rms_norm_mul_v4_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_rms_norm_mul_v4_batched")).unwrap();
+        assert!(msl.contains("kernel void rms_norm_mul_v4_batched("), "missing kernel name");
+        assert!(msl.contains("uint n4=n>>2"), "must be float4-vectorized");
+        assert!(msl.contains("device const float4* x4"), "must use float4 loads");
+        assert!(msl.contains("uint stream=gpig.y"), "must read stream from 2D grid .y");
+        assert!(msl.contains("rsqrt(sh[0]/float(n)+eps)"), "must compute rms scale");
+    }
+
+    #[test]
+    fn test_msl_rope_split_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_rope_split_batched")).unwrap();
+        assert!(msl.contains("kernel void rope_split_batched("), "missing kernel name");
+        assert!(msl.contains("device float* p0[[buffer(0)]]"), "p0 must be in-place");
+        assert!(msl.contains("uint stream=tgpig.y"), "must read stream from 2D grid .y");
+        assert!(msl.contains("p0+stream*stream_stride"), "must offset p0 by stream*stream_stride");
+        assert!(msl.contains("ps[base+half_dim+i]=x1*ca+x0*sa"), "must do split-half rotation");
+        assert!(!msl.contains("simd_sum"), "must not use simd reduction");
+    }
+
+    #[test]
+    fn test_msl_attn_decode_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_attn_decode_batched")).unwrap();
+        assert!(msl.contains("kernel void attn_decode_batched("), "missing kernel name");
+        assert!(msl.contains("threadgroup float scores[256]"), "must use scores[256]");
+        assert!(msl.contains("Kc+stream*kv_stride"), "must offset Kc by stream*kv_stride");
+        assert!(msl.contains("Q+stream*q_stride"), "must offset Q by stream*q_stride");
+        assert!(msl.contains("simd_max"), "must use simd_max for softmax");
+    }
+
+    #[test]
+    fn test_msl_attn_decode_v4_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_attn_decode_v4_batched")).unwrap();
+        assert!(msl.contains("kernel void attn_decode_v4_batched("), "missing kernel name");
+        assert!(msl.contains("uint hd4=head_dim>>2"), "must be float4 Q.K dot");
+        assert!(msl.contains("device const float4* Q4"), "must use float4 Q loads");
+        assert!(msl.contains("threadgroup float scores[256]"), "must use scores[256]");
+        assert!(msl.contains("Kc+stream*kv_stride"), "must offset Kc by stream*kv_stride");
+    }
+
+    fn attn_splitk_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @attn_sk(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>, %arg5: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(128 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_attn_decode_splitk(%a, %a, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_attn_splitk() {
+        let msl = convert_mlir_to_msl(attn_splitk_mlir()).unwrap();
+        assert!(msl.contains("nsplit"), "must split the KV range");
+        assert!(msl.contains("red[256]") && !msl.contains("[kv_len]"), "bounded reduction, no kv_len-sized array");
+        assert!(msl.contains("m_new") && msl.contains("corr"), "online-softmax flash recurrence");
+        assert!(msl.contains("tend = min(tbeg + chunk, seq)"), "KV chunk is bounded to seq");
+    }
+    fn attn_splitk_v2_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @attn_sk2(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>, %arg4: !llvm.ptr<1>, %arg5: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(128 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_attn_decode_splitk_v2(%a, %a, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_attn_splitk_v2() {
+        let msl = convert_mlir_to_msl(attn_splitk_v2_mlir()).unwrap();
+        assert!(msl.contains("simd_sum(sv)"), "must reduce the QK dot with simd_sum, not a barrier tree");
+        assert!(!msl.contains("red[256]") && !msl.contains("threadgroup_barrier"), "no barrier-tree reduction");
+        assert!(msl.contains("half4") && msl.contains("(float4)k4"), "f16 vectorized K/V loads");
+        assert!(msl.contains("tend = min(tbeg+chunk, seq)"), "bounded KV chunk");
+    }
+    fn attn_combine_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @attn_cb(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(128 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_attn_decode_combine(%a, %a, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg3, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_attn_combine() {
+        let msl = convert_mlir_to_msl(attn_combine_mlir()).unwrap();
+        assert!(msl.contains("acc/l") || msl.contains("acc / l"), "final normalize");
+        assert!(msl.contains("exp(mi - m)"), "flash merge weight");
+    }
+
+    #[test]
+    fn test_msl_silu_mul_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_silu_mul_batched")).unwrap();
+        assert!(msl.contains("kernel void silu_mul_batched("), "missing kernel name");
+        assert!(msl.contains("uint2 gid[[thread_position_in_grid]]"), "must use uint2 grid");
+        assert!(msl.contains("uint off=gid.y*stream_stride+gid.x"), "must compute per-stream offset");
+        assert!(msl.contains("(x/(1.0f+exp(-x)))*u[off]"), "must do silu(g)*u");
+        assert!(!msl.contains("simd_sum"), "must not use simd reduction");
+    }
+
+    #[test]
+    fn test_msl_add_inplace_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_add_inplace_batched")).unwrap();
+        assert!(msl.contains("kernel void add_inplace_batched("), "missing kernel name");
+        assert!(msl.contains("uint2 gid[[thread_position_in_grid]]"), "must use uint2 grid");
+        assert!(msl.contains("uint off=gid.y*stream_stride+gid.x"), "must compute per-stream offset");
+        assert!(msl.contains("a[off]+=b[off]"), "must do in-place add");
+        assert!(!msl.contains("simd_sum"), "must not use simd reduction");
+    }
+
+    #[test]
+    fn test_msl_kv_write_batched() {
+        let msl = convert_mlir_to_msl(&batched_nonmatmul_mlir("__tile_kv_write_batched")).unwrap();
+        assert!(msl.contains("kernel void kv_write_batched("), "missing kernel name");
+        assert!(msl.contains("uint2 gid[[thread_position_in_grid]]"), "must use uint2 grid");
+        assert!(msl.contains("src+gid.y*src_stride"), "must offset src by stream*src_stride");
+        assert!(msl.contains("cache+gid.y*cache_stride"), "must offset cache by stream*cache_stride");
+        assert!(msl.contains("caches[h*max_seq*head_dim+pos*head_dim+d]=srcs[h*head_dim+d]"), "must write into cache");
+    }
+
+    fn matvec_q4k_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @matvec_q4k(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_matvec_qblock(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_matvec_q4k() {
+        let msl = convert_mlir_to_msl(matvec_q4k_mlir()).unwrap();
+        assert!(msl.contains("uchar* p0") || msl.contains("uchar *p0"), "p0 must be uchar* (packed blocks)");
+        assert!(msl.contains("144ul"), "must stride by 144-byte super-blocks");
+        assert!(msl.contains("as_type<half>"), "must decode fp16 super-scales");
+        assert!(msl.contains("dl * nib - ml"), "must decode nibbles in quantized domain (vectorized)");
+        assert!(msl.contains("uchar4") && msl.contains("float4"), "must vectorize the nibble dot");
+        assert!(msl.contains("simd_sum"), "must use cooperative simd_sum reduction");
+        assert!(msl.contains("d_out"), "must use d_out param");
+    }
+
+    fn matvec_q4k_reg_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @matvec_q4k_reg(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_matvec_qblock_reg(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_matvec_q4k_reg() {
+        let msl = convert_mlir_to_msl(matvec_q4k_reg_mlir()).unwrap();
+        assert!(msl.contains("float yl[32]"), "must register-block the activation");
+        assert!(msl.contains("sumf[4]"), "must register-block 4 output rows");
+        assert!(msl.contains("simd_sum"), "must reduce via simd_sum");
+        assert!(msl.contains("(dl * (float)nib - ml) * yl[k]"), "must use the scalar FMA nibble decode");
+        assert!(msl.contains("first_row"), "register-blocked row mapping");
+    }
+
+    fn matvec_q4k_coop_mlir() -> &'static str {
+        r#"
+module {
+  llvm.func @mvqc(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_matvec_qblock_coop(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#
+    }
+    #[test]
+    fn test_msl_matvec_q4k_coop() {
+        let msl = convert_mlir_to_msl(matvec_q4k_coop_mlir()).unwrap();
+        assert!(msl.contains("block_q4_K"), "must emit the block_q4_K struct");
+        assert!(msl.contains("tiisg/8") && msl.contains("tiisg%8"), "cooperative one-lane-per-sub-block partition (single-read)");
+        assert!(msl.contains("simd_sum"), "simd_sum reduction");
+        assert!(msl.contains("0x0F00") && msl.contains("1.f/256.f"), "masked-unshifted nibble unpack with deferred scale");
+    }
+
+    // Bits-per-weight quant-matvec selection rule: the format suffix picks the kernel.
+    fn matvec_quant_mlir(fmt: &str) -> String {
+        format!(r#"
+module {{
+  llvm.func @mvq(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {{hacc.entry}} {{
+    ^bb0:
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %c = llvm.mlir.constant(2560 : i32) : i32
+    %a = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %b = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32
+    %res = llvm.call @__tile_matvec_quant_{fmt}(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_f32(%arg2, %res, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }}
+}}
+"#)
+    }
+    #[test]
+    fn test_msl_matvec_quant_selection() {
+        // Q4_K → cooperative single-read (llama-parity bandwidth, the fastest safe kernel).
+        {
+            let msl = convert_mlir_to_msl(&matvec_quant_mlir("q4_k")).unwrap();
+            assert!(msl.contains("block_q4_K") && msl.contains("tiisg/8"),
+                "quant_q4_k must select the cooperative single-read kernel");
+        }
+        // other <= 6-bit k-quants → register-blocked scalar (yl[32]/sumf[4], scalar FMA).
+        for fmt in ["q5_k", "q6_k", "q2_k"] {
+            let msl = convert_mlir_to_msl(&matvec_quant_mlir(fmt)).unwrap();
+            assert!(msl.contains("float yl[32]") && msl.contains("sumf[4]"),
+                "quant_{fmt} must select the register-blocked scalar kernel");
+        }
+        // >= 8-bit → vectorized per-row (char4/float4 dot, per-row scale).
+        for fmt in ["q8_0", "i8", "int8"] {
+            let msl = convert_mlir_to_msl(&matvec_quant_mlir(fmt)).unwrap();
+            assert!(msl.contains("char4") && msl.contains("simd_sum") && !msl.contains("yl[32]"),
+                "quant_{fmt} must select the vectorized per-row kernel");
+        }
     }
 
     #[test]
@@ -13990,6 +15333,18 @@ module {
         assert!(msl.contains("cos(angle)"), "missing cos");
         assert!(msl.contains("sin(angle)"), "missing sin");
         assert!(msl.contains("p0[idx]"), "must modify p0 in-place");
+    }
+
+    #[test]
+    fn test_msl_rope_split() {
+        // Split-half (NeoX / HF Qwen2) RoPE: rotate x[i] against x[i+d/2].
+        let mlir = rope_inplace_mlir().replace("__tile_rope_inplace_f32", "__tile_rope_split_f32");
+        let msl = convert_mlir_to_msl(&mlir).unwrap();
+        assert!(msl.contains("uint half_dim = head_dim / 2"), "split rope needs half_dim");
+        assert!(msl.contains("p0[base + half_dim + i]"), "must rotate against the second half");
+        assert!(msl.contains("cos(angle)") && msl.contains("sin(angle)"), "missing rotation");
+        // Must NOT be the interleaved (2*i adjacent-pair) form.
+        assert!(!msl.contains("head * head_dim + 2 * i"), "split rope must not use interleaved indexing");
     }
 
     fn kv_cache_update_mlir() -> &'static str {
@@ -14082,84 +15437,448 @@ module {
         assert!(msl.contains("rsqrt"), "missing rsqrt in RMS norm");
     }
 
-    // ── Additional classifiable kernel types driven end-to-end through
-    //    convert_mlir_to_msl, so the classify_body + num_bufs + routing arms
-    //    for each execute (not just the leaf emit_* via the emit-tail mod). ────
+    // -----------------------------------------------------------------------
+    // Composed elementwise chains (generated, not selected by name)
+    // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Reductions (phase 1 of the FFN matvec emitter work)
+    // -----------------------------------------------------------------------
+
+    /// A reduce-sum must lower to a REAL cross-lane reduction, not a copy.
+    ///
+    /// Before this, `__tile_reduce_sum_f32` matched no handler: the classifier fell
+    /// through to whichever op it did recognise and emitted that op's canned body, so a
+    /// reduce-only module produced `p1[gid] = p0[gid]`. The row-sum skeleton already
+    /// existed (`emit_sum_rows_msl`) but was reachable only under the `sum_rows` spelling.
     #[test]
-    fn test_msl_sub_dispatch() {
-        let msl = convert_mlir_to_msl(SUB_MLIR).unwrap();
-        assert!(msl.contains("p0[gid] - p1[gid]"), "missing sub expr:\n{msl}");
+    fn test_msl_reduce_sum_lowers_to_real_reduction() {
+        let mlir = "module {\n\
+            llvm.func @red(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(2560 : i32) : i32\n\
+            %w = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_reduce_sum_f32(%w, %r, %c) : (i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg1, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(mlir).unwrap();
+        assert!(msl.contains("simd_sum"), "no simd reduction:\n{msl}");
+        assert!(msl.contains("threadgroup_barrier"), "no cross-SIMD barrier:\n{msl}");
+        // The old failure mode: a bare elementwise copy.
+        assert!(!msl.contains("p1[gid] = p0[gid];"), "lowered to a COPY:\n{msl}");
     }
 
+    /// Every spelling of a row-sum reaches the same skeleton. cutile_bridge emits the
+    /// untyped `__tile_reduce_sum_f`; the emitter historically knew only `sum_rows_f32`.
     #[test]
-    fn test_msl_mul_dispatch() {
-        let msl = convert_mlir_to_msl(MUL_MLIR).unwrap();
-        assert!(msl.contains("p0[gid] * p1[gid]"), "missing mul expr:\n{msl}");
+    fn test_msl_reduce_sum_name_spellings() {
+        for name in ["__tile_reduce_sum_f32", "__tile_reduce_sum_f", "__tile_sum_rows_f32"] {
+            let mlir = format!(
+                "module {{\n\
+                 llvm.func @red(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {{hacc.entry}} {{\n\
+                 ^bb0:\n\
+                 %r = llvm.mlir.constant(1 : i32) : i32\n\
+                 %c = llvm.mlir.constant(512 : i32) : i32\n\
+                 %w = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+                 %s = llvm.call @{name}(%w, %r, %c) : (i32, i32, i32) -> i32\n\
+                 llvm.call @__tile_store_f32(%arg1, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+                 llvm.return\n}}\n}}\n"
+            );
+            let msl = convert_mlir_to_msl(&mlir)
+                .unwrap_or_else(|e| panic!("{name} did not lower: {e}"));
+            assert!(msl.contains("simd_sum"), "{name} produced no reduction:\n{msl}");
+        }
     }
 
+    /// A cross-lane op the chosen kernel type does not consume must REFUSE.
+    ///
+    /// This is the bug that motivated the whole phase: a matvec (mul + reduce) classified
+    /// as `Mul` and emitted only the multiply, silently turning an N-to-1 kernel into an
+    /// N-to-N one. Silent wrong shape is worse than a hard error, because it looks like
+    /// success.
     #[test]
-    fn test_msl_scale_dispatch() {
-        let msl = convert_mlir_to_msl(SCALE_MLIR).unwrap();
-        assert!(msl.contains("p0[gid] * scale_val"), "missing scale expr:\n{msl}");
-        assert!(msl.contains("scale_val"), "missing scale param:\n{msl}");
+    fn test_msl_matvec_composes_and_orphan_reduction_refuses() {
+        let mlir = "module {\n\
+            llvm.func @matvec(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(2560 : i32) : i32\n\
+            %w = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %x = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %p = llvm.call @__tile_mul_f32(%w, %x, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_reduce_sum_f32(%p, %r, %c) : (i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        // Phase 2 taught the emitter to COMPOSE this exact shape, so it now lowers rather
+        // than refusing -- the invariant that matters is that the reduction is never
+        // silently dropped. Assert the composition, and keep a genuinely unconsumable
+        // module below for the refusal path.
+        let msl = convert_mlir_to_msl(mlir).expect("matvec should compose");
+        assert!(msl.contains("simd_sum"), "reduction dropped:\n{msl}");
+        assert!(!msl.contains("p2[gid] = p0[gid] * p1[gid]"), "lowered as bare mul:\n{msl}");
+
+        // A reduction whose result is NOT what gets stored cannot be composed, and must
+        // still refuse rather than emit the multiply alone.
+        let orphan = "module {\n\
+            llvm.func @orphan(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(2560 : i32) : i32\n\
+            %w = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %x = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %p = llvm.call @__tile_mul_f32(%w, %x, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_reduce_sum_f32(%w, %r, %c) : (i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %p, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let err = convert_mlir_to_msl(orphan).expect_err("orphan reduction must refuse");
+        assert!(err.contains("cross-lane"), "wrong refusal reason: {err}");
     }
 
+    /// Kernel types that DO consume a cross-lane op internally must not trip the audit.
+    /// The first version of the check fired on `MatmulF16`, which consumes its matmul.
     #[test]
-    fn test_msl_sqrt_dispatch() {
-        let msl = convert_mlir_to_msl(SQRT_MLIR).unwrap();
-        assert!(msl.contains("sqrt(p0[gid])"), "missing sqrt call:\n{msl}");
+    fn test_msl_cross_lane_audit_exempts_consumers() {
+        for kt in ["MatmulF16", "MulMvF16F32_4", "SumRows", "SoftMaxF32_4", "Dsv4TopkMask"] {
+            assert!(
+                consumes_cross_lane(&format_kt(kt)),
+                "{kt} consumes a cross-lane op but is not exempt"
+            );
+        }
+        // ...and a purely elementwise type is NOT exempt, or the audit would never fire.
+        assert!(!consumes_cross_lane(&KernelType::Mul));
+        assert!(!consumes_cross_lane(&KernelType::Copy));
     }
 
-    #[test]
-    fn test_msl_softplus_dispatch() {
-        let msl = convert_mlir_to_msl(SOFTPLUS_MLIR).unwrap();
-        // log(1 + exp(x)) with overflow guard
-        assert!(msl.contains("log(1.0f + exp(x))"), "missing softplus body:\n{msl}");
+    /// Helper: the audit matches on the Debug name, so tests can name types by string.
+    #[cfg(test)]
+    fn format_kt(name: &str) -> KernelType {
+        match name {
+            "MatmulF16" => KernelType::MatmulF16,
+            "MulMvF16F32_4" => KernelType::MulMvF16F32_4,
+            "SumRows" => KernelType::SumRows,
+            "SoftMaxF32_4" => KernelType::SoftMaxF32_4,
+            "Dsv4TopkMask" => KernelType::Dsv4TopkMask,
+            _ => KernelType::Copy,
+        }
     }
 
+    /// The composed matvec must TRACK the module: swapping the multiply's operands in
+    /// the MLIR must swap them in the emitted dot product. A name-keyed lookup cannot
+    /// pass this, which is what separates real codegen from the canned emitters.
     #[test]
-    fn test_msl_where_dispatch() {
-        let msl = convert_mlir_to_msl(WHERE_MLIR).unwrap();
+    fn test_msl_matvec_chain_tracks_operand_order() {
+        let build = |lhs: &str, rhs: &str| {
+            let m = format!(
+                "module {{\n\
+                 llvm.func @mv(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {{hacc.entry}} {{\n\
+                 ^bb0:\n\
+                 %r = llvm.mlir.constant(1 : i32) : i32\n\
+                 %c = llvm.mlir.constant(2560 : i32) : i32\n\
+                 %w = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+                 %x = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+                 %p = llvm.call @__tile_mul_f32({lhs}, {rhs}, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+                 %s = llvm.call @__tile_reduce_sum_f32(%p, %r, %c) : (i32, i32, i32) -> i32\n\
+                 llvm.call @__tile_store_f32(%arg2, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+                 llvm.return\n}}\n}}\n"
+            );
+            convert_mlir_to_msl(&m).unwrap()
+        };
+        let a = build("%w", "%x");
+        let b = build("%x", "%w");
+        assert!(a.contains("p0[base + i] * p1[i]"), "wrong order in a:\n{a}");
+        assert!(b.contains("p1[base + i] * p0[i]"), "wrong order in b:\n{b}");
+        assert_ne!(a, b, "output did not follow the module -- lookup, not codegen");
+    }
+
+    /// An f16 weight load must produce a `half` weight buffer and a cast in the dot, and
+    /// the activation/output buffers must stay float. The signature is derived from the
+    /// module's load types, not from a single module-wide dtype.
+    #[test]
+    fn test_msl_matvec_chain_mixed_buffer_types() {
+        let m = "module {\n\
+            llvm.func @mv16(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(2560 : i32) : i32\n\
+            %w = llvm.call @__tile_load_f16(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %x = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %wf = llvm.call @__tile_cast_f16_f32(%w, %r, %c) : (i32, i32, i32) -> i32\n\
+            %p = llvm.call @__tile_mul_f32(%wf, %x, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_reduce_sum_f32(%p, %r, %c) : (i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        assert!(msl.contains("half* p0"), "weights not half:\n{msl}");
+        assert!(msl.contains("float* p1"), "activations not float:\n{msl}");
+        assert!(msl.contains("(float)p0[base + i]"), "missing cast in dot:\n{msl}");
+        assert!(msl.contains("simd_sum"), "no reduction:\n{msl}");
+    }
+
+    /// The composed matvec must carry the float4 fast path AND declare the nsg/nxpsg
+    /// function constants, so it sits on the same tuning surface as the hand-written
+    /// kernel that `specialized_pipeline` binds at indices 600/601.
+    #[test]
+    fn test_msl_matvec_chain_vectorized_and_specializable() {
+        let m = "module {\n\
+            llvm.func @mv16(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(2560 : i32) : i32\n\
+            %w = llvm.call @__tile_load_f16(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %x = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %wf = llvm.call @__tile_cast_f16_f32(%w, %r, %c) : (i32, i32, i32) -> i32\n\
+            %p = llvm.call @__tile_mul_f32(%wf, %x, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_reduce_sum_f32(%p, %r, %c) : (i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        assert!(msl.contains("#define FC_MUL_MV 600"), "no FC preamble:\n{msl}");
+        assert!(msl.contains("function_constant(FC_MUL_MV + 0)"), "no nsg constant:\n{msl}");
+        assert!(msl.contains("function_constant(FC_MUL_MV + 1)"), "no nxpsg constant:\n{msl}");
+        assert!(msl.contains("half4"), "weights not vector-loaded:\n{msl}");
+        assert!(msl.contains("float4"), "activations not vector-loaded:\n{msl}");
+        // The accumulate stride must cover the WHOLE threadgroup. Striding by NSG*32
+        // silently drops every lane above that span -- measured max_rel_err 5.7 at NSG=1
+        // before this was caught.
+        assert!(!msl.contains("i += mv_span"), "stride must not be narrowed by nsg:\n{msl}");
+        assert!(msl.contains("i += tcount"), "stride must cover the threadgroup:\n{msl}");
+    }
+
+    /// Grout's `add_2d_f16` shape: partition two buffers, take the block-id cell from
+    /// each, add. Must compose -- cell addressing AND the arithmetic, not a copy.
+    ///
+    /// Before this, `PartitionCell` (documented as "copy one cell") claimed the module and
+    /// emitted correct addressing with a copy body, silently dropping the second operand
+    /// and the add.
+    #[test]
+    fn test_msl_partition_chain_composes_add_2d() {
+        let m = "module {\n\
+            llvm.func @add_2d(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(64 : i32) : i32\n\
+            %c = llvm.mlir.constant(64 : i32) : i32\n\
+            %bid = llvm.call @__tile_block_id_i32() : () -> i32\n\
+            %pa = llvm.call @__tile_partition_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %pb = llvm.call @__tile_partition_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %ca = llvm.call @__tile_partition_cell_f32(%pa, %bid, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %cb = llvm.call @__tile_partition_cell_f32(%pb, %bid, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_add_f32(%ca, %cb, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        // cell addressing preserved
+        assert!(msl.contains("tile_rows * src_cols"), "no cell addressing:\n{msl}");
+        // BOTH partitioned operands read at a cell offset, and the add survives. Each now
+        // carries its OWN base from its own (i, j) rather than one shared kernel-level one.
+        assert!(msl.contains("p0[((") && msl.contains("p1[(("), "operand base missing:\n{msl}");
+        assert!(msl.contains(" + p1[(("), "arithmetic dropped:\n{msl}");
+        // exactly one `base` -- PartitionChain emits its own, and the shared wrapper must
+        // not also emit `row * num_elements` (Metal rejects the redeclaration).
+        // No shared `uint base`: per-operand bases are inline in the expression.
+        assert_eq!(msl.matches("uint base").count(), 0, "shared base returned:\n{msl}");
+    }
+
+    /// A partitioned kernel whose compute the copy body cannot express must REFUSE rather
+    /// than silently emitting the copy. Uses a cross-lane op, which PartitionChain does
+    /// not compose.
+    #[test]
+    fn test_msl_partition_with_unexpressible_compute_refuses() {
+        let m = "module {\n\
+            llvm.func @part_reduce(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(64 : i32) : i32\n\
+            %c = llvm.mlir.constant(64 : i32) : i32\n\
+            %bid = llvm.call @__tile_block_id_i32() : () -> i32\n\
+            %pa = llvm.call @__tile_partition_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %ca = llvm.call @__tile_partition_cell_f32(%pa, %bid, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_reduce_sum_f32(%ca, %r, %c) : (i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg1, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let err = convert_mlir_to_msl(m).expect_err("must refuse rather than drop the reduce");
+        assert!(err.contains("cross-lane") || err.contains("silently dropped"),
+                "wrong refusal reason: {err}");
+    }
+
+    /// Operands reading DIFFERENT cells must get DIFFERENT bases.
+    ///
+    /// This is the property the bridge's cell-index fix (f904097) and per-operand bases
+    /// exist for. `add_2d_f16` reads the SAME cell from both operands, so it passes either
+    /// way and cannot detect the collapse; only differing cells can.
+    #[test]
+    fn test_msl_partition_chain_per_operand_base() {
+        let m = "module {\n\
+            llvm.func @ij(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(64 : i32) : i32\n\
+            %c = llvm.mlir.constant(64 : i32) : i32\n\
+            %z = llvm.mlir.constant(0 : i32) : i32\n\
+            %bid = llvm.call @__tile_block_id_i32() : () -> i32\n\
+            %pa = llvm.call @__tile_partition_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %pb = llvm.call @__tile_partition_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %ca = llvm.call @__tile_partition_cell_f32(%pa, %bid, %z, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %cb = llvm.call @__tile_partition_cell_f32(%pb, %z, %bid, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %s = llvm.call @__tile_add_f32(%ca, %cb, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %s, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        // A is at (bid, 0): row axis varies, column axis is the literal 0.
+        assert!(msl.contains("p0[((((cell_i"), "A base not row-indexed:\n{msl}");
+        assert!(msl.contains("+ (0) * tile_cols"), "A column axis not 0:\n{msl}");
+        // B is at (0, bid): row axis is the literal 0, column axis varies.
+        assert!(msl.contains("p1[((0) * tile_rows"), "B row axis not 0:\n{msl}");
+        assert!(msl.contains("cell_j"), "B column axis not cell-indexed:\n{msl}");
+        // A constant-valued SSA (%z = 0) must resolve to 0, NOT to the block id -- that
+        // collapse is what the bridge fix removed and this would silently reinstate.
+        assert!(!msl.contains("p1[((((cell_i"), "B row axis read as the block id:\n{msl}");
+    }
+
+    /// Grout's `gemm_f16`: mma over partition cells, A at (row, 0) and B at (0, row).
+    ///
+    /// Two defects made the first attempt compute 773/1024 lanes wrong: one shared base for
+    /// both operands, and the CELL width used as the `simdgroup_load` row stride. A
+    /// column-partitioned cell is not contiguous -- its rows sit `src_cols` apart -- so the
+    /// stride must be the source width.
+    #[test]
+    fn test_msl_gemm_chain_per_operand_base_and_source_stride() {
+        let m = "module {\n\
+            llvm.func @gemm(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %m = llvm.mlir.constant(64 : i32) : i32\n\
+            %k = llvm.mlir.constant(32 : i32) : i32\n\
+            %n = llvm.mlir.constant(16 : i32) : i32\n\
+            %z = llvm.mlir.constant(0 : i32) : i32\n\
+            %row = llvm.call @__tile_block_id_i32() : () -> i32\n\
+            %ap = llvm.call @__tile_partition_f32(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %bp = llvm.call @__tile_partition_f32(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %ta = llvm.call @__tile_partition_cell_f32(%ap, %row, %z, %m, %k) : (i32, i32, i32, i32, i32) -> i32\n\
+            %tb = llvm.call @__tile_partition_cell_f32(%bp, %z, %row, %k, %n) : (i32, i32, i32, i32, i32) -> i32\n\
+            %acc = llvm.call @__tile_fill_f32(%m, %n) : (i32, i32) -> i32\n\
+            %r = llvm.call @__tile_matmul_f32(%ta, %tb, %acc, %m, %n) : (i32, i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %r, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        // Per-operand bases on DIFFERENT axes: A varies by row, B by column.
+        assert!(msl.contains("uint base_a = (cell_i) * tile_rows * lda"), "A base wrong:\n{msl}");
+        assert!(msl.contains("uint base_b = (0) * tile_rows * ldb + (cell_j)"), "B base wrong:\n{msl}");
+        // Row strides are the SOURCE widths, never the cell widths.
+        assert!(msl.contains("m0 * lda + k0, lda"), "A stride not lda:\n{msl}");
+        assert!(msl.contains("k0 * ldb + n0, ldb"), "B stride not ldb:\n{msl}");
+        assert!(!msl.contains(", tile_cols);"), "cell width used as a stride:\n{msl}");
+        // The matmul survives -- it is not lowered as a copy or an elementwise op.
+        assert!(msl.contains("simdgroup_multiply_accumulate"), "mma dropped:\n{msl}");
+        // A PLAIN partition must NOT emit a transposed load: that is the permuted lowering,
+        // and applying it here would silently transpose a correctly-laid-out operand.
+        assert!(!msl.contains(", true)"), "plain B lowered as transposed:\n{msl}");
+    }
+
+    /// A PERMUTED B partition lowers to a TRANSPOSED `simdgroup_load`, not a stride change.
+    ///
+    /// The engine stores weights `[d_out][d_in]` (a row per output), while the mma consumes
+    /// `[K][N]`. Reading one as the other yields the wrong element regardless of `ldb` --
+    /// row stride sets the distance between rows, not which axis is contiguous. That
+    /// mismatch is what made the first wiring attempt emit garbage. Metal's
+    /// `transpose=true` reads the stored order directly, with no data movement.
+    #[test]
+    fn test_msl_gemm_chain_permuted_b_lowers_to_transposed_load() {
+        let m = "module {\n\
+            llvm.func @gemm_t(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %m = llvm.mlir.constant(64 : i32) : i32\n\
+            %k = llvm.mlir.constant(32 : i32) : i32\n\
+            %n = llvm.mlir.constant(16 : i32) : i32\n\
+            %z = llvm.mlir.constant(0 : i32) : i32\n\
+            %row = llvm.call @__tile_block_id_i32() : () -> i32\n\
+            %ap = llvm.call @__tile_partition_f16(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %bp = llvm.call @__tile_partition_perm_f16(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %ta = llvm.call @__tile_partition_cell_f16(%ap, %row, %z, %m, %k) : (i32, i32, i32, i32, i32) -> i32\n\
+            %tb = llvm.call @__tile_partition_cell_f16(%bp, %z, %row, %k, %n) : (i32, i32, i32, i32, i32) -> i32\n\
+            %acc = llvm.call @__tile_fill_f32(%m, %n) : (i32, i32) -> i32\n\
+            %r = llvm.call @__tile_matmul_f32(%ta, %tb, %acc, %m, %n) : (i32, i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%arg2, %r, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        // B is read transposed: row n0 of the stored [N][K] buffer, k as the in-row offset.
         assert!(
-            msl.contains("(p0[gid] != 0.0f) ? p1[gid] : p2[gid]"),
-            "missing where select:\n{msl}"
+            msl.contains("simdgroup_load(bv, p1 + base_b + n0 * ldb + k0, ldb, ulong2(0, 0), true)"),
+            "permuted B not lowered as a transposed load:\n{msl}"
         );
+        // The untransposed form must be GONE -- emitting both reads the wrong element.
+        assert!(!msl.contains("k0 * ldb + n0, ldb);"), "untransposed B load survives:\n{msl}");
+        // A is NOT permuted, so it keeps the plain load.
+        assert!(msl.contains("simdgroup_load(av, p0 + base_a + m0 * lda + k0, lda);"), "A load disturbed:\n{msl}");
+        // The permuted cell base swaps axes with the stored layout: B's cell is (0, row),
+        // and under permutation the column index scales the row stride.
+        assert!(msl.contains("uint base_b = (cell_j) * tile_cols * ldb + (0) * tile_rows"), "permuted base not swapped:\n{msl}");
     }
 
+    /// Grout's `rope_f16`: read a partition cell, rotate it, write BACK into that cell.
+    ///
+    /// The writeback must be addressed at the CELL base. A destination stuck at offset 0
+    /// would write cell (0,0) whatever cell was read -- passing a cell-0 test while
+    /// corrupting every other cell. The buffer must also lose its `const`, since a mutable
+    /// partition is read AND written.
     #[test]
-    fn test_msl_argmin_dispatch() {
-        let msl = convert_mlir_to_msl(ARGMIN_MLIR).unwrap();
-        // tree reduction keeping the running min + index
-        assert!(msl.contains("local_min"), "missing local_min:\n{msl}");
-        assert!(msl.contains("idx_data"), "missing argmin idx array:\n{msl}");
+    fn test_msl_partition_chain_mutable_writeback() {
+        let m = "module {\n\
+            llvm.func @rope(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(64 : i32) : i32\n\
+            %z = llvm.mlir.constant(0 : i32) : i32\n\
+            %bid = llvm.call @__tile_block_id_i32() : () -> i32\n\
+            %qv = llvm.call @__tile_partition_cell_mut_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %cell = llvm.call @__tile_partition_cell_f32(%qv, %bid, %z, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %cosv = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %sinv = llvm.call @__tile_load_f32(%arg2, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %a = llvm.call @__tile_mul_f32(%cell, %cosv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %b = llvm.call @__tile_mul_f32(%cell, %sinv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %res = llvm.call @__tile_sub_f32(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%qv, %res, %r, %c) : (i32, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        // The writeback target is cell-addressed, not offset 0.
+        assert!(msl.contains("p0[(((cell_i"), "writeback not cell-addressed:\n{msl}");
+        // A mutable partition is read AND written, so it cannot be `const`.
+        assert!(msl.contains("device  float* p0"), "writeback buffer is const:\n{msl}");
+        // The rotate survives -- not lowered as a copy.
+        assert!(msl.contains(" - ("), "arithmetic dropped:\n{msl}");
+        // The non-partitioned cos/sin tables read at (r, c), not through a cell base.
+        assert!(msl.contains("p1[r * tile_cols + c]"), "cos table mis-addressed:\n{msl}");
     }
 
+    /// Two stores to the SAME address are refused: a read-modify-write hazard the
+    /// single-pass emit cannot order, and more likely a mis-lowering than an intent.
+    /// (Distinct cells ARE supported -- see
+    /// `test_msl_partition_chain_two_cells_compute_before_store`.)
     #[test]
-    fn test_msl_repeat_dispatch() {
-        let msl = convert_mlir_to_msl(REPEAT_MLIR).unwrap();
-        assert!(msl.contains("p0[i % src_n]"), "missing repeat modulo:\n{msl}");
-    }
-
-    #[test]
-    fn test_msl_sum_rows_dispatch() {
-        let msl = convert_mlir_to_msl(SUMROWS_MLIR).unwrap();
-        assert!(msl.contains("simd_sum"), "sum_rows must use simd_sum:\n{msl}");
-    }
-
-    #[test]
-    fn test_msl_get_rows_dispatch() {
-        let msl = convert_mlir_to_msl(GETROWS_MLIR).unwrap();
-        // gather: int row index from p1, copy that source row
-        assert!(msl.contains("int r = p1[row]"), "missing get_rows index load:\n{msl}");
-        assert!(msl.contains("p2[base + c] = p0[src_base + c]"), "missing get_rows copy:\n{msl}");
-    }
-
-    #[test]
-    fn test_msl_set_rows_dispatch() {
-        let msl = convert_mlir_to_msl(SETROWS_MLIR).unwrap();
-        assert!(msl.contains("int i1 = p1[row]"), "missing set_rows index load:\n{msl}");
-        assert!(msl.contains("p2[dst_base + c] = p0[base + c]"), "missing set_rows scatter:\n{msl}");
+    fn test_msl_partition_chain_refuses_two_stores() {
+        let m = "module {\n\
+            llvm.func @rope2(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(64 : i32) : i32\n\
+            %z = llvm.mlir.constant(0 : i32) : i32\n\
+            %one = llvm.mlir.constant(1 : i32) : i32\n\
+            %qv = llvm.call @__tile_partition_cell_mut_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %lo = llvm.call @__tile_partition_cell_f32(%qv, %z, %z, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %hi = llvm.call @__tile_partition_cell_f32(%qv, %z, %one, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %cosv = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %sinv = llvm.call @__tile_load_f32(%arg2, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %a = llvm.call @__tile_mul_f32(%lo, %cosv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %b = llvm.call @__tile_mul_f32(%hi, %sinv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %ylo = llvm.call @__tile_sub_f32(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %d = llvm.call @__tile_mul_f32(%lo, %sinv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %e = llvm.call @__tile_mul_f32(%hi, %cosv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %yhi = llvm.call @__tile_add_f32(%d, %e, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%qv, %ylo, %r, %c) : (i32, i32, i32, i32) -> ()\n\
+            llvm.call @__tile_store_f32(%qv, %yhi, %r, %c) : (i32, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        // Refused outright, rather than emitting a kernel that drops one of the halves.
+        assert!(
+            convert_mlir_to_msl(m).is_err(),
+            "two stores to one address must be refused, not silently reduced to the last one"
+        );
     }
 
     const SUB_MLIR: &str = r#"
@@ -14410,7 +16129,10 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_binop_msl() {
-        check(|o| emit_binop_msl(o, "+"), "uint gid = base + tid;", "emit_binop_msl");
+        // `row * tcount + tid`, not `base + tid`: pointwise ops are flat 1-D, where
+        // `num_elements` is the TOTAL, so a `base = row * num_elements` prelude puts every
+        // threadgroup past the end but the first. See the note on `emit_binop_msl`.
+        check(|o| emit_binop_msl(o, "+"), "uint gid = row * tcount + tid;", "emit_binop_msl");
     }
     #[test]
     fn t_emit_cast_bf16_msl() {
@@ -15078,7 +16800,7 @@ mod emit_tail_tests {
     }
     #[test]
     fn t_emit_unary_msl() {
-        check(|o| emit_unary_msl(o, "exp"), "uint gid = base + tid;", "emit_unary_msl");
+        check(|o| emit_unary_msl(o, "exp"), "uint gid = row * tcount + tid;", "emit_unary_msl");
     }
     #[test]
     fn t_emit_unary_op_disp_4_msl() {
@@ -15177,15 +16899,6 @@ module {
         }
     }
 
-    /// Dumps the generated MSL for the causal op so the standalone Metal A/B
-    /// harness runs the *real* emitter output rather than a transcription.
-    /// Writes only when TILERS_MSL_DUMP_DIR is set; otherwise a no-op.
-    ///
-    /// Used to prove the elision bit-exact on device: the dumped kernel is
-    /// compared against a control that computes the full S×S score matrix and
-    /// masks afterwards. Result on M1 Ultra, S=64 D=32, 8 random trials:
-    /// 0/16384 elements differ, worst ULP delta 0.
-    #[test]
     fn dump_causal_msl_for_ab() {
         let Ok(dir) = std::env::var("TILERS_MSL_DUMP_DIR") else { return };
         let mk = |intrinsic: &str| format!(r#"
@@ -15208,5 +16921,207 @@ module {{
         let plain  = convert_mlir_to_msl(&mk("__tile_attention_f32")).unwrap();
         std::fs::write(format!("{}/causal.metal", dir), causal).unwrap();
         std::fs::write(format!("{}/plain.metal", dir), plain).unwrap();
+    }
+
+    /// Split-half RoPE: two writebacks into DIFFERENT cells, both halves computed BEFORE
+    /// either is stored.
+    ///
+    /// Two things have to hold, and the second is easy to miss. Each store must carry its
+    /// own cell index (`y_lo` -> (0,0), `y_hi` -> (0,1)); resolving the target through the
+    /// shared view instead gives both the same base and writes one half twice. And because
+    /// the kernel is IN-PLACE, every value must be computed before any store: writing
+    /// `y_lo` first clobbers the `x_lo` that `y_hi` reads. Measured on M4, the naive
+    /// interleaved order gets 63 of 64 `hi` lanes wrong (worst rel 1.16e+01) while this
+    /// order is exact to 1.98e-07.
+    #[test]
+    fn test_msl_partition_chain_two_cells_compute_before_store() {
+        let m = "module {\n\
+            llvm.func @rope2(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {\n\
+            ^bb0:\n\
+            %r = llvm.mlir.constant(1 : i32) : i32\n\
+            %c = llvm.mlir.constant(64 : i32) : i32\n\
+            %z = llvm.mlir.constant(0 : i32) : i32\n\
+            %one = llvm.mlir.constant(1 : i32) : i32\n\
+            %qv = llvm.call @__tile_partition_cell_mut_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %lo = llvm.call @__tile_partition_cell_f32(%qv, %z, %z, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %hi = llvm.call @__tile_partition_cell_f32(%qv, %z, %one, %r, %c) : (i32, i32, i32, i32, i32) -> i32\n\
+            %cosv = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %sinv = llvm.call @__tile_load_f32(%arg2, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+            %a = llvm.call @__tile_mul_f32(%lo, %cosv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %b = llvm.call @__tile_mul_f32(%hi, %sinv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %ylo = llvm.call @__tile_sub_f32(%a, %b, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %d = llvm.call @__tile_mul_f32(%lo, %sinv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %e = llvm.call @__tile_mul_f32(%hi, %cosv, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            %yhi = llvm.call @__tile_add_f32(%d, %e, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+            llvm.call @__tile_store_f32(%lo, %ylo, %r, %c) : (i32, i32, i32, i32) -> ()\n\
+            llvm.call @__tile_store_f32(%hi, %yhi, %r, %c) : (i32, i32, i32, i32) -> ()\n\
+            llvm.return\n}\n}\n";
+        let msl = convert_mlir_to_msl(m).unwrap();
+        // BOTH halves are written, each at its own cell.
+        assert!(msl.contains("(0) * tile_cols) + r * src_cols + c] = _pc_v0"), "y_lo store missing:\n{msl}");
+        assert!(msl.contains("(1) * tile_cols) + r * src_cols + c] = _pc_v1"), "y_hi store missing:\n{msl}");
+        // Ordering: every value computed before the first store. Checking the index of the
+        // first store against the last temp is what actually pins this -- asserting the
+        // temps exist would pass on the interleaved order too.
+        let first_store = msl.find("] = _pc_v0;").expect("no store");
+        let last_value = msl.find("float _pc_v1 =").expect("no second value");
+        assert!(last_value < first_store, "y_hi computed AFTER y_lo was stored -- in-place clobber:\n{msl}");
+        // A mutable partition is read AND written, so it cannot be const.
+        assert!(msl.contains("device  float* p0"), "writeback buffer is const:\n{msl}");
+    }
+
+    /// Wrap a body in the module boilerplate the entry-point scan expects.
+    fn chain_module(body: &str) -> String {
+        format!(
+            "module {{\n\
+             llvm.func @k(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {{hacc.entry}} {{\n\
+             ^bb0:\n\
+             %r = llvm.mlir.constant(1 : i32) : i32\n\
+             %c = llvm.mlir.constant(1024 : i32) : i32\n\
+             {body}\n\
+             llvm.return\n}}\n}}\n"
+        )
+    }
+
+    /// A SwiGLU spelled as five separate ops must compose into ONE expression.
+    ///
+    /// This is the case that motivated the pass: `classify_body` reduces a function to a
+    /// single `KernelType` and emits a canned body per type, so before this the chain
+    /// collapsed to whichever op was recognised last.
+    #[test]
+    fn test_msl_chain_composes_swiglu_from_primitives() {
+        let mlir = chain_module(
+            "%g = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+             %u = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+             %n = llvm.call @__tile_neg_f32(%g, %r, %c) : (i32, i32, i32) -> i32\n\
+             %e = llvm.call @__tile_exp_f32(%n, %r, %c) : (i32, i32, i32) -> i32\n\
+             %o = llvm.call @__tile_fill_f32(%r, %c) : (i32, i32) -> i32\n\
+             %d = llvm.call @__tile_add_f32(%o, %e, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+             %s = llvm.call @__tile_div_f32(%g, %d, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+             %y = llvm.call @__tile_mul_f32(%s, %u, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+             llvm.call @__tile_store_f32(%arg2, %y, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()",
+        );
+        let msl = convert_mlir_to_msl(&mlir).unwrap();
+        assert!(msl.contains("exp((-v))"), "silu denominator missing:\n{msl}");
+        assert!(msl.contains("* p1[gid]"), "up operand missing:\n{msl}");
+        assert!(msl.contains("p2[gid] ="), "store missing:\n{msl}");
+        // Every op must appear in ONE statement, not be reduced to the last one seen.
+        assert_eq!(msl.matches("p2[gid] =").count(), 1, "expected one store:\n{msl}");
+    }
+
+    /// The emitted expression must TRACK the MLIR. A canned emitter passes the test
+    /// above by luck; it cannot pass this one, because swapping an op in the module has
+    /// to change the generated text.
+    #[test]
+    fn test_msl_chain_tracks_the_module_not_a_lookup() {
+        let with = |op: &str| {
+            let body = format!(
+                "%g = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+                 %u = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+                 %e = llvm.call @{op}(%g, %r, %c) : (i32, i32, i32) -> i32\n\
+                 %y = llvm.call @__tile_mul_f32(%e, %u, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+                 llvm.call @__tile_store_f32(%arg2, %y, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()"
+            );
+            convert_mlir_to_msl(&chain_module(&body)).unwrap()
+        };
+        let exp = with("__tile_exp_f32");
+        let tanh = with("__tile_tanh_f32");
+        assert!(exp.contains("exp(p0[gid])"), "exp not composed:\n{exp}");
+        assert!(tanh.contains("tanh(p0[gid])"), "tanh not composed:\n{tanh}");
+        assert_ne!(exp, tanh, "output did not change with the module -- lookup, not codegen");
+    }
+
+    /// An operand read more than once binds to a local, so the device read happens once.
+    #[test]
+    fn test_msl_chain_binds_repeated_operand() {
+        let mlir = chain_module(
+            "%g = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+             %u = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+             %s = llvm.call @__tile_silu_f32(%g, %g, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+             %y = llvm.call @__tile_mul_f32(%s, %u, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+             llvm.call @__tile_store_f32(%arg2, %y, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()",
+        );
+        let msl = convert_mlir_to_msl(&mlir).unwrap();
+        assert!(msl.contains("float v = p0[gid];"), "repeated operand not bound:\n{msl}");
+        // Bound once, so the buffer is not re-read inside the expression.
+        assert_eq!(msl.matches("p0[gid]").count(), 1, "p0 read more than once:\n{msl}");
+        // The single-use operand stays inlined rather than getting a pointless copy.
+        assert!(msl.contains("* p1[gid]"), "single-use operand should inline:\n{msl}");
+    }
+
+    /// An unmodelled op in the elementwise namespace must REFUSE, not fall through to a
+    /// canned emitter that would pick a body by some other op's name and ignore the MLIR.
+    #[test]
+    fn test_msl_chain_refuses_unmodelled_elementwise_op() {
+        let mlir = chain_module(
+            "%g = llvm.call @__tile_load_f32(%arg0, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+             %u = llvm.call @__tile_load_f32(%arg1, %r, %c) : (!llvm.ptr<1>, i32, i32) -> i32\n\
+             %e = llvm.call @__tile_mystery_f32(%g, %r, %c) : (i32, i32, i32) -> i32\n\
+             %y = llvm.call @__tile_mul_f32(%e, %u, %r, %c) : (i32, i32, i32, i32) -> i32\n\
+             llvm.call @__tile_store_f32(%arg2, %y, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()",
+        );
+        // `__tile_mystery` is not in the allowlist, so this DECLINES the chain path
+        // rather than erroring -- the conservative direction.
+        let _ = convert_mlir_to_msl(&mlir);
+
+        // A name that IS in the elementwise allowlist but has no lowering must error,
+        // because falling through there would silently emit the wrong arithmetic.
+        // gelu has two incompatible conventions (exact erf vs the tanh approximation),
+        // so it sits in NEITHER table: not lowered, and not claimed as elementwise.
+        // The invariant that matters is that the two tables never disagree.
+        assert!(chain_op("__tile_gelu_f32").is_none(), "gelu has two conventions; keep it unlowered");
+        assert!(!looks_elementwise_name("__tile_gelu_f32"), "unlowerable op must not be allowlisted");
+    }
+
+    /// Structured kernels (matmul, attention, quantised matvec) must be untouched by the
+    /// chain pass -- it declines them so the existing classifier keeps ownership.
+    #[test]
+    fn test_msl_chain_declines_structured_kernels() {
+        for name in [
+            "__tile_matmul_simdgroup_f16",
+            "__tile_matvec_qblock",
+            "__tile_topk_f32",
+            "__tile_embedding_f32",
+            "__tile_attention_f32",
+        ] {
+            assert!(!looks_elementwise_name(name), "{name} must not read as elementwise");
+        }
+    }
+
+    /// Every name the allowlist calls elementwise must actually lower, or the pass errors
+    /// on kernels it should have declined. This is the invariant that broke once.
+    #[test]
+    fn test_msl_chain_allowlist_matches_op_table() {
+        for name in [
+            "__tile_add_f32", "__tile_sub_f32", "__tile_mul_f32", "__tile_div_f32",
+            "__tile_neg_f32", "__tile_exp_f32", "__tile_log_f32", "__tile_sqrt_f32",
+            "__tile_rsqrt_f32", "__tile_tanh_f32", "__tile_abs_f32", "__tile_sin_f32",
+            "__tile_cos_f32", "__tile_sigmoid_f32", "__tile_silu_f32", "__tile_relu_f32",
+            "__tile_softplus_f32", "__tile_recip_f32", "__tile_floor_f32",
+            "__tile_ceil_f32", "__tile_round_f32", "__tile_sign_f32", "__tile_step_f32",
+            "__tile_square_f32", "__tile_erf_f32", "__tile_asin_f32", "__tile_acos_f32",
+            "__tile_atan_f32", "__tile_sinh_f32", "__tile_cosh_f32", "__tile_cbrt_f32",
+            "__tile_pow_f32", "__tile_fmod_f32",
+        ] {
+            assert!(looks_elementwise_name(name), "{name} missing from the allowlist");
+            assert!(chain_op(name).is_some(), "{name} is allowlisted but has no lowering");
+        }
+    }
+
+    /// The bridge emits untyped names (`__tile_add_f`); the emitter historically knew only
+    /// typed ones (`__tile_add_f32`). Both must resolve, or bridge output cannot lower.
+    #[test]
+    fn test_msl_chain_accepts_both_name_spellings() {
+        for (untyped, typed) in [
+            ("__tile_add_f", "__tile_add_f32"),
+            ("__tile_mul_f", "__tile_mul_f32"),
+            ("__tile_div_f", "__tile_div_f32"),
+            ("__tile_exp_f", "__tile_exp_f32"),
+        ] {
+            assert_eq!(chain_op(untyped), chain_op(typed), "{untyped} and {typed} disagree");
+        }
+        // Casts carry both types and must not be suffix-stripped into a miss.
+        assert!(chain_op("__tile_cast_f16_f32").is_some());
+        assert!(chain_op("__tile_cast_f32_f16").is_some());
     }
 }

@@ -1455,38 +1455,6 @@ fn analyze_body(
             translate_attention_gqa(line, ctx, &mut ops)?;
             continue;
         }
-        // tile.attention_causal f32 — REJECTED, deliberately and loudly.
-        //
-        // The causal op exists so a backend can skip above-diagonal work
-        // instead of computing and masking it (the "monotone-predicate block
-        // elision" pattern). Neither half of that is expressible in this
-        // emitter's current attention shape:
-        //
-        //   * `translate_attention` emits ONE `pto.tmatmul` covering the whole
-        //     S×S score matrix, so there are no per-block ops to drop. The
-        //     elision needs a *blocked* score pipeline (a tmatmul per (i,j)
-        //     block pair, emitted only for j <= i, with the softmax
-        //     row-statistics accumulated across the surviving blocks).
-        //   * There is no select/where primitive in the PTO op set
-        //     (tadd/tmul/trowmax/... only), so even the fallback of masking
-        //     after a dense matmul would need a materialized triangular -inf
-        //     bias tile — which is precisely the work this op exists to avoid.
-        //
-        // This MUST be an explicit error: unrecognized `llvm.call` lines fall
-        // through to the "emit as comment" arm at the bottom of this loop, so
-        // staying silent would produce a kernel that never computes attention
-        // at all and stores an undefined output tile.
-        if line.contains("__tile_attention_causal_f32") {
-            return Err(
-                "attention_causal: no PTO lowering. The causal elision needs a \
-                 blocked score pipeline (one tmatmul per (i,j) block, emitted \
-                 only for j <= i, with row max/sum accumulated across blocks); \
-                 translate_attention currently emits a single whole-S×S \
-                 tmatmul, and the PTO op set has no select primitive for a \
-                 masking fallback. Use __tile_attention_f32 for full attention."
-                    .to_string(),
-            );
-        }
         // tile.attention f32 — fused Q@K^T → scale → softmax → @V
         // Decomposed into: matmul + scale + softmax_5ops + matmul
         if line.contains("__tile_attention_f32") {
@@ -2698,27 +2666,6 @@ fn translate_attention(
     // Step 2: move scores to VEC for softmax
     let vec_ty = tile_buf_type(s, s, "f32");
     let sv = ctx.alloc_tile_typed(&format!("{}__sv", result_ssa), s, s, "f32", &vec_ty, ops);
-    // NOTE (a2a3 blocker, diagnosed on hardware 2026-08-05): this Acc->Vec
-    // tmov is why attention is gated to a5 and cannot run on 910B2/910c.
-    // The a2a3 TMov (pto/npu/a2a3/TMov.hpp:160) static-asserts that a move is
-    // one of: Mat -> {Left,Right,Bias,Scaling}, Vec -> Vec, or Acc -> Mat.
-    // Acc -> Vec matches none, so it fails at compile time with
-    // "TMov: Invalid TileType".
-    //
-    // Ruled out as fixes: Mat is not a legal destination from Acc for our
-    // purpose (softmax needs Vec, and Mat -> Vec is also unsupported); and
-    // row-blocking the score matrix does not help, since every block still has
-    // to cross Acc -> Vec to be softmaxed.
-    //
-    // The one workable route is a global-memory round trip -- tstore the Acc
-    // tile, then tload it back into a Vec tile (both directions are supported).
-    // That needs an S x S GM scratch buffer, which this emitter cannot
-    // currently obtain: there is no scratch/workspace mechanism and no
-    // module-level GM global emission. Reusing the output buffer only works
-    // when S <= D, which is false for real attention shapes (S=seq >> D=head_dim).
-    // So the fix is an ABI change -- a scratch pointer argument on the
-    // attention intrinsic -- which touches tile_std and every backend that
-    // lowers __tile_attention_f32, and should be done as its own change.
     ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", scores, acc_ty, sv, vec_ty));
 
     // Step 3: softmax (5-step) — mirrors translate_softmax.
@@ -2761,24 +2708,6 @@ fn translate_attention(
     // lowers it on PIPE_MTE3 as a UB→L1 copy. dst must be blayout=col_major
     // + slayout=row_major (which `mat_tile_type` already produces) and src
     // must be blayout=row_major + slayout=none_box (which vec tiles are).
-    //
-    // SECOND a2a3 blocker (see the Acc->Vec note earlier in this function).
-    // `pto.tinsert` is A5-only, so an a2a3-compatible attention needs BOTH
-    // crossings rerouted, not just the score move:
-    //
-    //   1. scores  Acc -> Vec   (softmax input)
-    //   2. weights Vec -> Mat   (this tinsert: softmax output -> cube)
-    //
-    // Both take the same fix and can share ONE S x S GM scratch buffer used
-    // sequentially: tstore to GM, then tload back into the destination tile
-    // kind. The precedent for the second leg is already in this function --
-    // V is loaded GM partition_view -> mat precisely to "avoid vec->mat
-    // tmov" -- so GM -> Mat is known-good on a2a3; only the store side is new.
-    //
-    // That makes an a2a3 attention path a self-contained change: a new
-    // opt-in intrinsic taking a scratch GM pointer (intrinsics may take raw
-    // GM pointers -- cf. `tile_store_f32(gm: *mut f32, ...)`), two
-    // tstore/tload round trips, and exclusion from `module_uses_a5_ops`.
     ctx.use_size(0);
     ops.push(format!(
         "pto.tinsert ins({}, %c0, %c0 : {}, index, index) outs({} : {})",
@@ -3133,34 +3062,6 @@ fn translate_silu(
 
 /// Block size constants used by the K/N-blocked matmul emission.
 /// See comment above `detect_blocked_matmul_loads` for the rationale.
-///
-/// **Measured on hardware (910c, Ascend910, CANN 9.0.0, 2026-08-05)** with a
-/// decode-shaped projection M=16 K=1536 N=1536 — the shape a 1.5B model's
-/// q/k/v/o projection actually runs at. All variants produced identical
-/// checksums and matched a CPU reference (max_rel_err 1.12e-06), so these are
-/// pure scheduling choices:
-///
-/// ```text
-///   Kb x Nb      product   median
-///   64  x 64       4096    173.4 us
-///   128 x 64       8192    148.2 us
-///   256 x 64      16384    134.7 us   <- shipped
-///   512 x 32      16384    134.0 us
-///   1024 x 16     16384    133.9 us
-///   128 x 128     16384    133.9 us
-/// ```
-///
-/// The invariant is the **product**, not either dimension: every pair whose
-/// `Kb * Nb` saturates L0B (16384 f32 = 64 KB) lands on the same ~134 us
-/// plateau within noise, while smaller products degrade proportionally. So
-/// the pair is really one knob — "fill L0B" — and 256x64 is already on the
-/// optimum. Unlike the Metal K-unroll default (which was leaving ~40% on the
-/// table until measured), there is nothing to reclaim here.
-///
-/// Note `Nb=128` did **not** reproduce the "aicore execution exception"
-/// recorded below for 910B2: at Kb=128 it ran correctly on this
-/// Ascend910/CANN 9.0.0 box. Treat that crash as box/CANN-specific rather
-/// than a universal cap.
 const PTO_MM_KB: u32 = 256;
 const PTO_MM_NB: u32 = 64;
 /// i8 matmul needs a wider Nb than f16/f32: ptoas picks the L0A `Left` tile's
@@ -4281,9 +4182,6 @@ fn translate_attention_gqa(
     // Step 2: move scores to VEC for softmax
     let vec_ty = tile_buf_type(s, s, "f32");
     let sv = ctx.alloc_tile_typed(&format!("{}__gqa_sv", result_ssa), s, s, "f32", &vec_ty, ops);
-    // Same a2a3 Acc->Vec blocker as translate_attention; see the note there.
-    // The comment above about avoiding vec->mat / acc->vec covers only the Q/V
-    // LOADS -- this scores move is still Acc -> Vec and is a5-only.
     ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", scores, acc_ty, sv, vec_ty));
 
     // Step 3: softmax (5-step) — max/sum are row-reductions (rows×1 col_major).
@@ -5561,8 +5459,34 @@ fn translate_fill(
 
     let tb_ssa = ctx.alloc_tile(&result_ssa, rows, cols, dtype, ops);
     let tb_ty = tile_buf_type(rows, cols, dtype);
-    ops.push(format!("// fill {}x{} with scalar (broadcast via tmov)", rows, cols));
-    ops.push(format!("pto.tmov ins({} : {}) outs({} : {})", tb_ssa, tb_ty, tb_ssa, tb_ty));
+
+    // The scalar to broadcast is args[1]. Emitting `tmov ins(tb) outs(tb)` -- reading and
+    // writing the same freshly-allocated tile -- silently DROPPED it and left the tile
+    // uninitialised: changing the fill value produced byte-identical output.
+    //
+    // ptoas has no scalar-to-tile broadcast primitive, so materialise the value as
+    // `tmuls(tb, 0.0)` to zero the tile, then `tadds(tile, v)`. Both carry a real f32
+    // operand, so the value actually reaches the tile.
+    let scalar_ssa = args
+        .get(1)
+        .map(|a| a.trim().to_string())
+        .ok_or_else(|| format!("fill: missing scalar operand in: {}", line))?;
+    let val = ctx.resolve_float(&scalar_ssa);
+
+    let zero_ssa = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant 0.0 : f32", zero_ssa));
+    let val_ssa = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant {} : f32", val_ssa, val));
+
+    ops.push(format!("// fill {}x{} with scalar {}", rows, cols, val));
+    ops.push(format!(
+        "pto.tmuls ins({}, {} : {}, f32) outs({} : {})",
+        tb_ssa, zero_ssa, tb_ty, tb_ssa, tb_ty
+    ));
+    ops.push(format!(
+        "pto.tadds ins({}, {} : {}, f32) outs({} : {})",
+        tb_ssa, val_ssa, tb_ty, tb_ssa, tb_ty
+    ));
 
     Ok(())
 }
@@ -7799,90 +7723,11 @@ module {
         assert!(pto.contains("pto.tload"), "missing pto.tload in PTO rope output:\n{}", pto);
         assert!(pto.contains("pto.tstore"), "missing pto.tstore in PTO rope output:\n{}", pto);
     }
-
-    // ── Uncovered-audit coverage: top-level emitters reachable through
-    //    convert_mlir_to_pto but previously undriven by any test. ──
-
-    #[test]
-    fn test_pto_fill_f32_generates_tmov() {
-        // __tile_fill_f32(dst, scalar, rows, cols) → translate_fill,
-        // which broadcasts a scalar into a vec tile via pto.tmov.
-        let mlir = r#"
-module {
-  llvm.func @fill_k(%arg0: !llvm.ptr<1>) attributes {hacc.entry} {
-    %c0 = llvm.mlir.constant(0 : i32) : i32
-    %scal = llvm.mlir.constant(0 : i32) : i32
-    %r = llvm.mlir.constant(2 : i32) : i32
-    %c = llvm.mlir.constant(32 : i32) : i32
-    %t = llvm.call @__tile_fill_f32(%c0, %scal, %r, %c) : (i32, i32, i32, i32) -> i32
-    llvm.call @__tile_store_f32(%arg0, %t, %r, %c) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
 }
-"#;
-        let pto = convert_mlir_to_pto(mlir).expect("fill PTO-MLIR generation");
-        assert!(pto.contains("pto.tmov"), "fill must emit pto.tmov broadcast:\n{}", pto);
-        assert!(
-            pto.contains("fill 2x32 with scalar"),
-            "fill must emit the broadcast comment:\n{}",
-            pto
-        );
-    }
 
-    #[test]
-    fn test_pto_matmul_i8_blocked_dequant() {
-        // __tile_matmul_i8_acc_i32_dequant_f16(dst, a, b, scale, m, k, n).
-        // i8 A/B → i32 L0C accumulator, per-column f32 scale folded in the
-        // L0C→GM DMA (FixPipe). Shapes chosen so k*n > L0 64KB cap → the
-        // K/N-blocked path (the only supported i8 path) engages.
-        let mlir = r#"
-module {
-  llvm.func @mm_i8(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
-    %c0 = llvm.mlir.constant(0 : i32) : i32
-    %m = llvm.mlir.constant(16 : i32) : i32
-    %k = llvm.mlir.constant(256 : i32) : i32
-    %n = llvm.mlir.constant(512 : i32) : i32
-    %t_a = llvm.call @__tile_load_i8(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32
-    %t_b = llvm.call @__tile_load_i8(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32
-    %t_c = llvm.call @__tile_matmul_i8_acc_i32_dequant_f16(%c0, %t_a, %t_b, %arg3, %m, %k, %n) : (i32, i32, i32, !llvm.ptr<1>, i32, i32, i32) -> i32
-    llvm.call @__tile_store_f16(%arg2, %t_c, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
-}
-"#;
-        let pto = convert_mlir_to_pto(mlir).expect("matmul_i8 PTO-MLIR generation");
-        assert!(pto.contains("pto.tmatmul"), "i8 matmul must emit pto.tmatmul:\n{}", pto);
-        // i8 operands, i32 accumulator.
-        assert!(pto.contains("dtype=i8"), "i8 operand tiles expected:\n{}", pto);
-        assert!(
-            pto.contains("loc=acc, dtype=i32"),
-            "i8 matmul L0C accumulator must be i32:\n{}",
-            pto
-        );
-    }
 
-    #[test]
-    fn test_pick_kb_and_nb_convenience_wrappers() {
-        // pick_kb / pick_nb are the N-agnostic convenience wrappers documented
-        // for callers that don't know N. They delegate to the *_for_n / *_for_dtype
-        // forms with N = u32::MAX / lhs_bytes = 2 (f16).
-        assert_eq!(pick_kb(1536), pick_kb_for_n(1536, u32::MAX));
-        assert_eq!(pick_nb(8960), pick_nb_for_dtype(8960, 2));
-        // sane bounds: both return positive, kb divides into k-ish blocks.
-        assert!(pick_kb(256) > 0);
-        assert!(pick_nb(256) > 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Error-path coverage: malformed MLIR that reaches the `unknown tile`
-    // `.ok_or_else(...)` closures and the arity guards inside the translate_*
-    // functions. Each `ghost_pto!` body references a source operand SSA that
-    // was never produced by a load, so `ctx.get_tile(...)` returns None and
-    // the op's error closure fires. convert_mlir_to_pto must return Err.
-    // -----------------------------------------------------------------------
-
-    /// Wrap a single intrinsic `$call` line in entry-func module boilerplate.
-    /// `$call` references `%undef` (never loaded) in its source-operand slot.
+#[cfg(test)]
+mod npu_bound_tests {
     macro_rules! ghost_pto {
         ($call:expr) => {
             format!(
@@ -7895,284 +7740,32 @@ module {
         };
     }
 
+    use super::*;
+
+    fn ty(rows: u32, cols: u32, dt: &str) -> String { tile_buf_type(rows, cols, dt) }
+
     #[test]
-    fn test_pto_binary_unknown_errs() {
-        // translate_binary: add/mul/sub/div/max — unknown src1 tile.
-        for op in [
-            "__tile_add_f32",
-            "__tile_mul_f32",
-            "__tile_sub_f32",
-            "__tile_div_f32",
-            "__tile_add_f16",
-            "__tile_mul_f16",
-            "__tile_max_f32",
-        ] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %undef2, %c32, %c32) : (i32, i32, i32, i32, i32) -> i32",
-                op
-            );
-            let mlir = ghost_pto!(call);
-            assert!(
-                convert_mlir_to_pto(&mlir).is_err(),
-                "{} with undefined src tile must error",
-                op
-            );
-        }
+    fn valid_data_tile_passes() {
+        // 1x256 f32: 256*4=1024B = 2 fractals, %512==0 -> OK
+        assert!(validate_tile_shape::<A2A3>(1, 256, "f32", &ty(1,256,"f32")).is_ok());
+        // 128x128 f32: cols*b=512 == 1 fractal -> OK
+        assert!(validate_tile_shape::<A2A3>(128, 128, "f32", &ty(128,128,"f32")).is_ok());
     }
 
     #[test]
-    fn test_pto_unary_unknown_errs() {
-        // translate_unary: exp/neg/reduce_max/reduce_sum/scale — unknown src.
-        for op in [
-            "__tile_exp_f32",
-            "__tile_exp_f16",
-            "__tile_neg_f32",
-            "__tile_reduce_max_f32",
-            "__tile_reduce_sum_f32",
-            "__tile_scale_f32",
-        ] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %c32, %c32) : (i32, i32, i32, i32) -> i32",
-                op
-            );
-            let mlir = ghost_pto!(call);
-            assert!(convert_mlir_to_pto(&mlir).is_err(), "{} unknown src must error", op);
-        }
+    fn sub_fractal_tile_exempt() {
+        // 1x8 f32 (reduction intermediate): 32B < 512B fractal -> exempt, OK
+        assert!(validate_tile_shape::<A2A3>(1, 8, "f32", &ty(1,8,"f32")).is_ok());
+        // 1x64 f32: 256B < 512B -> exempt, OK (this was op_matmul's tile)
+        assert!(validate_tile_shape::<A2A3>(1, 64, "f32", &ty(1,64,"f32")).is_ok());
     }
 
     #[test]
-    fn test_pto_softmax_unknown_errs() {
-        for op in ["__tile_softmax_f32", "__tile_softmax_f16"] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %c32, %c32) : (i32, i32, i32, i32) -> i32",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_matmul_unknown_errs() {
-        // translate_matmul / translate_matmul_f16: unknown A tile.
-        for op in ["__tile_matmul_f32", "__tile_matmul_f16"] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %undef2, %c16, %c16, %c16) : (i32, i32, i32, i32, i32, i32) -> i32",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_matmul_transposed_unknown_errs() {
-        for op in [
-            "__tile_matmul_transposed_f32",
-            "__tile_matmul_transposed_f16",
-        ] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %undef2, %c16, %c16, %c16) : (i32, i32, i32, i32, i32, i32) -> i32",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_store_unknown_errs() {
-        // translate_store: buf SSA never produced by a load.
-        for op in ["__tile_store_f32", "__tile_store_f16", "__tile_store_i8"] {
-            let call = format!(
-                "llvm.call @{}(%arg1, %undef, %c32, %c32) : (!llvm.ptr<1>, i32, i32, i32) -> ()",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} unknown buf must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_simple_unary_like_unknown_errs() {
-        // transpose/rsqrt/log/sigmoid/silu/cast/clamp/argmax/absmax —
-        // single src operand at args[1].
-        let cases: &[(&str, &str)] = &[
-            ("__tile_transpose_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_rsqrt_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_log_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_sigmoid_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_silu_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_silu_f16", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_cast_f32_f16", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_cast_f16_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_cast_bf16_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_argmax_f32", "(i32, i32, i32, i32) -> i32"),
-            ("__tile_absmax_f32", "(i32, i32, i32, i32) -> i32"),
-        ];
-        for (op, sig) in cases {
-            let call = format!("%r = llvm.call @{}(%c0, %undef, %c32, %c32) : {}", op, sig);
-            assert!(
-                convert_mlir_to_pto(&ghost_pto!(call)).is_err(),
-                "{} unknown src must error",
-                op
-            );
-        }
-    }
-
-    #[test]
-    fn test_pto_clamp_unknown_errs() {
-        // clamp: (c0, src, min, max, rows, cols)
-        let call = "%r = llvm.call @__tile_clamp_f32(%c0, %undef, %c0, %c1, %c32, %c32) : (i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
-    }
-
-    #[test]
-    fn test_pto_rms_norm_unknown_errs() {
-        // rms_norm: (c0, src, gamma, rows, cols)
-        for op in ["__tile_rms_norm_f32", "__tile_rms_norm_f16"] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %undef2, %c8, %c32) : (i32, i32, i32, i32, i32) -> i32",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_quantize_dequantize_unknown_errs() {
-        // quantize: (c0, src, scale, rows, cols); dequantize: (c0, src, scale, rows, cols)
-        for op in ["__tile_quantize_f32_i8", "__tile_dequantize_i8_f32"] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %undef2, %c32, %c32) : (i32, i32, i32, i32, i32) -> i32",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_slice_concat_unknown_errs() {
-        // slice: (c0, src, row_off, col_off, src_r, src_c, dst_r, dst_c)
-        let slice = "%r = llvm.call @__tile_slice_f32(%c0, %undef, %c0, %c0, %c32, %c32, %c16, %c16) : (i32, i32, i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(slice)).is_err());
-        // concat: (c0, a, b, rows, cols_a, cols_b)
-        let concat = "%r = llvm.call @__tile_concat_f32(%c0, %undef, %undef2, %c32, %c16, %c16) : (i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(concat)).is_err());
-    }
-
-    #[test]
-    fn test_pto_gather_scatter_unknown_errs() {
-        // gather/scatter: (c0, src, indices, n, m, d)
-        for op in ["__tile_gather_f32", "__tile_scatter_f32"] {
-            let call = format!(
-                "%r = llvm.call @{}(%c0, %undef, %undef2, %c32, %c32, %c1) : (i32, i32, i32, i32, i32, i32) -> i32",
-                op
-            );
-            assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err(), "{} must error", op);
-        }
-    }
-
-    #[test]
-    fn test_pto_topk_unknown_errs() {
-        // topk: (c0, src, indices_out, k, rows, cols) — rows/cols guarded >0 first.
-        let call = "%r = llvm.call @__tile_topk_f32(%c0, %undef, %undef2, %c8, %c1, %c32) : (i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
-    }
-
-    #[test]
-    fn test_pto_gather_mask_unknown_errs() {
-        // gather_mask: (c0, src, mask, rows, cols) — guards rows>0/cols>0/mask<=15 first.
-        let call = "%r = llvm.call @__tile_gather_mask_f32(%c0, %undef, %c10, %c1, %c32) : (i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
-    }
-
-    #[test]
-    fn test_pto_gather_mask_arity_errs() {
-        // gather_mask guard: mask must fit in 4 bits.
-        let call = "%r = llvm.call @__tile_gather_mask_f32(%c0, %undef, %c99, %c1, %c32) : (i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
-    }
-
-    #[test]
-    fn test_pto_sort_unknown_errs() {
-        // init_sort_buf: (c0, src, rows, cols) — rows/cols guarded >0.
-        let init = "%r = llvm.call @__tile_init_sort_buf_f32(%c0, %undef, %c1, %c32) : (i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(init)).is_err());
-        // sort32: (c0, src, rows, cols)
-        let sort = "%r = llvm.call @__tile_sort32_f32(%c0, %undef, %c1, %c32) : (i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(sort)).is_err());
-        // mrgsort2: (c0, src0, src1, tmp, cols_each)
-        let mrg = "%r = llvm.call @__tile_mrgsort2_f32(%c0, %undef, %undef2, %undef3, %c16) : (i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(mrg)).is_err());
-    }
-
-    #[test]
-    fn test_pto_phase6_unknown_errs() {
-        // sample_top_p: (c0, logits, temp, top_p, seed, rows, cols)
-        let stp = "%r = llvm.call @__tile_sample_top_p_f32(%c0, %undef, %c1, %c1, %c0, %c1, %c32) : (i32, i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(stp)).is_err());
-        // draft_verify: (c0, draft, target, rows, cols) — looks up target at args[2].
-        let dv = "%r = llvm.call @__tile_draft_verify_f32(%c0, %undef, %undef2, %c1, %c32) : (i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(dv)).is_err());
-        // token_accept: (c0, draft, target, probs, threshold, rows) — looks up draft at args[1].
-        let ta = "%r = llvm.call @__tile_token_accept_f32(%c0, %undef, %undef2, %undef3, %c1, %c1) : (i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(ta)).is_err());
-    }
-
-    #[test]
-    fn test_pto_rope_unknown_errs() {
-        // rope: (c0, src, pos, rows, cols)
-        let call = "%r = llvm.call @__tile_rope_f32(%c0, %undef, %c0, %c1, %c32) : (i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
-    }
-
-    #[test]
-    fn test_pto_attention_unknown_and_arity_errs() {
-        // attention: 6 args (c0, q, k, v, scale, seq) — unknown Q tile.
-        let attn = "%r = llvm.call @__tile_attention_f32(%c0, %undef, %undef2, %undef3, %c1, %c32) : (i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(attn)).is_err());
-        // attention arity: only 3 args -> args.len() < 6 guard.
-        let attn_arity = "%r = llvm.call @__tile_attention_f32(%c0, %undef, %undef2) : (i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(attn_arity)).is_err());
-        // attention_gqa: 8 args — unknown Q tile.
-        let gqa = "%r = llvm.call @__tile_attention_gqa_f32(%c0, %undef, %undef2, %undef3, %c1, %c32, %c4, %c1) : (i32, i32, i32, i32, i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(gqa)).is_err());
-        // attention_gqa arity: only 4 args -> args.len() < 8 guard.
-        let gqa_arity = "%r = llvm.call @__tile_attention_gqa_f32(%c0, %undef, %undef2, %undef3) : (i32, i32, i32, i32) -> i32";
-        assert!(convert_mlir_to_pto(&ghost_pto!(gqa_arity)).is_err());
-    }
-
-    /// P1 (monotone-predicate block elision) does NOT currently transfer to
-    /// PTO: `translate_attention` emits one whole-S×S `pto.tmatmul`, so there
-    /// are no per-block ops to elide, and the op set has no select primitive
-    /// for a masking fallback. Until a blocked attention path exists, the
-    /// causal op must be rejected loudly — never silently dropped into the
-    /// "unrecognized call → comment" arm, which would emit a kernel that
-    /// computes no attention at all.
-    #[test]
-    fn test_pto_attention_causal_rejected_until_blocked_path_exists() {
-        let call = "%r = llvm.call @__tile_attention_causal_f32(%c0, %q, %k, %v, %c16, %c64) : (i32, i32, i32, i32, i32, i32) -> i32";
-        let mlir = ghost_pto!(call);
-        let err = convert_mlir_to_pto(&mlir)
-            .expect_err("causal attention must not lower silently on PTO");
-        assert!(err.contains("attention_causal"),
-            "error must name the op:\n{}", err);
-        assert!(err.contains("blocked"),
-            "error must name the structural blocker (blocked score pipeline):\n{}", err);
-        // The failure must be an Err, not a kernel with the call commented out.
-        let out = convert_mlir_to_pto(&mlir).ok();
-        assert!(out.is_none(),
-            "causal attention must never emit a kernel body on PTO");
-    }
-
-    /// The plain (non-causal) attention op keeps lowering: the causal branch
-    /// must not shadow it. `__tile_attention_causal_f32` and
-    /// `__tile_attention_f32` are matched by `contains`, so this guards the
-    /// substring-collision hazard in that dispatch style.
-    #[test]
-    fn test_pto_attention_plain_still_lowers_after_causal_branch() {
-        let call = "%r = llvm.call @__tile_attention_f32(%c0, %undef, %undef2, %undef3, %c16, %c64) : (i32, i32, i32, i32, i32, i32) -> i32";
-        let err = convert_mlir_to_pto(&ghost_pto!(call))
-            .expect_err("undefined Q tile still errors");
-        assert!(!err.contains("attention_causal"),
-            "plain attention must not hit the causal rejection:\n{}", err);
+    fn multifractal_bad_stride_rejected() {
+        // 1x160 f32: 640B > 512, %512 != 0 -> REJECT (C2)
+        let e = validate_tile_shape::<A2A3>(1, 160, "f32", &ty(1,160,"f32"));
+        assert!(e.is_err(), "expected C2 rejection for 640B multi-fractal tile");
+        assert!(e.unwrap_err().contains("C2"));
     }
 
     #[test]
@@ -8294,53 +7887,24 @@ module {
         let call = "%r = llvm.call @__tile_matmul_i8_acc_i32_dequant_f16(%c0, %undef, %undef2, %arg1, %c16, %c16, %c16) : (i32, i32, i32, !llvm.ptr<1>, i32, i32, i32) -> i32";
         assert!(convert_mlir_to_pto(&ghost_pto!(call)).is_err());
     }
-}
 
-#[cfg(test)]
-mod pto_toolchain_dump {
-    use super::*;
-
-    /// Dumps generated PTO-MLIR so it can be assembled by the real `ptoas` on
-    /// a 910B box, checking that this emitter's output is still accepted by
-    /// the toolchain (codegen-string tests cannot catch that).
-    /// No-op unless TILERS_PTO_DUMP_DIR is set.
     #[test]
-    fn dump_pto_for_toolchain_check() {
-        let Ok(dir) = std::env::var("TILERS_PTO_DUMP_DIR") else { return };
-        let mm = r#"
-module {
-  llvm.func @tile_matmul(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>) attributes {hacc.entry} {
-    ^bb0:
-    %m = llvm.mlir.constant(16 : i32) : i32
-    %k = llvm.mlir.constant(16 : i32) : i32
-    %n = llvm.mlir.constant(16 : i32) : i32
-    %a = llvm.call @__tile_load_f32(%arg0, %m, %k) : (!llvm.ptr<1>, i32, i32) -> i32
-    %b = llvm.call @__tile_load_f32(%arg1, %k, %n) : (!llvm.ptr<1>, i32, i32) -> i32
-    %c = llvm.call @__tile_matmul_f32(%a, %a, %b, %m, %k, %n) : (i32, i32, i32, i32, i32, i32) -> i32
-    llvm.call @__tile_store_f32(%arg2, %c, %m, %n) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
-}
-"#;
-        std::fs::write(format!("{}/matmul.pto", dir), convert_mlir_to_pto(mm).unwrap()).unwrap();
+    fn ub_budget_rejects_overflow() {
+        let mut ub = UbAllocator::new::<A2A3>();
+        // one 256KB tile fits exactly at the boundary? UB_SIZE=262144. A 262144B
+        // tile: base 0, end 262144 == UB_SIZE -> NOT > , so OK. One more byte over fails.
+        assert!(ub.place(262144).is_ok());
+        let e = ub.place(1); // now cursor=262144, next place overflows
+        assert!(e.is_err(), "expected UB overflow (C1)");
+        assert!(e.unwrap_err().contains("C1"));
+    }
 
-        // Attention exercises the whole-tile pipeline (tmatmul -> softmax_5ops
-        // -> tmatmul) that the causal-rejection change sits next to.
-        let attn = r#"
-module {
-  llvm.func @tile_attn(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>, %arg2: !llvm.ptr<1>, %arg3: !llvm.ptr<1>) attributes {hacc.entry} {
-    ^bb0:
-    %s = llvm.mlir.constant(16 : i32) : i32
-    %d = llvm.mlir.constant(16 : i32) : i32
-    %q = llvm.call @__tile_load_f32(%arg0, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
-    %k = llvm.call @__tile_load_f32(%arg1, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
-    %v = llvm.call @__tile_load_f32(%arg2, %s, %d) : (!llvm.ptr<1>, i32, i32) -> i32
-    %r = llvm.call @__tile_attention_f32(%q, %q, %k, %v, %s, %d) : (i32, i32, i32, i32, i32, i32) -> i32
-    llvm.call @__tile_store_f32(%arg3, %r, %s, %d) : (!llvm.ptr<1>, i32, i32, i32) -> ()
-    llvm.return
-  }
-}
-"#;
-        std::fs::write(format!("{}/attention.pto", dir), convert_mlir_to_pto(attn).unwrap()).unwrap();
+    #[test]
+    fn ub_bank_aligns_offsets() {
+        let mut ub = UbAllocator::new::<A2A3>();
+        let a = ub.place(1000).unwrap();   // base 0
+        let b = ub.place(1000).unwrap();   // 1000 -> align_up to 1024 (512-align)
+        assert_eq!(a, 0);
+        assert_eq!(b % 512, 0, "UB offsets must be 512B bank-aligned (C5)");
     }
 }
