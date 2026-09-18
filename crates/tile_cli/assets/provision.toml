@@ -1,0 +1,115 @@
+# The provisioning manifest. Pinned data, checked into the repo, reviewed like code.
+#
+# Every entry is (id, version, os, arch) -> a URL and a sha256. Nothing is fetched that
+# is not named here, and nothing is installed whose bytes do not match. The transport is
+# not trusted; the hash is.
+#
+# `barrier` marks a tool tile-rs will NOT install for you, and says why in one word. A
+# vendor SDK behind a EULA, a login, or a root install cannot be silently acquired --
+# legally or practically -- so the tool refuses with the exact command instead of
+# pretending. That is what "never leave users hunting for setup docs" actually requires;
+# claiming otherwise would be a lie the tool cannot keep.
+
+[[tool]]
+id = "rustc_codegen_tile"
+version = "0.0.2+nightly-2025-08-04"
+os = "macos"
+arch = "aarch64"
+url = "https://github.com/yijunyu/tile-rs/releases/download/v0.0.2%2Bnightly-2025-08-04/tile-rs-codegen-aarch64-apple-darwin.tar.gz"
+sha256 = "70fffed473aa2d5c3f51bcc04caf9d18e0379188e764689ed52be0c373926891"
+unpack = "tar.gz"
+strip = "1"
+note = "The version encodes the nightly the backend is ABI-pinned to: it dlopens rustc internals and does not load into another. sha256 from the published release digest."
+
+# 0.0.2 exists because 0.0.1 could not read a standard rustc rlib -- backlog #025, fixed
+# in the private codegen tree 4c9e43f68 + a1d1014ba. The PATCH digit moved, not the nightly: the ABI
+# pin is unchanged (both link @rpath/librustc_driver-4fe7264953f0c736.dylib), and the
+# version string still says which nightly this loads into. It had to move at all because
+# `installed()` keys the cache on <id>/<version>, so reusing "0.0.1+..." would leave
+# everyone who already has the backend on the broken one, forever, with no way to notice.
+
+# There is deliberately NO entry for any other platform. `gh release list` shows one
+# release with one asset -- aarch64-apple-darwin -- so a linux entry would be a URL that
+# 404s, and a manifest that points at nothing is worse than a manifest that says nothing.
+# Asked for a Linux backend, the tool answers "no manifest entry for rustc_codegen_tile
+# on linux/x86_64", which is true, rather than failing mid-download.
+
+# uv, so `-r` can reach a PyTorch reference on a machine that has neither.
+#
+# Pinned and verified like everything else rather than `curl -LsSf https://astral.sh/uv/
+# install.sh | sh`: that pipe is unverified, runs whatever the server sends, and installs
+# wherever it likes. These are the same release artifacts that installer fetches, with the
+# digests astral publishes, unpacked into the user's own prefix.
+#
+# A pinned version goes stale, and that is the trade: stale-and-verified beats
+# latest-and-unchecked. Bump it deliberately, with the digest.
+
+[[tool]]
+id = "uv"
+version = "0.12.8"
+os = "macos"
+arch = "aarch64"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.8/uv-aarch64-apple-darwin.tar.gz"
+sha256 = "8ce083658dbff20143607ca7af8e0c1d64b6fd7bf03a5cdcb62bf3d47d991b5f"
+unpack = "tar.gz"
+strip = "1"
+
+[[tool]]
+id = "uv"
+version = "0.12.8"
+os = "macos"
+arch = "x86_64"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.8/uv-x86_64-apple-darwin.tar.gz"
+sha256 = "bfcd4407de99e0a2c1904df0902fa1795653d4edd145358e6561527e746a4f16"
+unpack = "tar.gz"
+strip = "1"
+
+[[tool]]
+id = "uv"
+version = "0.12.8"
+os = "linux"
+arch = "x86_64"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.8/uv-x86_64-unknown-linux-gnu.tar.gz"
+sha256 = "2e2b37e9811e17675a9e70bed5e1a58fc8c0388be63d751d72cc735188c149ff"
+unpack = "tar.gz"
+strip = "1"
+
+[[tool]]
+id = "uv"
+version = "0.12.8"
+os = "linux"
+arch = "aarch64"
+url = "https://github.com/astral-sh/uv/releases/download/0.12.8/uv-aarch64-unknown-linux-gnu.tar.gz"
+sha256 = "ba8661f4fd207c8e94814191598e619b355ac10d5014e851e21eb800f9ef2b00"
+unpack = "tar.gz"
+strip = "1"
+
+[[tool]]
+id = "cann"
+version = "8.0"
+os = "linux"
+arch = "aarch64"
+url = "https://www.hiascend.com/developer/download/community/result"
+sha256 = ""
+barrier = "vendor-login"
+remedy = "download the CANN toolkit from hiascend.com and run its installer, then set ASCEND_TOOLKIT_HOME"
+
+[[tool]]
+id = "cuda"
+version = "12.4"
+os = "linux"
+arch = "x86_64"
+url = "https://developer.nvidia.com/cuda-downloads"
+sha256 = ""
+barrier = "eula"
+remedy = "install the CUDA toolkit from developer.nvidia.com (its licence must be accepted by a person)"
+
+[[tool]]
+id = "xcode-clt"
+version = "any"
+os = "macos"
+arch = "aarch64"
+url = "https://developer.apple.com/xcode/"
+sha256 = ""
+barrier = "os-level"
+remedy = "xcode-select --install"

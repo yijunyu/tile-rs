@@ -1,0 +1,83 @@
+name: toolchain-drift
+
+# Guards the #![no_core] `tile_std` surface against silent toolchain drift.
+#
+# tile_std hooks directly into compiler internals (lang items, rustc_* attributes,
+# intrinsics), so it is sensitive to the exact nightly. Two invariants must hold and
+# are easy to break without noticing:
+#
+#   1. tile_std still BUILDS on the pinned nightly. `cargo build` (not check) exercises
+#      the tile codegen backend that overrides tile_std's `rustc_intrinsic`s — the stock
+#      backend cannot, so only the pinned toolchain can build it. A port that fixes a
+#      newer nightly must not regress the pin (this job is exactly the regression that
+#      motivated the two-way-compatible cfg gating in build.rs).
+#
+#   2. tile_std still CHECKS on a current nightly. `cargo check` needs no codegen backend,
+#      so it validates that the forward-compat `#[cfg]` branches (build.rs commit-date
+#      gates for the renamed attribute + safe/const float intrinsics) still hold as new
+#      nightlies land. This is a check, not a build: a real build needs the LLVM-pinned
+#      MIR->MLIR codegen backend, which is out of this repo's scope.
+#
+# If either fails, the pin or the port has drifted and needs attention before merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so forward-compat breakage from new nightlies surfaces even without a push.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  pinned-build:
+    name: tile_std builds on the pinned nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pin toolchain (matches rust-toolchain.toml)
+        run: |
+          cat > rust-toolchain.toml << 'TOML'
+          [toolchain]
+          channel = "nightly-2025-08-04"
+          components = ["rustc-dev", "rust-src", "llvm-tools"]
+          TOML
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't force `-D warnings`: tile_std legitimately enables the
+          # incomplete `generic_const_exprs` feature, which always warns.
+          rustflags: ""
+
+      - name: Build tile_std on the pinned nightly
+        run: cargo build -p tile_std
+
+  current-check:
+    name: tile_std checks on a current nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use latest nightly
+        run: |
+          cat > rust-toolchain.toml << 'TOML'
+          [toolchain]
+          channel = "nightly"
+          components = ["rustc-dev", "rust-src", "llvm-tools"]
+          TOML
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't force `-D warnings`: tile_std legitimately enables the
+          # incomplete `generic_const_exprs` feature, which always warns.
+          rustflags: ""
+
+      - name: Check tile_std on the current nightly
+        # tile_std is forward-compatible: its build.rs commit-date cfg gates keep
+        # the #![no_core] surface checking across the whole supported nightly range
+        # (pinned 2025-08-04 through current). A failure here is real drift from a
+        # new nightly and must be ported (add a dated cfg gate), so this is a hard
+        # gate, not report-only.
+        run: cargo check -p tile_std

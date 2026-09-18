@@ -1,0 +1,13 @@
+[package]
+name = "tile_std_macros"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0.38"
+syn = { version = "2.0.96", features = ["full"] }
+proc-macro2 = "1.0.93"

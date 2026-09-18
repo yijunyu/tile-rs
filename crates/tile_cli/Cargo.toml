@@ -1,0 +1,69 @@
+[package]
+name = "tile_cli"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "tile — the tile-rs kernel swissknife: identify, profile, lower, lift and optimize accelerator kernels across 16 backends from one command."
+
+# Standalone workspace, like crates/tile_codegen and crates/tile_spec. Two reasons,
+# and the second one is the load-bearing one:
+#
+#  1. `cargo build` at the repo root builds `tile_std`, which is `#![no_core]` and
+#     declares intrinsics only the out-of-tree MIR->MLIR backend satisfies. A root
+#     member would make the root build the wrong command for building this CLI.
+#  2. The root `rust-toolchain.toml` pins nightly-2025-08-04 DELIBERATELY (the codegen
+#     backend links that exact rustc/LLVM). rustup resolves that file by walking UP
+#     from the cwd, so it reaches every subdirectory — excluded crates included. The
+#     sibling `rust-toolchain.toml` in THIS directory is what pins the CLI to stable,
+#     which is what lets one binary build for six target triples.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tile"
+path = "src/bin/tile.rs"
+
+# ── Dependency budget ─────────────────────────────────────────────────────────
+# The whole repo's graph is 18 crates, and tile_spec hand-rolled a Gherkin parser
+# rather than take one dependency. The default binary keeps that discipline: argv is
+# parsed by hand (the grammar is small and frozen), and the only dependency is the
+# open, std-only, zero-dependency codegen skeleton. Later milestones add features —
+# `stats` (sealed corpus reader), `net` (provisioning), `daemon`, `ui` — and each
+# carries its own deps so nobody who wants `tile k.mlir -o k.metal` pays for them.
+[dependencies]
+tile_codegen = { path = "../tile_codegen" }
+
+# `stats` only. Both are pure Rust -- verified: the resulting graph contains no crate
+# that runs a C or C++ compiler, which is the gate CI enforces for requirement (3). This
+# is also why the knowledge corpus is NOT SQLite: rusqlite would fail that gate on day
+# one, and adding encryption on top (sqlcipher) makes it worse.
+chacha20poly1305 = { version = "0.11", optional = true }
+ed25519-dalek = { version = "2", optional = true, default-features = false }
+
+[dev-dependencies]
+# The executable-spec harness reuses tile_spec's std-only Gherkin runner rather than
+# growing a second one.
+tile_spec = { path = "../tile_spec" }
+
+[features]
+# `emitters` is ON by default: without it `tile` can identify and profile a kernel but
+# cannot convert one, which is most of the point. It costs ~2.5 MB of included emitter
+# source (mlir_to_msl.rs alone is 1.0 MB) and no dependencies at all -- the emitters are
+# pure string transforms with no LLVM.
+#
+# `--no-default-features` is not a curiosity: it is the build a release without the
+# emitters would be, and CI builds it so the "not compiled into this build" path (exit 4,
+# distinct from "nobody wrote it") is exercised rather than assumed.
+default = ["emitters"]
+emitters = []
+# The licensed knowledge corpus and the license token. Off by default: nobody who wants
+# `tile k.mlir -o k.metal` should pay for an AEAD and a signature scheme.
+stats = ["dep:chacha20poly1305", "dep:ed25519-dalek"]
+# The 16th target. Its emitter lives in the sibling `tile-rs-pico` checkout, takes the
+# uniform `convert_mlir_to_*` signature and imports nothing but std, so wiring it in is
+# one `#[path]` include. Off by default because that checkout is not part of this tree --
+# without it `tile -t pico` refuses with "not compiled into this build", which is the
+# right answer rather than a build error.
+pico = []

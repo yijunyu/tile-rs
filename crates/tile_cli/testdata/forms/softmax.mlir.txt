@@ -1,0 +1,8 @@
+// tile-rs debug target
+// 9 MLIR lines, 1 func.func op(s)
+module {
+  func.func @softmax(%arg0: tensor<1024xf32>) -> tensor<1024xf32> {
+    %0 = math.exp %arg0 : tensor<1024xf32>
+    return %0 : tensor<1024xf32>
+  }
+}

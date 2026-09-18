@@ -1,0 +1,20 @@
+[package]
+name = "tile_spec"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "tile-rs executable Gherkin (Given/When/Then) spec layer: .feature use cases mapped 1:1 to step definitions that drive the open CodegenTarget trait + registry and the 14 open MLIR->source emitters. Std-only, zero external deps (offline-vendored-registry friendly)."
+
+# Standalone workspace, like crates/tile_codegen: this open crate is `exclude`d
+# from the repo-root workspace so `cd crates/tile_spec && cargo test` (and the
+# coverage harness) resolve against THIS manifest. The .feature steps
+# `#[path]`-include the real emitter sources from rustc_codegen_tile with NO
+# LLVM dep — exactly like the generality-matrix tests.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# Drives the open trait + registry directly in the spec steps.
+tile_codegen = { path = "../tile_codegen" }

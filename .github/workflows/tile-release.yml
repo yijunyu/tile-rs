@@ -1,0 +1,136 @@
+# Release the `tile` binary.
+#
+# Deliberately separate from `codegen-release.yml`, and tagged differently. That
+# workflow's tags encode the nightly the codegen backend is ABI-pinned to
+# (`v0.0.1+nightly-2025-08-04`) because a `.so` built against one rustc does not load into
+# another. `tile` has no such pin -- it builds on stable and links nothing -- so inheriting
+# that scheme would tell users a version number means something it does not.
+#
+# NOTE: `scripts/install.sh` is deployed from the private repo (see its header) and is not
+# edited here. Teaching it to install `tile` belongs in that repo; this workflow publishes
+# the assets it would fetch.
+name: tile-release
+
+on:
+  push:
+    tags: ["tile-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, e.g. 0.1.0 (tag becomes tile-v<version>)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a pre-release"
+        required: false
+        type: boolean
+        default: true
+
+defaults:
+  run:
+    working-directory: crates/tile_cli
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,     target: aarch64-apple-darwin }
+          - { os: macos-13,     target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+
+      # A release binary carries every feature: the corpus reader and the license
+      # verifier are what a licence holder is buying, and a release that silently lacked
+      # them would report "this build has no corpus support" to someone who paid.
+      - name: build
+        run: cargo build --locked --release --features stats --target ${{ matrix.target }}
+
+      - name: test what is being shipped
+        run: cargo test --locked --release --features stats --target ${{ matrix.target }}
+
+      # It has to actually run on the machine it was built for. A binary that builds and
+      # does not start is the failure a release workflow exists to catch.
+      - name: the binary runs
+        run: |
+          set -e
+          BIN=target/${{ matrix.target }}/release/tile
+          "$BIN" --version
+          "$BIN" doctor
+          "$BIN" --list-forms > /dev/null
+          "$BIN" testdata/forms/softmax.mlir -t msl -o /tmp/release-check.metal
+          grep -q "kernel void" /tmp/release-check.metal
+
+      # `pto_to_ascendc` ships as a prebuilt binary only — its source lives outside this
+      # public tree (vendor/pto_to_ascendc/ holds one executable per release triple).
+      # Prove the right one is present and starts before it is packed; a wrong-arch blob
+      # would otherwise ship as a silent ENOEXEC on the user's machine.
+      - name: the bundled pto_to_ascendc runs
+        run: |
+          set -e
+          P2A=../../vendor/pto_to_ascendc/pto_to_ascendc-${{ matrix.target }}
+          test -x "$P2A"
+          # No args prints usage and exits 2; that is a successful start.
+          "$P2A" >/tmp/p2a.out 2>&1 && rc=0 || rc=$?
+          grep -q 'usage: pto_to_ascendc' /tmp/p2a.out
+          test "$rc" -eq 2
+
+      - name: package
+        run: |
+          set -e
+          # Copy while still in crates/tile_cli (../../vendor = repo root), then pack
+          # from the release dir. Path depth after `cd target/<triple>/release` would
+          # be five levels up — easy to get wrong and only fails on the runner.
+          cp ../../vendor/pto_to_ascendc/pto_to_ascendc-${{ matrix.target }} \
+             target/${{ matrix.target }}/release/pto_to_ascendc
+          cd target/${{ matrix.target }}/release
+          tar czf tile-${{ matrix.target }}.tar.gz tile pto_to_ascendc
+          # The same checksum discipline the provisioner enforces on what it downloads.
+          shasum -a 256 tile-${{ matrix.target }}.tar.gz > tile-${{ matrix.target }}.tar.gz.sha256
+          cat tile-${{ matrix.target }}.tar.gz.sha256
+          tar tzf tile-${{ matrix.target }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tile-${{ matrix.target }}
+          path: |
+            crates/tile_cli/target/${{ matrix.target }}/release/tile-${{ matrix.target }}.tar.gz
+            crates/tile_cli/target/${{ matrix.target }}/release/tile-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: collect the checksums into one file
+        run: |
+          set -e
+          find dist -name '*.sha256' -exec cat {} + | sort -k2 > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.tar.gz
+            dist/SHA256SUMS
+          prerelease: ${{ inputs.prerelease || true }}
+          body: |
+            `tile` — the tile-rs kernel swissknife.
+
+            Versioned independently of the codegen backend: this binary builds on stable
+            and links nothing, so it carries no nightly pin.
+
+            Verify what you downloaded against `SHA256SUMS` before unpacking — the same
+            discipline `tile install` applies to everything it fetches.

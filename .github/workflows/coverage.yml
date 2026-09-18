@@ -1,0 +1,51 @@
+name: coverage
+
+# Framework CI for the open tile-rs surface: no CANN/Ascend toolchain — just the
+# no-toolchain codegen + spec crates and the cargo-llvm-cov coverage gate.
+# (The Ascend build / compiletest / NPU jobs live in the ascend-rs repo's ci.yml.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Slim rust-toolchain.toml for CI
+        run: |
+          cat > rust-toolchain.toml << 'TOML'
+          [toolchain]
+          channel = "nightly-2025-08-04"
+          components = ["rustc", "cargo", "llvm-tools"]
+          TOML
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run coverage gate (open, no-toolchain surface)
+        # Ratchet set BELOW the achieved GATED total, ~2 points of headroom.
+        #
+        # The 216 canned per-kernel emitters now live in mlir_to_msl_canned.rs and
+        # are measured and printed but NOT gated (UNGATED_FILES in
+        # scripts/coverage.sh). They are straight-line `writeln!` bodies that run
+        # only when one specific MLIR shape reaches them, so they sit at ~45%.
+        #
+        # This supersedes holding out the WHOLE of mlir_to_msl.rs: with the canned
+        # tail in its own file, mlir_to_msl.rs's real dispatch logic (61.7%) is
+        # gated on its own merits instead of being excluded with it. The gated
+        # surface therefore grew from 31,160 to 48,094 lines -- more code measured,
+        # not less -- and the total is a truthful 80.00% rather than a 89.93% that
+        # quietly omitted 35k lines.
+        #
+        # 78 keeps the usual ~2 points of headroom. Covering the canned emitters is
+        # the remaining work; their row prints every run. See
+        # docs/TILE_RS_COVERAGE.md.
+        run: bash scripts/coverage.sh --gate 78

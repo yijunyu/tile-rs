@@ -1,0 +1,207 @@
+# Scenarios that are LIVE — implemented, and required to be green.
+# Everything else carries @planned. A milestone's change moves lines INTO this file.
+# Format: <feature file>::<scenario name>
+
+01_form_detection.feature::content magic disambiguates a shared extension
+01_form_detection.feature::.rs is reserved for tile-rs unconditionally
+01_form_detection.feature::an unrecognisable file is refused with the candidate forms named
+01_form_detection.feature::-f overrides both magic and extension
+01_form_detection.feature::a form claimed by -f that contradicts strong magic is warned about, not silently accepted
+
+02_transform_dispatch.feature::the reader/writer matrix is one command away
+02_transform_dispatch.feature::same-form optimization names the missing reader, in the right tense
+02_transform_dispatch.feature::a target absent from THIS build is a different answer from one nobody wrote
+02_transform_dispatch.feature::same-form optimization exists only for the forms tile-rs owns
+02_transform_dispatch.feature::a lift does not silently compose into a lowering route
+02_transform_dispatch.feature::the composed route runs when it is named explicitly
+02_transform_dispatch.feature::with no reader for the input form, a lift says which work is missing
+02_transform_dispatch.feature::every route reports a fidelity class, and says where it was measured
+
+04_profile_and_optimize.feature::-i and -o together are a usage error, not a silent precedence rule
+04_profile_and_optimize.feature::bare -O means -O2
+04_profile_and_optimize.feature::an unmeasured architecture makes the profile refuse, not guess
+04_profile_and_optimize.feature::the 950 SKUs refuse bounds and invent no core count
+04_profile_and_optimize.feature::a target with genuinely no such limit answers Ok rather than refusing
+04_profile_and_optimize.feature::the profile surfaces the hazard model
+
+05_platform_and_targets.feature::the default output target follows the detected accelerator
+05_platform_and_targets.feature::an AMD GPU is not an AMD NPU
+
+10_portability_and_grammar.feature::cfg gates are confined to the platform module
+10_portability_and_grammar.feature::the documented options are accepted with both spellings
+10_portability_and_grammar.feature::-v is version and -V is verbose, as specified
+10_portability_and_grammar.feature::--help documents every option, its default, and its exit codes
+10_portability_and_grammar.feature::exit codes are grouped by remedy, not by subsystem
+10_portability_and_grammar.feature::exit 3 never claims that something is impossible
+10_portability_and_grammar.feature::no C or C++ is compiled to build the tool
+
+11_io_edges.feature::stdin with no -f is a usage error, because there is no name to sniff from
+11_io_edges.feature::several inputs with a single -o is a usage error
+11_io_edges.feature::a form that exists but is not compiled into this build says so
+
+# M2 — the emitters are wired in, so the program's own behaviour is checkable
+11_io_edges.feature::"-o -" writes the result to stdout and nothing else does
+11_io_edges.feature::an empty input is refused, matching the emitters' own contract
+11_io_edges.feature::a non-UTF8 input is refused before sniffing
+11_io_edges.feature::an output directory that does not exist is an error, not a silent mkdir
+
+# M3 — the optimize hop is a real step, so intermediates are real
+02_transform_dispatch.feature::identical forms mean optimization, not a copy
+03_intermediates.feature::intermediates are removed by default
+03_intermediates.feature::-k keeps every hop, named by step index and form
+03_intermediates.feature::the optimize hop is a step on the route, not a claim in a report
+03_intermediates.feature::-O0 has no optimize hop to keep
+
+# M4 — provisioning: verified, user-scoped, refusing what it cannot honestly do
+06_toolchains.feature::a pinned artifact is fetched, verified and installed without prompting
+06_toolchains.feature::acquiring the same toolchain twice does nothing the second time
+06_toolchains.feature::a corrupted download is rejected before it is unpacked
+06_toolchains.feature::only the toolchain the route needs is installed
+06_toolchains.feature::installs are user-scoped and never touch the system
+06_toolchains.feature::a toolchain that cannot be automated is refused with the exact remedy
+06_toolchains.feature::what this platform can be given is one command away
+06_toolchains.feature::--no-install turns acquisition into a diagnosis
+06_toolchains.feature::--offline refuses a network URL but still reads a local one
+
+# M8 — MCP over stdio: the same core, a second rendering
+08_daemon_and_mcp.feature::the daemon exposes the CLI's verbs as MCP tools
+08_daemon_and_mcp.feature::an MCP conversion and the equivalent CLI invocation agree
+08_daemon_and_mcp.feature::in stdio mode all logging goes to stderr
+08_daemon_and_mcp.feature::agent-initiated work is bounded
+08_daemon_and_mcp.feature::the daemon never binds TCP without an explicit token
+08_daemon_and_mcp.feature::stdio is the default transport and needs no token
+
+# M5 — two stores, one storage layer; the gate is on delivery, not on the file
+07_stats_and_license.feature::an unassessed headroom is displayed as unassessed, never as zero
+07_stats_and_license.feature::without a license, -s still works on local attempts and explains the gap
+07_stats_and_license.feature::a missing license degrades a feature but never blocks the conversion
+07_stats_and_license.feature::the corpus is unreadable without the key, not merely unlisted
+07_stats_and_license.feature::a license is verified offline against an embedded public key
+07_stats_and_license.feature::license status with no key installed is not a failure
+07_stats_and_license.feature::an invalid license is rejected with the reason
+07_stats_and_license.feature::a forged token is never reported as merely expired
+07_stats_and_license.feature::writes to the local store are never license-gated
+07_stats_and_license.feature::the tool never fabricates a measurement to fill a column
+07_stats_and_license.feature::every stats report states how old the corpus is
+07_stats_and_license.feature::the corpus is read by a pure-Rust reader, not a database binding
+
+# M7 — the MLIR-to-MLIR rewrite layer
+04_profile_and_optimize.feature::each -O level runs the passes it is permitted and no others
+04_profile_and_optimize.feature::a level names what it does not do, and why
+04_profile_and_optimize.feature::the rewrite layer parses and prints without changing a byte
+04_profile_and_optimize.feature::a pass that separated a fusion pair reverts to the input
+04_profile_and_optimize.feature::-O2 refuses a tiling the target cannot hold
+04_profile_and_optimize.feature::-O2 refuses to judge a tiling on an unmeasured architecture
+04_profile_and_optimize.feature::-O3 without the target's compiler degrades rather than failing
+
+# M10a — the UI server, and M9a — the engine mapping
+09_ui.feature::-u serves the view on loopback and prints its address
+09_ui.feature::the listener binds loopback and nothing else
+09_ui.feature::the page needs nothing from the network
+09_ui.feature::kernel source cannot inject markup into the page
+09_ui.feature::the UI is a view over the core, not a second implementation
+09_ui.feature::a headless host prints the address rather than failing
+08_daemon_and_mcp.feature::-m selects the engine matching the detected accelerator
+08_daemon_and_mcp.feature::an engine that is not on the machine names everywhere it looked
+08_daemon_and_mcp.feature::a failure to provision a model never costs the kernel tools
+08_daemon_and_mcp.feature::the engine follows the accelerator family
+08_daemon_and_mcp.feature::-m outside daemon mode is a usage error
+
+# M6 — .rs inputs, through the real codegen backend
+06_toolchains.feature::a set RUSTFLAGS is refused, because it would silently disable the backend
+06_toolchains.feature::the codegen path is translated from the form id, not passed through
+
+# -r/--run: the harness, the references, and the measurements
+12_run.feature::a speedup is never reported without both measurements
+12_run.feature::a reported speedup names what it is measured against
+12_run.feature::every timing carries its sample count and its spread
+12_run.feature::the reference does not allocate inside the timed region
+12_run.feature::the kernel, the reference and torch all see the same input
+12_run.feature::a kernel whose operation has no reference is refused, not run
+12_run.feature::a kernel using two referenceable operations is refused rather than guessed at
+12_run.feature::without torch the weaker comparison is still made, and labelled
+12_run.feature::three sources attribute a disagreement to the right side
+12_run.feature::a kernel that matches nothing is not called an inherited error
+12_run.feature::two sources cannot make the attribution three sources can
+12_run.feature::a relative error near zero does not dominate the accuracy figure
+12_run.feature::a non-finite mismatch is counted, not averaged away
+12_run.feature::--run and --info-only together are a usage error
+12_run.feature::--run and --cross together are a usage error
+12_run.feature::a target with no harness says so rather than pretending
+12_run.feature::uv is pinned in the manifest rather than piped from a shell
+12_run.feature::the torch path needs no second command from the user
+
+# The backlog: what tile could not do, and the rule for when to stop patching
+13_backlog.feature::an entry survives being written and read back
+13_backlog.feature::an entry with no workaround says so rather than leaving a blank
+13_backlog.feature::each entry is its own file, so two sessions do not conflict
+13_backlog.feature::a handful of unrelated gaps is healthy
+13_backlog.feature::three issues in one area is a design problem, not three bugs
+13_backlog.feature::a cluster is reported ahead of a raw count
+13_backlog.feature::enough scattered issues eventually say stop as well
+13_backlog.feature::closing issues brings the verdict back, so the rule is not a ratchet
+13_backlog.feature::the listing groups by area and shows each workaround
+13_backlog.feature::an empty backlog says so rather than printing a bare zero
+13_backlog.feature::the exit code carries the verdict so a session can branch on it
+13_backlog.feature::an unknown field in an entry is an error, not something to skip
+11_io_edges.feature::"-" reads stdin, and the form must then be given
+11_io_edges.feature::several inputs are converted independently, and one failure does not lose the rest
+11_io_edges.feature::a directory input is refused with the glob that would have worked
+11_io_edges.feature::a file containing several kernels reports all of them
+11_io_edges.feature::converting a multi-kernel module emits all of them into one output
+11_io_edges.feature::a symlinked input is read through, and the output is named after the link
+11_io_edges.feature::an output that is a symlink is refused rather than written through
+05_platform_and_targets.feature::doctor reports platform, accelerators, and SDKs separately
+05_platform_and_targets.feature::doctor names the AMD device class it found
+05_platform_and_targets.feature::--cross permits a target with no local device
+05_platform_and_targets.feature::naming a non-native target is cross generation and says so
+05_platform_and_targets.feature::-O4 is rejected under cross generation
+05_platform_and_targets.feature::no vendor library is required to start the tool
+05_platform_and_targets.feature::doctor distinguishes "measured" from "supported"
+04_profile_and_optimize.feature::a single input profiles and then optimizes by default
+04_profile_and_optimize.feature::an existing artifact is refused, and --force says that it overwrote
+04_profile_and_optimize.feature::--force overwrites, and says that it did
+04_profile_and_optimize.feature::-i stops after the profile
+04_profile_and_optimize.feature::the default level is reproducible
+04_profile_and_optimize.feature::-O4 requires a device and refuses honestly without one
+04_profile_and_optimize.feature::a forced absence is applied, not merely printed
+02_transform_dispatch.feature::-o wins over any extension inference
+02_transform_dispatch.feature::routes are enumerable with their requirements, and asking writes nothing
+02_transform_dispatch.feature::--via pins the intermediates, and a pin nothing satisfies is refused
+02_transform_dispatch.feature::an unreadable input names the missing capability, never a silent no-op
+02_transform_dispatch.feature::a target missing from this build fails distinguishably from one nobody wrote
+02_transform_dispatch.feature::two inputs of different forms are two jobs, not a route request
+03_intermediates.feature::--keep-dir implies -k and places the hops there
+03_intermediates.feature::a failed hop still cleans up, and says which hop failed
+03_intermediates.feature::-k preserves the intermediates of a failed run for debugging
+10_portability_and_grammar.feature::verbosity is repeatable and additive
+10_portability_and_grammar.feature::diagnostics never go to stdout when stdout carries a result
+07_stats_and_license.feature::-s reports prior conversions relevant to the kernels in the arguments
+08_daemon_and_mcp.feature::a socket daemon is refused until it can authenticate its callers
+08_daemon_and_mcp.feature::a killed run leaves no scratch behind
+01_form_detection.feature::the form table is data, so resolution is uniform across every row
+06_toolchains.feature::an unpinned entry will not be downloaded at all
+06_toolchains.feature::a tool with no entry for this platform is refused, not guessed at
+02_transform_dispatch.feature::the fidelity class is printed on every conversion, not only with --route
+07_stats_and_license.feature::the kernel identity is resolved, not string-matched on the filename
+11_io_edges.feature::two concurrent runs do not corrupt the shared state directory
+04_profile_and_optimize.feature::the same hazard report is produced for a tile-rs input
+07_stats_and_license.feature::a corpus that fails its seal is reported, not silently ignored
+04_profile_and_optimize.feature::an unmeasured architecture blocks optimization above O1
+06_toolchains.feature::the daemon does not install on an agent's behalf by default
+11_io_edges.feature::an interrupted run cleans up on the next run
+12_run.feature::the kernel runs on this machine and matches the reference
+12_run.feature::torch is consulted and the three sources are compared
+10_portability_and_grammar.feature::the tool builds for every supported target triple
+05_platform_and_targets.feature::the same binary reports correctly on every host it is copied to
+09_ui.feature::--ui native is refused rather than silently served as a web view
+02_transform_dispatch.feature::a lower is chosen when the output form sits below the input
+04_profile_and_optimize.feature::-O3 asks the target's own compiler
+04_profile_and_optimize.feature::-O4 records what it measured and invents nothing
+08_daemon_and_mcp.feature::a model that cannot be provisioned does not take the kernel tools with it
+09_ui.feature::the wasm bundle is served from the same address
+08_daemon_and_mcp.feature::provisioning an engine is explicit, reported, and cleaned up after
+09_ui.feature::the bundle does what it claims, executed
+09_ui.feature::the checked-in bundle has not drifted from its source
+02_transform_dispatch.feature::an intrinsic the emitter does not understand is refused, never copied
+04_profile_and_optimize.feature::-O4 verifies a width before recommending it
