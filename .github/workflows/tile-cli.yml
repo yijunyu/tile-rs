@@ -1,0 +1,203 @@
+# The `tile` CLI. Separate from the other workflows on purpose: tile_cli is excluded
+# from the root workspace and pins STABLE (the root pins nightly-2025-08-04 for the
+# codegen backend), so it must never be built by a root `cargo` invocation.
+name: tile-cli
+
+# The path filter MUST list every tree this crate is built from, not just its own.
+# `crates/tile_cli/src/lib.rs` `#[path]`-includes the emitter sources out of
+# `crates/rustc_codegen_tile/`, and the corpus gates in tests/emitted_parses.rs read the
+# intrinsic declarations out of `crates/tile_std/src/tile.rs`. Neither was listed, so a
+# commit touching ONLY an emitter -- which is most emitter work -- triggered no CI at all.
+# Written out twice rather than shared with a YAML anchor: an anchor needs a top-level
+# key to hang off, GitHub's workflow schema rejects keys it does not know, and an invalid
+# workflow does not run at all -- which would be the opposite of this fix, and is not
+# something that can be checked from a laptop.
+on:
+  push:
+    paths:
+      - "crates/tile_cli/**"
+      - "crates/tile_codegen/**"
+      - "crates/rustc_codegen_tile/**"
+      - "crates/tile_std/**"
+      - "docs/cli/**"
+      - ".github/workflows/tile-cli.yml"
+  pull_request:
+    paths:
+      - "crates/tile_cli/**"
+      - "crates/tile_codegen/**"
+      - "crates/rustc_codegen_tile/**"
+      - "crates/tile_std/**"
+      - "docs/cli/**"
+      - ".github/workflows/tile-cli.yml"
+
+defaults:
+  run:
+    working-directory: crates/tile_cli
+
+jobs:
+  # Runs first and takes seconds: a feature file that does not parse means the normative
+  # spec is not a spec. Catching it before the compiler starts keeps the signal clean.
+  spec-structure:
+    name: the specification parses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 check-features.py features
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - name: build
+        run: cargo build --locked
+      - name: test
+        run: cargo test --locked
+      - name: test with the stats feature (the crypto the corpus needs)
+        run: cargo test --locked --features stats
+      - name: the tool runs on this machine
+        run: |
+          set -e
+          cargo run --locked -q -- doctor
+          cargo run --locked -q -- --list-forms
+          cargo run --locked -q -- testdata/forms/softmax.mlir -i
+          cargo run --locked -q -- testdata/forms/softmax.mlir -t msl -o /tmp/ci.metal
+          grep -q "kernel void" /tmp/ci.metal
+          cargo run --locked -q -- install
+          cargo run --locked -q -- license status
+          printf '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n' \
+            | cargo run --locked -q -- -d | grep -q '"convert"' 
+      - name: publish the coverage meter
+        run: cat target/spec-progress.md >> "$GITHUB_STEP_SUMMARY"
+
+  # The paths that never run on a developer's machine, because a developer's machine has
+  # everything. Each job constructs an absence and asserts the tool still behaves.
+  environments:
+    name: missing ${{ matrix.absent }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        absent: [nothing, no-emitters, no-vendor-clis, no-devices, no-network, bare]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - run: cargo build --locked
+      - name: the tool still starts and still reports honestly
+        env:
+          TILE_SIMULATE: ${{ matrix.absent == 'nothing' && '' || matrix.absent }}
+        run: |
+          set -e
+          cargo run --locked -q -- doctor
+          cargo run --locked -q -- --list-forms > /dev/null
+          cargo run --locked -q -- testdata/forms/softmax.mlir -i > /dev/null
+      - name: the environment suite
+        run: cargo test --locked --test environments
+
+  # A build that genuinely lacks the emitters, not a simulated one. This is the artifact
+  # a "lean" release would be, and it must still identify and profile kernels -- and must
+  # refuse a conversion with exit 4 ("not here"), never exit 3 ("nobody wrote it").
+  no-emitters-build:
+    name: build without the emitters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - run: cargo build --locked --no-default-features
+      - run: cargo test --locked --no-default-features
+      - name: identify and profile still work; converting says exit 4
+        run: |
+          set -e
+          cargo run --locked --no-default-features -q -- testdata/forms/softmax.mlir -i
+          set +e
+          cargo run --locked --no-default-features -q -- \
+            testdata/forms/softmax.mlir -t msl -o /tmp/out.metal
+          code=$?
+          set -e
+          [ "$code" = "4" ] || { echo "::error::wanted exit 4 (unavailable), got $code"; exit 1; }
+
+  # Requirement (2): platform code stays behind cfg, and the modules for the OTHER
+  # platforms must still compile. An "empty matrix job" checks nothing — `platform/linux.rs`
+  # breaks silently on a developer's Mac without this.
+  cross-check:
+    name: cargo check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - run: cargo check --locked --target ${{ matrix.target }}
+
+  # Requirement (3), machine-checked rather than remembered. "Pure Rust" here means: no
+  # crate in the build graph runs a C or C++ compiler. This is the gate that would have
+  # caught `rusqlite` (via libsqlite3-sys) before it was scheduled.
+  no-c-in-the-graph:
+    name: nothing in the graph compiles C
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+      # Measured on the RESOLVED graph, not on Cargo.lock: the lockfile records every
+      # optional dependency whether or not a build uses it, so counting it would fail the
+      # moment a feature exists. `--all-features` is what the check has to cover, because
+      # the point is that no configuration drags in C.
+      - name: no C-building crate in any feature combination
+        run: |
+          set -e
+          graph=$(cargo tree -e normal --prefix none --all-features | sed 's/ v[0-9].*//' | sort -u)
+          echo "$graph" | tr '\n' ' '; echo
+          for bad in cc cmake libsqlite3-sys openssl-sys ring bindgen aws-lc-sys; do
+            if echo "$graph" | grep -qx "$bad"; then
+              echo "::error::$bad compiles C and must not be in tile_cli's graph"
+              exit 1
+            fi
+          done
+      - name: the default binary's dependency budget holds
+        run: |
+          n=$(cargo tree -e normal --prefix none | sed 's/ v[0-9].*//' | sort -u | wc -l)
+          echo "default binary graph: $n crates (budget: 15)"
+          [ "$n" -le 15 ] || { echo "::error::dependency budget exceeded"; exit 1; }
+          m=$(cargo tree -e normal --prefix none --features stats | sed 's/ v[0-9].*//' | sort -u | wc -l)
+          echo "with the stats feature: $m crates (nobody who wants a conversion pays for these)"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          rustflags: ""
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings

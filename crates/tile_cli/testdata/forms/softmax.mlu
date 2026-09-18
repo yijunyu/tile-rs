@@ -1,0 +1,5 @@
+#include <bang.h>
+
+__mlu_entry__ void softmax(float* in, float* out, int n) {
+    for (int i = taskId; i < n; i += taskDim) out[i] = __mlu_exp(in[i]);
+}

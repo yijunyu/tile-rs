@@ -1,0 +1,9 @@
+const math = @import_module("<math>");
+
+comptime {
+    @export_symbol(softmax, "softmax");
+}
+
+fn softmax(n: i16) void {
+    @fexp(out_dsd, in_dsd);
+}
