@@ -3730,9 +3730,27 @@ fn register(r: &mut Runner) {
         "the artifact has a derived name beside the input",
         |w: &mut World, _: &[String]| {
             let dir = PathBuf::from(w.get("dir"));
+            let artifact = derived_artifact(&dir, "softmax");
+            // On failure this must say what the run ACTUALLY did -- which form it
+            // routed to is the difference between a detection that found no GPU and a
+            // run that failed outright, and "no derived artifact" alone tells neither.
+            let files: Vec<String> = std::fs::read_dir(&dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
             assert!(
-                dir.join("softmax.opt.metal").exists(),
-                "no derived artifact"
+                !artifact.is_empty(),
+                "no derived artifact; exit={} files={files:?} stdout={} stderr={}",
+                w.get("exit"),
+                w.get("stdout"),
+                w.get("error"),
+            );
+            assert!(
+                artifact.starts_with("softmax.opt."),
+                "not a derived name: {artifact}"
             );
         },
     );
@@ -3755,8 +3773,13 @@ fn register(r: &mut Runner) {
             // host with different hardware.
             let dir = PathBuf::from(w.get("dir"));
             let (probe, _, _) = run_bin(&dir, &["doctor"]);
+            // Only the ACCELERATOR line carries the family: doctor also prints
+            // `sdks: metal ... [apple-gpu] (no matching device)` on a machine whose
+            // GPU was not found, and taking the first bracket anywhere would read that
+            // SDK line as a device and then demand the `.metal` artifact.
             let fam = probe
                 .lines()
+                .filter(|l| l.trim_start().starts_with("accelerator:"))
                 .find_map(|l| l.split('[').nth(1)?.split(']').next())
                 .unwrap_or("none")
                 .to_string();
@@ -3767,13 +3790,18 @@ fn register(r: &mut Runner) {
     );
     r.when("I convert it again", |w: &mut World, _: &[String]| {
         let dir = PathBuf::from(w.get("dir"));
+        // Snapshot the derived artifact (whatever form this machine detected) before
+        // the refusing run, and read it again after: "not overwritten" is bytes
+        // unchanged, which holds on every machine -- "kernel void" only holds on one
+        // whose detected form happens to be Metal.
+        let artifact = derived_artifact(&dir, "softmax");
+        let before = std::fs::read_to_string(dir.join(&artifact)).unwrap_or_default();
         let (_, e, code) = run_bin(&dir, &["softmax.mlir"]);
+        let kept = std::fs::read_to_string(dir.join(&artifact)).unwrap_or_default();
         w.set("error", e);
         w.set("exit", code.to_string());
-        w.set(
-            "kept",
-            std::fs::read_to_string(dir.join("softmax.opt.metal")).unwrap_or_default(),
-        );
+        w.set("before", before);
+        w.set("kept", kept);
     });
     r.then(
         "the existing artifact is refused rather than overwritten",
@@ -3781,7 +3809,11 @@ fn register(r: &mut Runner) {
             assert_eq!(w.get("exit"), "2");
             let e = w.get("error");
             assert!(e.contains("--force"), "does not name --force: {e}");
-            assert!(w.get("kept").contains("kernel void"), "clobbered anyway");
+            assert!(
+                !w.get("before").is_empty(),
+                "the first run wrote nothing to check against"
+            );
+            assert_eq!(w.get("kept"), w.get("before"), "clobbered anyway");
         },
     );
     r.when(
@@ -5519,6 +5551,23 @@ fn scratch_dir(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("scratch");
     d
+}
+
+/// The derived artifact `tile` wrote with no `-o`: `<stem>.opt.<ext>`, where the ext
+/// belongs to the form this machine's DETECTION picked — `.metal` where an Apple GPU is
+/// found, `.mlir` on a machine with none. The spec says "the output form's extension",
+/// never which form, so the steps read the file the run actually produced rather than
+/// this machine's name for it; a hardcoded `.metal` turns the scenario into a test of
+/// the CI runner's GPU detection.
+fn derived_artifact(dir: &Path, stem: &str) -> String {
+    let prefix = format!("{stem}.opt.");
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with(&prefix))
+        .unwrap_or_default()
 }
 
 /// Run the real binary in `dir` with extra environment. Returns (stdout, stderr, code).

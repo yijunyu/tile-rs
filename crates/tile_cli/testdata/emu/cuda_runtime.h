@@ -18,8 +18,13 @@ static inline float rsqrtf_(float x) { return 1.0f / sqrtf(x); }
 #ifndef rsqrtf
 #define rsqrtf rsqrtf_
 #endif
-static inline float __expf(float x) { return expf(x); }
-static inline float __logf(float x) { return logf(x); }
+/* Not definitions: glibc's <math.h> declares both `__expf` and `__logf` (it spells
+   every `X` as `__X` too), so a `static inline` definition after that declaration is a
+   hard error under gcc -- which is why emulate_gpu failed on ubuntu while mac, whose
+   math.h declares nothing of the kind, passed. The CUDA spelling gets the libc one,
+   spelled the way libc spells it. */
+#define __expf expf
+#define __logf logf
 static inline int min_(int a, int b) { return a < b ? a : b; }
 static inline int max_(int a, int b) { return a > b ? a : b; }
 #define min min_

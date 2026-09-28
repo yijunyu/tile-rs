@@ -60,7 +60,11 @@ jobs:
       - name: build
         run: cargo build --locked
       - name: test
-        run: cargo test --locked
+        # --no-fail-fast: cargo stops at the first failing test TARGET by default, and
+        # that has twice hidden everything behind it on CI -- the fixture gate hid the
+        # spec scenario (two runs), and emitted_parses hid the fixture failures at the
+        # tag. One red run must show every red target.
+        run: cargo test --locked --no-fail-fast
       - name: the ISSTA regression gates run with the build
         # Named deliberately: these three files are the campaign's finding surface
         # (never-panic fuzz corpus mutations, metamorphic surface-equivalence, and the
@@ -68,9 +72,10 @@ jobs:
         # too, but a future `--lib` or `-- --skip` on that step would silently drop
         # every tests/ target — which is exactly how sibling trees went months without
         # exercising their ungated-emitter gates. Sub-second once built.
-        run: cargo test --locked --test issta_fuzz --test issta_metamorphic -- --nocapture
+        run: cargo test --locked --no-fail-fast --test issta_fuzz --test issta_metamorphic -- --nocapture
       - name: test with the stats feature (the crypto the corpus needs)
-        run: cargo test --locked --features stats
+        # --no-fail-fast, for the same reason as the blanket run above.
+        run: cargo test --locked --no-fail-fast --features stats
       - name: the tool runs on this machine
         run: |
           set -e
@@ -104,7 +109,12 @@ jobs:
       - run: cargo build --locked
       - name: the tool still starts and still reports honestly
         env:
-          TILE_SIMULATE: ${{ matrix.absent == 'nothing' && '' || matrix.absent }}
+          # The `nothing` row means NO absence, i.e. unset TILE_SIMULATE. The natural
+          # spelling `absent == 'nothing' && '' || absent` does NOT do that: Actions'
+          # `&&`/`||` treat `''` as falsy, so it collapses to `absent` and the tool
+          # rejects the unknown term with exit 2. Invert the condition instead; the
+          # empty string then sits at the end where falsiness cannot redirect it.
+          TILE_SIMULATE: ${{ matrix.absent != 'nothing' && matrix.absent || '' }}
         run: |
           set -e
           cargo run --locked -q -- doctor
@@ -126,7 +136,9 @@ jobs:
           toolchain: stable
           rustflags: ""
       - run: cargo build --locked --no-default-features
-      - run: cargo test --locked --no-default-features
+      # --no-fail-fast: a failing target must not hide the ones behind it (see the
+      # test job's blanket run).
+      - run: cargo test --locked --no-fail-fast --no-default-features
       - name: identify and profile still work; converting says exit 4
         run: |
           set -e
