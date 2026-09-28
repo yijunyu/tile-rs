@@ -5252,9 +5252,9 @@ fn register(r: &mut Runner) {
             // line; with none detected it is that no engine maps to the "none" family.
             // Matching three substrings of the Apple-laptop wording rejected that
             // sentence on every CI runner.
-            let reason = e.lines().any(|l| {
-                l.starts_with("tile:") && !l.contains("serving the kernel tools")
-            });
+            let reason = e
+                .lines()
+                .any(|l| l.starts_with("tile:") && !l.contains("serving the kernel tools"));
             assert!(reason, "no reason given: {e}");
         },
     );
@@ -5337,17 +5337,41 @@ fn register(r: &mut Runner) {
             // hang. The same rule the toolchain fetcher follows.
             let dir = scratch_dir("engbuild");
             let root = dir.join("root");
-            let checkout = root.join("ds4-rs-metal");
-            std::fs::create_dir_all(checkout.join("target/release")).unwrap();
-            std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").unwrap();
-            // A stand-in server that stays up, so the supervision path is exercised
-            // without the sibling repository having to build.
-            let bin = checkout.join("target/release/ds4-server");
-            std::fs::write(&bin, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Detection on CI finds nothing, and `engine_for("none")` never looks at
+            // TILE_ENGINE_PATH. The probes honour PATH, so a planted `system_profiler`
+            // (mac) or `nvidia-smi` (everywhere else) makes the family match a checkout
+            // we actually wrote. Both checkouts exist because primary_family prefers
+            // apple-gpu over nvidia when both probes answer.
+            let bindir = dir.join("bin");
+            std::fs::create_dir_all(&bindir).unwrap();
+            for (name, body) in [
+                (
+                    "system_profiler",
+                    "#!/bin/sh\necho '      Chipset Model: Apple M1'\n",
+                ),
+                ("nvidia-smi", "#!/bin/sh\necho 'Test GPU'\n"),
+            ] {
+                let p = bindir.join(name);
+                std::fs::write(&p, body).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+            for engine_name in ["ds4-rs-metal", "ds4-rs-cuda"] {
+                let checkout = root.join(engine_name);
+                std::fs::create_dir_all(checkout.join("target/release")).unwrap();
+                std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").unwrap();
+                // A stand-in server that stays up, so the supervision path is exercised
+                // without the sibling repository having to build.
+                let bin = checkout.join("target/release/ds4-server");
+                std::fs::write(&bin, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
             }
             let home = dir.join("home");
             std::fs::create_dir_all(home.join("models")).unwrap();
@@ -5360,6 +5384,8 @@ fn register(r: &mut Runner) {
             c.env("TILE_ENGINE_PATH", &root);
             c.env("TILE_HOME", &home);
             c.env_remove("TILE_SIMULATE");
+            let path = std::env::var("PATH").unwrap_or_default();
+            c.env("PATH", format!("{}:{path}", bindir.display()));
             c.stdin(std::process::Stdio::null());
             c.stdout(std::process::Stdio::piped());
             c.stderr(std::process::Stdio::piped());
@@ -5375,7 +5401,7 @@ fn register(r: &mut Runner) {
             );
             // And it is stopped with the daemon: an orphaned engine holding the device is
             // the failure that makes people stop trusting a supervisor.
-            assert!(e.contains("stopping ds4-rs-metal"), "left it running: {e}");
+            assert!(e.contains("stopping ds4-rs-"), "left it running: {e}");
         },
     );
 
