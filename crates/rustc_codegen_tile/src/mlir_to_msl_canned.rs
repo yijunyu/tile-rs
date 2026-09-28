@@ -5,7 +5,7 @@
 //! lines and ~40% covered, while every other emitter in the tree sits at 83-93%
 //! -- so the single file set the whole-surface coverage number by itself and the
 //! ratchet moved whenever a canned emitter was ADDED rather than when real logic
-//! regressed (see docs/TILE_RS_COVERAGE.md).
+//! regressed (the gate and this rationale live in `scripts/coverage.sh`).
 //!
 //! Splitting them here lets coverage measure the composed/dispatch logic and this
 //! canned tail separately, instead of holding the whole file out of the gate.
@@ -75,32 +75,31 @@ pub(super) fn emit_transpose_msl(out: &mut String) {
     writeln!(out, "        p1[c * rows + r] = p0[r * cols + c];").unwrap();
     writeln!(out, "    }}").unwrap();
 }
-/// Sigmoid: p1[i] = 1.0f / (1.0f + exp(-p0[i])).
+/// Sigmoid: p1[i] = 1.0f / (1.0f + exp(-p0[i])), over every element of the row.
+/// One threadgroup per row, so `i += tcount` walks the whole row -- a single
+/// `gid = base + tid` covered only `tcount` of its elements.
 pub(super) fn emit_sigmoid_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
-    writeln!(out, "    if (gid < num_elements) {{").unwrap();
-    writeln!(out, "        p1[gid] = 1.0f / (1.0f + exp(-p0[gid]));").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        p1[base + i] = 1.0f / (1.0f + exp(-p0[base + i]));").unwrap();
     writeln!(out, "    }}").unwrap();
 }
 /// Softplus: log(1+exp(x)). For x>20 falls through to identity to avoid exp overflow.
 pub(super) fn emit_softplus_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
-    writeln!(out, "    if (gid < num_elements) {{").unwrap();
-    writeln!(out, "        float x = p0[gid];").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        float x = p0[base + i];").unwrap();
     writeln!(
         out,
-        "        p1[gid] = (x > 20.0f) ? x : log(1.0f + exp(x));"
+        "        p1[base + i] = (x > 20.0f) ? x : log(1.0f + exp(x));"
     )
     .unwrap();
     writeln!(out, "    }}").unwrap();
 }
-/// Clamp: p1[i] = clamp(p0[i], clamp_min, clamp_max).
+/// Clamp: p1[i] = clamp(p0[i], clamp_min, clamp_max), over the row.
 pub(super) fn emit_clamp_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
-    writeln!(out, "    if (gid < num_elements)").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
     writeln!(
         out,
-        "        p1[gid] = clamp(p0[gid], clamp_min, clamp_max);"
+        "        p1[base + i] = clamp(p0[base + i], clamp_min, clamp_max);"
     )
     .unwrap();
 }
@@ -21335,21 +21334,25 @@ pub(super) fn emit_dsv4_shared_gate_up_swiglu_q8_0_msl(out: &mut String, nsg: u3
 }
 /// SiLU activation: out[i] = x[i] / (1 + exp(-x[i]))
 /// Equivalent to x * sigmoid(x), used in gated MLP (Qwen2, LLaMA, etc.)
+/// Strided over the row; the `gid = base + tid` form covered `tcount` elements
+/// of it and mis-placed them once there was more than one row.
 pub(super) fn emit_silu_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
-    writeln!(out, "    if (gid < num_elements) {{").unwrap();
-    writeln!(out, "        float v = p0[gid];").unwrap();
-    writeln!(out, "        p1[gid] = v / (1.0f + exp(-v));").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        float v = p0[base + i];").unwrap();
+    writeln!(out, "        p1[base + i] = v / (1.0f + exp(-v));").unwrap();
     writeln!(out, "    }}").unwrap();
 }
 /// Fused SiLU * Mul: out[i] = silu(p0[i]) * p1[i]
 /// Combines SiLU activation with element-wise multiply for gated MLP.
 /// Saves one kernel dispatch and one intermediate buffer vs separate ops.
 pub(super) fn emit_silu_mul_msl(out: &mut String) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
-    writeln!(out, "    if (gid < num_elements) {{").unwrap();
-    writeln!(out, "        float v = p0[gid];").unwrap();
-    writeln!(out, "        p2[gid] = (v / (1.0f + exp(-v))) * p1[gid];").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        float v = p0[base + i];").unwrap();
+    writeln!(
+        out,
+        "        p2[base + i] = (v / (1.0f + exp(-v))) * p1[base + i];"
+    )
+    .unwrap();
     writeln!(out, "    }}").unwrap();
 }
 /// Cooperative matvec with f16 weights, f32 accumulation.

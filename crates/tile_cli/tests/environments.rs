@@ -315,6 +315,12 @@ fn with_no_accelerator_the_default_target_is_still_runnable() {
 
 #[test]
 fn a_bare_machine_can_still_convert() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // The whole argument for Tier 0: MLIR -> target source needs no toolchain, no
     // vendor SDK and no network, so an air-gapped box with nothing installed still gets
     // the tool's core value.
@@ -402,6 +408,12 @@ fn a_usage_error_never_borrows_a_capability_code() {
 
 #[test]
 fn the_banner_never_contaminates_stdout() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // `-o -` makes stdout a data channel. A diagnostic there corrupts a pipeline, and
     // the simulation banner is exactly the kind of well-meaning message that leaks.
     let r = Machine::simulating("no-network").run(&[
@@ -432,6 +444,12 @@ fn the_banner_never_contaminates_stdout() {
 
 #[test]
 fn nothing_is_written_when_the_output_directory_is_absent() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     Machine::real()
         .run(&[
             corpus("softmax.mlir").to_str().unwrap(),
@@ -446,6 +464,12 @@ fn nothing_is_written_when_the_output_directory_is_absent() {
 
 #[test]
 fn an_existing_output_is_never_clobbered_silently() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let out = out_path("clobber");
     std::fs::write(&out, "PRECIOUS").unwrap();
     Machine::real()
@@ -464,6 +488,12 @@ fn an_existing_output_is_never_clobbered_silently() {
 
 #[test]
 fn a_scratch_directory_left_by_a_killed_run_is_swept_by_the_next_one() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // A SIGKILL mid-conversion cannot run its own cleanup. "No orphans" is therefore not
     // a property of the run that died — it is a property of the run that follows, and
     // this is the only place that can be checked.
@@ -492,6 +522,12 @@ fn a_scratch_directory_left_by_a_killed_run_is_swept_by_the_next_one() {
 
 #[test]
 fn a_default_run_leaves_no_scratch_of_its_own() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // Its own TMPDIR, so a sibling test converting the same kernel in parallel cannot
     // put a directory here and make this fail.
     let tmp = PrivateTmp::new("noscratch");
@@ -518,6 +554,12 @@ fn a_default_run_leaves_no_scratch_of_its_own() {
 
 #[test]
 fn a_scratch_belonging_to_a_live_process_is_never_swept() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // The sweep must not delete the working directory of a concurrent run. Erring the
     // other way costs a stale directory; erring this way corrupts someone's conversion.
     let mine = std::env::temp_dir().join(format!("tile-live-{}", std::process::id()));
@@ -637,6 +679,12 @@ fn nothing_but_protocol_reaches_stdout_even_at_maximum_verbosity() {
 
 #[test]
 fn an_mcp_convert_and_the_cli_produce_the_same_bytes() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // "An agent can do exactly what a person can do" has to be checkable, not asserted.
     let src = std::fs::read_to_string(corpus("softmax.mlir")).unwrap();
     let req = format!(

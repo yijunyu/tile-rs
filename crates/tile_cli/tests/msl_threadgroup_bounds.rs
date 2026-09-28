@@ -47,6 +47,12 @@ fn emit(mlir: &str) -> String {
 
 #[test]
 fn the_shared_array_is_sized_for_the_widest_dispatch() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let out = emit(&reduce_mlir(256, 256));
     assert!(
         out.contains("sdata[MAX_TG]") && out.contains("constexpr uint MAX_TG = 1024;"),
@@ -56,6 +62,12 @@ fn the_shared_array_is_sized_for_the_widest_dispatch() {
 
 #[test]
 fn a_narrow_tile_width_does_not_shrink_the_array() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // The case that produced 17.8 max-rel error: emitted for 64, dispatched at 1024.
     let out = emit(&reduce_mlir(1024, 64));
     assert!(
@@ -67,6 +79,12 @@ fn a_narrow_tile_width_does_not_shrink_the_array() {
 
 #[test]
 fn the_argmin_half_of_the_same_reduction_is_sized_too() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // idx_data sat beside sdata carrying the argmin, hardcoded at 256. Fixing only sdata
     // would have left this half overrunning on the same dispatch.
     let mlir = reduce_mlir(256, 256).replace("__tile_softmax_f32", "__tile_argmin_f32");

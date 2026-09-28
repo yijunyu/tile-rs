@@ -24,28 +24,29 @@ kernel void softmax_1d(
         tmax = max(tmax, p0[base + i]);
     sdata[tid] = tmax;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        for (uint i = 1; i < tcount; i++) sdata[0] = max(sdata[0], sdata[i]);
+    for (uint s = 1; s < tcount; s <<= 1) {
+        if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     float row_max = sdata[0];
 
     // Pass 2: exp(x - max), accumulate sum
-    float tsum = 0.0f;
+    float tsum = 0.0;
     for (uint i = tid; i < num_elements; i += tcount) {
-        float e = exp(float(p0[base + i]) - float(row_max));
+        float e = exp(p0[base + i] - row_max);
+        p1[base + i] = e;
         tsum += e;
     }
     sdata[tid] = tsum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        for (uint i = 1; i < tcount; i++) sdata[0] += sdata[i];
+    for (uint s = 1; s < tcount; s <<= 1) {
+        if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     float row_sum = sdata[0];
 
     // Pass 3: normalise
     for (uint i = tid; i < num_elements; i += tcount)
-        p1[base + i] = exp(float(p0[base + i]) - float(row_max)) / row_sum;
+        p1[base + i] /= row_sum;
 }
 

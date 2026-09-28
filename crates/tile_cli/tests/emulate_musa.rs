@@ -110,6 +110,12 @@ fn kernel_mlir(op: &str, rows: usize, cols: usize) -> String {
 
 #[test]
 fn musa_computes_what_the_reference_computes() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(cc) = which("clang").or_else(|| which("gcc")) else {
         eprintln!("emulate_musa: skipped, no host C compiler");
         return;

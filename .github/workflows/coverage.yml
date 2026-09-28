@@ -39,13 +39,13 @@ jobs:
         # only when one specific MLIR shape reaches them, so they sit at ~45%.
         #
         # This supersedes holding out the WHOLE of mlir_to_msl.rs: with the canned
-        # tail in its own file, mlir_to_msl.rs's real dispatch logic (61.7%) is
-        # gated on its own merits instead of being excluded with it. The gated
-        # surface therefore grew from 31,160 to 48,094 lines -- more code measured,
-        # not less -- and the total is a truthful 80.00% rather than a 89.93% that
+        # tail in its own file, mlir_to_msl.rs's real dispatch logic is gated on
+        # its own merits instead of being excluded with it. The gated surface
+        # therefore grew from 31,160 lines to 69,132 -- more code measured, not
+        # less -- and the total is a truthful 79.71% rather than a 89.93% that
         # quietly omitted 35k lines.
         #
-        # 78 keeps the usual ~2 points of headroom. Covering the canned emitters is
-        # the remaining work; their row prints every run. See
-        # docs/TILE_RS_COVERAGE.md.
+        # 78 keeps the usual ~2 points of headroom (measured 79.71%, 55107/69132,
+        # after the ISSTA campaign added 23 emitter smoke tests). Covering the
+        # canned emitters is the remaining work; their row prints every run.
         run: bash scripts/coverage.sh --gate 78

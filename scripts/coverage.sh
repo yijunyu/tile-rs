@@ -14,7 +14,7 @@
 #   bash scripts/coverage.sh --html          # also write target/llvm-cov/html
 #   COVERAGE_GATE=50 bash scripts/coverage.sh # gate via env (used by CI)
 #
-# NOT measured here (documented in docs/TILE_RS_COVERAGE.md):
+# NOT measured here:
 #   * tile_std / tile_ir — `no_std`+`no_core` kernel-side crates with
 #     `[lib] test = false`; they need the bare-metal nightly target and carry no
 #     host-runnable tests, so host line-coverage is N/A by construction.
@@ -59,11 +59,11 @@ import json, sys, glob, os
 # real logic regressed.
 #
 # Now that they are their own file the split is exact and the composed dispatch
-# logic is gated on its own merits: mlir_to_msl.rs 61.7%, canned 45.2% (they were
-# conflated as one 53.1% figure).
+# logic is gated on its own merits instead of being conflated with the canned
+# tail (they were reported as one 53.1% figure).
 #
 # The excluded file is still MEASURED and PRINTED -- just not gated. Covering
-# these emitters is the remaining work; see docs/TILE_RS_COVERAGE.md.
+# these emitters is the remaining work; see docs/issta_campaign.md.
 UNGATED_FILES = ("mlir_to_msl_canned.rs",)
 
 rows = []

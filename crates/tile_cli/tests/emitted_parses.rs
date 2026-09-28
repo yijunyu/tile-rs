@@ -294,6 +294,12 @@ fn have_python() -> bool {
 
 #[test]
 fn every_python_backend_emits_python_that_parses() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     if !have_python() {
         eprintln!("emitted_parses: skipped, no python3 on PATH");
         return;
@@ -376,6 +382,12 @@ fn every_python_backend_emits_python_that_parses() {
 /// emitting something that reads like a kernel.
 #[test]
 fn every_cuda_backend_emits_cxx_that_parses() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(cxx) = which("clang++").or_else(|| which("g++")) else {
         eprintln!("emitted_parses: skipped, no host C++ compiler");
         return;
@@ -529,6 +541,12 @@ macro_rules! require_metal_toolchain {
 /// matmul's undeclared `_v2`, in a different backend, found the same way.
 #[test]
 fn every_vendor_c_backend_emits_cxx_that_parses() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(cxx) = which("clang++").or_else(|| which("g++")) else {
         eprintln!("emitted_parses: skipped, no host C++ compiler");
         return;
@@ -636,6 +654,12 @@ fn every_vendor_c_backend_emits_cxx_that_parses() {
 /// instrument stops being the broken thing.
 #[test]
 fn every_header_including_backend_emits_cxx_that_parses() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(cxx) = which("clang++").or_else(|| which("g++")) else {
         eprintln!("emitted_parses: skipped, no host C++ compiler");
         return;
@@ -723,6 +747,12 @@ fn every_header_including_backend_emits_cxx_that_parses() {
 /// fourth cannot arrive unnoticed.
 #[test]
 fn mlir_backends_use_no_value_before_defining_it() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let exe = env!("CARGO_BIN_EXE_tile");
     let dir = std::env::temp_dir().join(format!("tile-ssa-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
@@ -848,6 +878,12 @@ fn typed_args(s: &str) -> Vec<String> {
 /// undeclared-variable bug, if it comes, does not come here unnoticed.
 #[test]
 fn csl_declares_every_name_it_uses() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     const KEYWORDS: &[&str] = &[
         "param", "var", "const", "task", "fn", "comptime", "for", "if", "else", "while", "return",
         "void", "true", "false", "and", "or", "not", "export", "layout", "i16", "i32", "u16",
@@ -2121,6 +2157,12 @@ fn declared_intrinsics_pass_the_c_family_gates() {
 /// Needs `glslangValidator`; skips with a note otherwise.
 #[test]
 fn spirv_kernels_compile_with_the_real_shader_compiler() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(glslang) = which("glslangValidator") else {
         eprintln!("emitted_parses: skipped, no glslangValidator");
         return;

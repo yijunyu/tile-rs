@@ -267,7 +267,13 @@ fn generate_func_aie(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     } else {
         1
     };
-    let mem_width = tile_width * n_tiles.max(2);
+    let mem_width = tile_width.checked_mul(n_tiles.max(2)).ok_or_else(|| {
+        format!(
+            "AIE: MemTile staging {tile_width} x {} overflows u32 — the kernel's tile \
+             extent ({problem_size} elements) is too large to lower",
+            n_tiles.max(2)
+        )
+    })?;
     let dtype_str = ctx.primary_dtype.as_deref().unwrap_or("f32");
     let np_dtype = np_dtype_str(dtype_str);
 
@@ -1760,13 +1766,23 @@ impl AieContext {
         total
     }
 
-    fn note_tile_dims(&mut self, rows: u32, cols: u32, dtype: &str) {
+    /// Record the first intrinsic's shape as the kernel's tile geometry.
+    ///
+    /// An extent product that does not fit u32 is REFUSED: falling back to a
+    /// default here would emit a program that computes a fixed corner of a kernel
+    /// whose real shape is unreachable (the stand-in hazard C0 refuses zeros for).
+    fn note_tile_dims(&mut self, rows: u32, cols: u32, dtype: &str) -> Result<(), String> {
         if self.tile_width.is_none() {
             self.tile_width = Some(cols);
             // problem_size = rows * cols for single-tile kernels
-            self.problem_size = Some(rows * cols);
+            self.problem_size = Some(rows.checked_mul(cols).ok_or_else(|| {
+                format!(
+                    "AIE: kernel shape {rows}x{cols} does not fit in u32 — too large to lower"
+                )
+            })?);
             self.primary_dtype = Some(dtype.to_string());
         }
+        Ok(())
     }
 
     fn fresh_var(&mut self, prefix: &str) -> String {
@@ -1966,7 +1982,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[1].trim());
             let cols = ctx.resolve_const(args[2].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
 
             let gm_base = ctx.resolve_ptr(gm_raw);
             let elem_offset = ctx.resolve_offset(gm_raw);
@@ -2014,7 +2030,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
 
             let gm_base = ctx.resolve_ptr(gm_raw);
             if !ctx.output_ptrs.contains(&gm_base) {
@@ -2037,12 +2053,12 @@ fn translate_call(
 
         // ── binary ops ─────────────────────────────────────────────────────────
         "__tile_add_f32" | "__tile_add_f16" => {
-            if let Some(op) = make_binop("+", &callee, &args, &result, ctx) {
+            if let Some(op) = make_binop("+", &callee, &args, &result, ctx)? {
                 ops.push(op);
             }
         }
         "__tile_sub_f32" | "__tile_sub_f16" => {
-            if let Some(op) = make_binop("-", &callee, &args, &result, ctx) {
+            if let Some(op) = make_binop("-", &callee, &args, &result, ctx)? {
                 ops.push(op);
             }
         }
@@ -2066,7 +2082,7 @@ fn translate_call(
                         let rows = ctx.resolve_const(args[3].trim());
                         let cols = ctx.resolve_const(args[4].trim());
                         let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-                        ctx.note_tile_dims(rows, cols, dtype);
+                        ctx.note_tile_dims(rows, cols, dtype)?;
                         let out_var = ctx.fresh_var("_silumul");
                         if let Some(r) = &result {
                             ctx.tile_vars.insert(r.clone(), out_var.clone());
@@ -2084,7 +2100,7 @@ fn translate_call(
                 }
             }
             if !fused {
-                if let Some(op) = make_binop("*", &callee, &args, &result, ctx) {
+                if let Some(op) = make_binop("*", &callee, &args, &result, ctx)? {
                     ops.push(op);
                 }
             }
@@ -2105,7 +2121,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_exp");
             if let Some(r) = &result {
@@ -2131,7 +2147,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = if let Some(r) = &result {
                 let v = ctx
@@ -2162,7 +2178,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_rmax");
             if let Some(r) = &result {
@@ -2188,7 +2204,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_rsum");
             if let Some(r) = &result {
@@ -2215,7 +2231,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let scalar = ctx.resolve_float(scalar_ssa);
             let out_var = ctx.fresh_var("_scale");
@@ -2247,7 +2263,7 @@ fn translate_call(
             let m = ctx.resolve_const(args[3].trim());
             let k = ctx.resolve_const(args[4].trim());
             let n = ctx.resolve_const(args[5].trim());
-            ctx.note_tile_dims(m, n, "f32");
+            ctx.note_tile_dims(m, n, "f32")?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or("elem_in0").to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or("elem_in1").to_string();
             let out_var = ctx.fresh_var("_mm");
@@ -2280,7 +2296,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_neg");
             if let Some(r) = &result {
@@ -2293,7 +2309,7 @@ fn translate_call(
 
         // ── div ────────────────────────────────────────────────────────────────
         "__tile_div_f32" | "__tile_div_f16" => {
-            if let Some(op) = make_binop("/", &callee, &args, &result, ctx) {
+            if let Some(op) = make_binop("/", &callee, &args, &result, ctx)? {
                 ops.push(op);
             }
         }
@@ -2313,7 +2329,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_trans");
             if let Some(r) = &result {
@@ -2344,7 +2360,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_rsqrt");
             if let Some(r) = &result {
@@ -2370,7 +2386,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_log");
             if let Some(r) = &result {
@@ -2396,7 +2412,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_sigm");
             if let Some(r) = &result {
@@ -2424,7 +2440,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[4].trim());
             let cols = ctx.resolve_const(args[5].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let min_val = ctx.resolve_float(min_ssa);
             let max_val = ctx.resolve_float(max_ssa);
@@ -2456,7 +2472,7 @@ fn translate_call(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_cast16");
             if let Some(r) = &result {
@@ -2481,7 +2497,7 @@ fn translate_call(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            ctx.note_tile_dims(rows, cols, "f16");
+            ctx.note_tile_dims(rows, cols, "f16")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_cast32");
             if let Some(r) = &result {
@@ -2511,7 +2527,7 @@ fn translate_call(
             let dst_rows = ctx.resolve_const(args[6].trim());
             let dst_cols = ctx.resolve_const(args[7].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(src_rows, src_cols, dtype);
+            ctx.note_tile_dims(src_rows, src_cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_slice");
             if let Some(r) = &result {
@@ -2547,7 +2563,7 @@ fn translate_call(
             let cols_a = ctx.resolve_const(args[4].trim());
             let cols_b = ctx.resolve_const(args[5].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols_a + cols_b, dtype);
+            ctx.note_tile_dims(rows, cols_a + cols_b, dtype)?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or("elem_in0").to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or("elem_in1").to_string();
             let out_var = ctx.fresh_var("_concat");
@@ -2583,7 +2599,7 @@ fn translate_call(
             let m = ctx.resolve_const(args[4].trim());
             let d = ctx.resolve_const(args[5].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(n, d, dtype);
+            ctx.note_tile_dims(n, d, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let indices_var = ctx
                 .get_tile_var(indices_ssa)
@@ -2621,7 +2637,7 @@ fn translate_call(
             let m = ctx.resolve_const(args[4].trim());
             let d = ctx.resolve_const(args[5].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(n, d, dtype);
+            ctx.note_tile_dims(n, d, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let indices_var = ctx
                 .get_tile_var(indices_ssa)
@@ -2659,7 +2675,7 @@ fn translate_call(
             let cols = ctx.resolve_const(args[4].trim());
             let k = ctx.resolve_const(args[5].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let indices_out_var = ctx
                 .get_tile_var(indices_ssa)
@@ -2697,7 +2713,7 @@ fn translate_call(
             let m = ctx.resolve_const(args[3].trim());
             let k = ctx.resolve_const(args[4].trim());
             let n = ctx.resolve_const(args[5].trim());
-            ctx.note_tile_dims(m, n, "f16");
+            ctx.note_tile_dims(m, n, "f16")?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or("elem_in0").to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or("elem_in1").to_string();
             let out_var = ctx.fresh_var("_mmf16");
@@ -2731,7 +2747,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let out_var = ctx.fresh_var("_fill");
             if let Some(r) = &result {
                 ctx.tile_vars.insert(r.clone(), out_var.clone());
@@ -2760,7 +2776,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or("elem_in0").to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or("elem_in1").to_string();
             let out_var = ctx.fresh_var("_max");
@@ -2793,7 +2809,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_rmsn");
             if let Some(r) = &result {
@@ -2824,7 +2840,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_absmax");
             if let Some(r) = &result {
@@ -2854,7 +2870,7 @@ fn translate_call(
             let scale_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let scale_var = ctx
                 .get_tile_var(scale_ssa)
@@ -2889,7 +2905,7 @@ fn translate_call(
             let scale_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let scale_var = ctx
                 .get_tile_var(scale_ssa)
@@ -2923,7 +2939,7 @@ fn translate_call(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_argmax");
             if let Some(r) = &result {
@@ -2956,7 +2972,7 @@ fn translate_call(
             let rng_seed_ssa = args[4].trim();
             let rows = ctx.resolve_const(args[5].trim());
             let cols = ctx.resolve_const(args[6].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let logits_var = ctx
                 .get_tile_var(logits_ssa)
                 .unwrap_or("elem_in0")
@@ -3005,7 +3021,7 @@ fn translate_call(
             let target_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let draft_var = ctx
                 .get_tile_var(draft_ssa)
                 .unwrap_or("elem_in0")
@@ -3045,7 +3061,7 @@ fn translate_call(
             let probs_ssa = args[3].trim();
             let threshold_ssa = args[4].trim();
             let rows = ctx.resolve_const(args[5].trim());
-            ctx.note_tile_dims(rows, 1, "f32");
+            ctx.note_tile_dims(rows, 1, "f32")?;
             let draft_var = ctx
                 .get_tile_var(draft_ssa)
                 .unwrap_or("elem_in0")
@@ -3093,7 +3109,7 @@ fn translate_call(
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
             let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-            ctx.note_tile_dims(rows, cols, dtype);
+            ctx.note_tile_dims(rows, cols, dtype)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_silu");
             if let Some(r) = &result {
@@ -3118,7 +3134,7 @@ fn translate_call(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            ctx.note_tile_dims(rows, cols, "bf16");
+            ctx.note_tile_dims(rows, cols, "bf16")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let out_var = ctx.fresh_var("_castbf");
             if let Some(r) = &result {
@@ -3145,7 +3161,7 @@ fn translate_call(
             let m = ctx.resolve_const(args[3].trim());
             let k = ctx.resolve_const(args[4].trim());
             let n = ctx.resolve_const(args[5].trim());
-            ctx.note_tile_dims(m, n, "f32");
+            ctx.note_tile_dims(m, n, "f32")?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or("elem_in0").to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or("elem_in1").to_string();
             let out_var = ctx.fresh_var("_mmt");
@@ -3204,7 +3220,9 @@ fn translate_call(
             let heads_kv = ctx.resolve_const(args[base + 4].trim());
             let seq_len = ctx.resolve_const(args[base + 5].trim());
             let head_dim = ctx.resolve_const(args[base + 6].trim());
-            ctx.note_tile_dims(heads_q, seq_len * head_dim, "f32");
+            // saturating: an overflowed product is pinned at u32::MAX, which the
+            // first-note refusal path (tile_width x 2 in generate_func_aie) rejects.
+            ctx.note_tile_dims(heads_q, seq_len.saturating_mul(head_dim), "f32")?;
             let q_var = ctx.get_tile_var(q_ssa).unwrap_or("elem_in0").to_string();
             let k_var = ctx.get_tile_var(k_ssa).unwrap_or("elem_in1").to_string();
             let v_var = ctx.get_tile_var(v_ssa).unwrap_or("elem_in2").to_string();
@@ -3241,7 +3259,7 @@ fn translate_call(
             let pos_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
-            ctx.note_tile_dims(rows, cols, "f32");
+            ctx.note_tile_dims(rows, cols, "f32")?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or("elem_in0").to_string();
             let pos = ctx.resolve_const(pos_ssa).to_string();
             let out_var = ctx.fresh_var("_rope");
@@ -3271,16 +3289,16 @@ fn make_binop(
     args: &[String],
     result: &Option<String>,
     ctx: &mut AieContext,
-) -> Option<AieOp> {
+) -> Result<Option<AieOp>, String> {
     if args.len() < 5 {
-        return None;
+        return Ok(None);
     }
     let a_ssa = args[1].trim();
     let b_ssa = args[2].trim();
     let rows = ctx.resolve_const(args[3].trim());
     let cols = ctx.resolve_const(args[4].trim());
     let dtype = if callee.contains("f16") { "f16" } else { "f32" };
-    ctx.note_tile_dims(rows, cols, dtype);
+    ctx.note_tile_dims(rows, cols, dtype)?;
     let a_var = ctx.get_tile_var(a_ssa).unwrap_or("elem_in0").to_string();
     let b_var = ctx.get_tile_var(b_ssa).unwrap_or("elem_in1").to_string();
     let out_var = ctx.fresh_var("_binop");
@@ -3289,12 +3307,12 @@ fn make_binop(
         ctx.tile_shapes
             .insert(r.clone(), (rows, cols, dtype.to_string()));
     }
-    Some(AieOp::BinOp {
+    Ok(Some(AieOp::BinOp {
         py_op,
         a_var,
         b_var,
         out_var,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------

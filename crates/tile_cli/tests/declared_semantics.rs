@@ -62,6 +62,12 @@ fn kernel(op: &str, rows: usize, cols: usize, reduces: bool) -> String {
 
 #[test]
 fn mlir_backends_declare_the_operation_that_was_asked_for() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let exe = env!("CARGO_BIN_EXE_tile");
     let dir = std::env::temp_dir().join(format!("tile-declared-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a scratch directory");

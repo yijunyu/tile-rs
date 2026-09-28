@@ -1309,7 +1309,11 @@ fn tile_buf_type_rowreduce(rows: u32, dtype: &str) -> String {
     let alloc_rows = if rows % align_rows == 0 {
         rows
     } else {
-        ((rows / align_rows) + 1) * align_rows
+        // saturating: for rows within `align_rows` of u32::MAX the round-up does not
+        // fit u32 (a debug build panics on the multiply). The saturated value is
+        // never 32B-aligned, so `validate_tile_shape`'s C3-reduce rule refuses the
+        // tile — an absurd extent becomes an Err, never a wrapped allocation.
+        ((rows / align_rows) + 1).saturating_mul(align_rows)
     };
     format!(
         "!pto.tile_buf<loc=vec, dtype={}, rows={}, cols=1, v_row={}, v_col=1, \
@@ -1340,7 +1344,10 @@ fn tile_buf_type_rowreduce_wide(rows: u32, valid: u32, dtype: &str) -> String {
     // Widen to hold every partial rather than clamping to one alignment unit.
     // Clamping would still verify and still run, and would silently reduce the
     // absmax to the first `align_cols` blocks -- a wrong scale, not an error.
-    let cols = valid.div_ceil(align_cols) * align_cols;
+    // saturating: `valid` near u32::MAX rounds up past u32 (debug panic otherwise);
+    // the saturated column count is never 32B-aligned, so it cannot pass as a real
+    // tile — refusal, not a wrapped one.
+    let cols = valid.div_ceil(align_cols).saturating_mul(align_cols);
     format!(
         "!pto.tile_buf<loc=vec, dtype={}, rows={}, cols={}, v_row={}, v_col={}, \
          blayout=row_major, slayout=none_box, fractal=512, pad=0>",

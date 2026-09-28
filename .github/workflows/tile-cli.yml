@@ -61,6 +61,14 @@ jobs:
         run: cargo build --locked
       - name: test
         run: cargo test --locked
+      - name: the ISSTA regression gates run with the build
+        # Named deliberately: these three files are the campaign's finding surface
+        # (never-panic fuzz corpus mutations, metamorphic surface-equivalence, and the
+        # pinned u32::MAX-extent refusals). The blanket `cargo test` above runs them
+        # too, but a future `--lib` or `-- --skip` on that step would silently drop
+        # every tests/ target — which is exactly how sibling trees went months without
+        # exercising their ungated-emitter gates. Sub-second once built.
+        run: cargo test --locked --test issta_fuzz --test issta_metamorphic -- --nocapture
       - name: test with the stats feature (the crypto the corpus needs)
         run: cargo test --locked --features stats
       - name: the tool runs on this machine

@@ -39,12 +39,24 @@ fn emit(mlir: &str) -> Result<String, String> {
 
 #[test]
 fn the_shape_it_was_written_for_lowers() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let out = emit(&score_mlir("%dk", "%dv")).expect("dk=dv=64 is the specialization");
     assert!(out.contains("DK4_FIXED"), "expected the specialized kernel");
 }
 
 #[test]
 fn a_head_dimension_it_was_not_written_for_is_refused() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let err = emit(&score_mlir("128", "128")).expect_err("dk=128 must be refused");
     assert!(err.contains("specialized to dk=64"), "got: {err}");
     assert!(err.contains("called with dk=128"), "got: {err}");
@@ -52,6 +64,12 @@ fn a_head_dimension_it_was_not_written_for_is_refused() {
 
 #[test]
 fn each_shape_operand_is_checked_separately() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // dk is right and dv is wrong: a guard that only looked at the first operand,
     // or that stopped at the first match, would let this through.
     let err = emit(&score_mlir("%dk", "128")).expect_err("dv=128 must be refused");
@@ -60,6 +78,12 @@ fn each_shape_operand_is_checked_separately() {
 
 #[test]
 fn a_dynamic_shape_operand_still_lowers() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     // %dyn is loaded at run time, so nothing is proven about it. `parse_const_arg` would
     // happily turn an SSA name into a number and refuse on it; `known_const` does not.
     emit(&score_mlir("%dyn", "%dv")).expect("an unknown dk is not a proven mismatch");

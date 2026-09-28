@@ -160,6 +160,12 @@ fn parse_memref(stdout: &str) -> Vec<f32> {
 
 #[test]
 fn linalg_computes_what_the_reference_computes() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let (Some(mlir_opt), Some(mlir_runner)) = (llvm_tool("mlir-opt"), llvm_tool("mlir-runner"))
     else {
         eprintln!("emulate_linalg: skipped, no mlir-opt / mlir-runner");

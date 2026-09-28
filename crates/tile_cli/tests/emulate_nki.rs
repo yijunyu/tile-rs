@@ -337,6 +337,12 @@ fn f16_judge(
 
 #[test]
 fn nki_computes_what_the_reference_computes() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(py) = python_with_numpy() else {
         eprintln!("emulate_nki: skipped, no Python with numpy");
         return;

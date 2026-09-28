@@ -456,9 +456,13 @@ fn prescan_body_bang(body_lines: &[String], ctx: &mut BangContext) {
                 if args.len() >= 3 {
                     let rows = ctx.resolve_const(args[1].trim());
                     let cols = ctx.resolve_const(args[2].trim());
-                    let size = rows * cols;
-                    if size > 0 && ctx.tile_size == 0 {
-                        ctx.tile_size = size;
+                    // checked: an extent product that overflows is not recorded at
+                    // all — tile_size stays 0 and generate falls back to its 1024
+                    // default rather than wrapping to a wrong-sized kernel.
+                    if let Some(size) = rows.checked_mul(cols) {
+                        if size > 0 && ctx.tile_size == 0 {
+                            ctx.tile_size = size;
+                        }
                     }
                 }
             }
@@ -786,6 +790,23 @@ fn translate_call_bang(
 }
 
 // ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Product of two extents (rows × cols and friends) for buffer sizing.
+///
+/// An overflow is REFUSED, not wrapped: a debug build panics on `rows * cols` and a
+/// release build allocates a wrong-sized buffer — the same stand-in hazard that
+/// `validate_tile_shape`'s C0 refuses zeros for, one step earlier. Every handler in
+/// `emit_intrinsic_bang` returns Result, so refusing here produces the contract's
+/// `EmitError::Rejected` instead of a compiler crash on adversarial extents.
+fn extent_product(a: u32, b: u32, what: &str) -> Result<u32, String> {
+    a.checked_mul(b).ok_or_else(|| {
+        format!("{what}: extent {a} x {b} does not fit in u32 — too large to lower")
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Per-intrinsic emitter
 // ---------------------------------------------------------------------------
 
@@ -813,7 +834,7 @@ pub(crate) fn emit_intrinsic_bang(
             let gm_raw = args[0].trim();
             let rows = ctx.resolve_const(args[1].trim());
             let cols = ctx.resolve_const(args[2].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let param = ctx.param_for_ptr(gm_raw);
             let elem_off = ctx.resolve_offset(gm_raw);
 
@@ -851,7 +872,7 @@ pub(crate) fn emit_intrinsic_bang(
             let tile_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let param = ctx.param_for_ptr(gm_raw);
             let elem_off = ctx.resolve_offset(gm_raw);
             let tile_var = ctx.get_tile_var(tile_ssa).unwrap_or(tile_ssa).to_string();
@@ -896,7 +917,7 @@ pub(crate) fn emit_intrinsic_bang(
                         let up_var = if &a_var == silu_out { b_var } else { a_var };
                         let rows = ctx.resolve_const(args[2 + 1].trim());
                         let cols = ctx.resolve_const(args[3 + 1].trim());
-                        let count = rows * cols;
+                        let count = extent_product(rows, cols, callee)?;
                         let out_buf = ctx.fresh_buf(count, &ctype);
                         if let Some(r) = result {
                             ctx.tile_vars.insert(r.to_string(), out_buf.clone());
@@ -933,7 +954,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -956,7 +977,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -984,7 +1005,7 @@ pub(crate) fn emit_intrinsic_bang(
             let scalar_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let scalar_val = scalar_ssa.to_string();
             let buf = ctx.fresh_buf(count, &ctype);
@@ -1086,7 +1107,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
 
             let out_buf = ctx.fresh_buf(count, &ctype);
@@ -1162,7 +1183,7 @@ pub(crate) fn emit_intrinsic_bang(
             let n = ctx.resolve_const(args[5].trim());
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or(a_ssa).to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or(b_ssa).to_string();
-            let out_count = m * n;
+            let out_count = extent_product(m, n, callee)?;
             let out_buf = ctx.fresh_buf(out_count, &ctype);
             if let Some(r) = result {
                 ctx.tile_vars.insert(r.to_string(), out_buf.clone());
@@ -1316,7 +1337,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let neg_buf = ctx.fresh_buf(count, &ctype);
             let exp_buf = ctx.fresh_buf(count, &ctype);
@@ -1371,7 +1392,7 @@ pub(crate) fn emit_intrinsic_bang(
             let pos_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols = ctx.resolve_const(args[4].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let pos_const = ctx.resolve_const(pos_ssa);
             let out_buf = ctx.fresh_buf(count, &ctype);
@@ -1429,7 +1450,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let out_buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -1474,7 +1495,7 @@ pub(crate) fn emit_intrinsic_bang(
                 .unwrap_or(weight_ssa)
                 .to_string();
             let indices_param = ctx.param_for_ptr(indices_ssa);
-            let out_count = n_indices * embed_dim;
+            let out_count = extent_product(n_indices, embed_dim, callee)?;
             let out_buf = ctx.fresh_buf(out_count, &ctype);
             // Allocate NRAM buffer for indices (loaded from GDRAM)
             let idx_buf = ctx.fresh_buf(n_indices, "int");
@@ -1592,7 +1613,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -1628,7 +1649,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -1651,7 +1672,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -1677,7 +1698,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -1705,7 +1726,7 @@ pub(crate) fn emit_intrinsic_bang(
             let max_ssa = args[3].trim();
             let rows = ctx.resolve_const(args[4].trim());
             let cols = ctx.resolve_const(args[5].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let min_val = min_ssa.to_string();
             let max_val = max_ssa.to_string();
@@ -1750,7 +1771,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, "half");
             if let Some(r) = result {
@@ -1776,7 +1797,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, "float");
             if let Some(r) = result {
@@ -1805,7 +1826,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_c = ctx.resolve_const(args[5].trim());
             let dst_r = ctx.resolve_const(args[6].trim());
             let dst_c = ctx.resolve_const(args[7].trim());
-            let count = dst_r * dst_c;
+            let count = extent_product(dst_r, dst_c, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
@@ -1844,7 +1865,7 @@ pub(crate) fn emit_intrinsic_bang(
             let cols_a = ctx.resolve_const(args[4].trim());
             let cols_b = ctx.resolve_const(args[5].trim());
             let total_cols = cols_a + cols_b;
-            let count = rows * total_cols;
+            let count = extent_product(rows, total_cols, callee)?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or(a_ssa).to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or(b_ssa).to_string();
             let buf = ctx.fresh_buf(count, &ctype);
@@ -1891,7 +1912,7 @@ pub(crate) fn emit_intrinsic_bang(
             let d = ctx.resolve_const(args[5].trim());
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let idx_param = ctx.param_for_ptr(idx_ssa);
-            let out_count = _m * d;
+            let out_count = extent_product(_m, d, callee)?;
             let buf = ctx.fresh_buf(out_count, &ctype);
             let idx_buf = ctx.fresh_buf(n, "int");
             if let Some(r) = result {
@@ -1934,7 +1955,7 @@ pub(crate) fn emit_intrinsic_bang(
             let d = ctx.resolve_const(args[5].trim());
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let idx_param = ctx.param_for_ptr(idx_ssa);
-            let out_count = n * d;
+            let out_count = extent_product(n, d, callee)?;
             let buf = ctx.fresh_buf(out_count, &ctype);
             let idx_buf = ctx.fresh_buf(n, "int");
             if let Some(r) = result {
@@ -1975,7 +1996,7 @@ pub(crate) fn emit_intrinsic_bang(
             let k = ctx.resolve_const(args[5].trim());
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let idx_out_param = ctx.param_for_ptr(idx_out_ssa);
-            let out_count = rows * k;
+            let out_count = extent_product(rows, k, callee)?;
             let val_buf = ctx.fresh_buf(out_count, &ctype);
             let idx_buf = ctx.fresh_buf(out_count, "int");
             if let Some(r) = result {
@@ -2055,7 +2076,7 @@ pub(crate) fn emit_intrinsic_bang(
             let scalar_raw = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols_val = ctx.resolve_const(args[3].trim());
-            let count = rows * cols_val;
+            let count = extent_product(rows, cols_val, callee)?;
             let out_buf = ctx.fresh_buf(count, &ctype);
             if let Some(r) = result {
                 ctx.tile_vars.insert(r.to_string(), out_buf.clone());
@@ -2077,7 +2098,7 @@ pub(crate) fn emit_intrinsic_bang(
             let b_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols_val = ctx.resolve_const(args[4].trim());
-            let count = rows * cols_val;
+            let count = extent_product(rows, cols_val, callee)?;
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or(a_ssa).to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or(b_ssa).to_string();
             let out_buf = ctx.fresh_buf(count, &ctype);
@@ -2113,7 +2134,7 @@ pub(crate) fn emit_intrinsic_bang(
                 });
             let rows = ctx.resolve_const(args[3].trim());
             let cols_val = ctx.resolve_const(args[4].trim());
-            let count = rows * cols_val;
+            let count = extent_product(rows, cols_val, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let sq_buf = ctx.fresh_buf(count, &ctype);
             let out_buf = ctx.fresh_buf(count, &ctype);
@@ -2194,7 +2215,7 @@ pub(crate) fn emit_intrinsic_bang(
             let scale_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols_val = ctx.resolve_const(args[4].trim());
-            let count = rows * cols_val;
+            let count = extent_product(rows, cols_val, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let scale_var = ctx.get_tile_var(scale_ssa).unwrap_or(scale_ssa).to_string();
             let out_buf = ctx.fresh_buf(count, "int8_t");
@@ -2232,7 +2253,7 @@ pub(crate) fn emit_intrinsic_bang(
             let scale_ssa = args[2].trim();
             let rows = ctx.resolve_const(args[3].trim());
             let cols_val = ctx.resolve_const(args[4].trim());
-            let count = rows * cols_val;
+            let count = extent_product(rows, cols_val, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let scale_var = ctx.get_tile_var(scale_ssa).unwrap_or(scale_ssa).to_string();
             let out_buf = ctx.fresh_buf(count, &ctype);
@@ -2301,7 +2322,7 @@ pub(crate) fn emit_intrinsic_bang(
             let rng_seed_ssa = args[4].trim();
             let rows = ctx.resolve_const(args[5].trim());
             let cols_val = ctx.resolve_const(args[6].trim());
-            let count = rows * cols_val;
+            let count = extent_product(rows, cols_val, callee)?;
             let logits_var = ctx
                 .get_tile_var(logits_ssa)
                 .unwrap_or(logits_ssa)
@@ -2482,7 +2503,7 @@ pub(crate) fn emit_intrinsic_bang(
             let src_ssa = args[1].trim();
             let rows = ctx.resolve_const(args[2].trim());
             let cols = ctx.resolve_const(args[3].trim());
-            let count = rows * cols;
+            let count = extent_product(rows, cols, callee)?;
             let src_var = ctx.get_tile_var(src_ssa).unwrap_or(src_ssa).to_string();
             let buf = ctx.fresh_buf(count, "float");
             if let Some(r) = result {
@@ -2523,7 +2544,7 @@ pub(crate) fn emit_intrinsic_bang(
             let n = ctx.resolve_const(args[5].trim());
             let a_var = ctx.get_tile_var(a_ssa).unwrap_or(a_ssa).to_string();
             let b_var = ctx.get_tile_var(b_ssa).unwrap_or(b_ssa).to_string();
-            let out_count = m * n;
+            let out_count = extent_product(m, n, callee)?;
             let out_buf = ctx.fresh_buf(out_count, &ctype);
             if let Some(r) = result {
                 ctx.tile_vars.insert(r.to_string(), out_buf.clone());
@@ -2729,7 +2750,7 @@ fn emit_bang_binop(
     let ctype = c_type_bang(&dtype).to_string();
     let rows = ctx.resolve_const(args[3].trim());
     let cols = ctx.resolve_const(args[4].trim());
-    let count = rows * cols;
+    let count = extent_product(rows, cols, bang_fn)?;
     let a_var = ctx.get_tile_var(a_ssa).unwrap_or(a_ssa).to_string();
     let b_var = ctx.get_tile_var(b_ssa).unwrap_or(b_ssa).to_string();
     let buf = ctx.fresh_buf(count, &ctype);

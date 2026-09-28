@@ -5697,6 +5697,12 @@ fn scan(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
 
 #[test]
 fn the_specification_runs() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let mut runner = Runner::new();
     register(&mut runner);
 

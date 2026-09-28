@@ -142,9 +142,15 @@ pub fn lift(input: &Path) -> Result<String, LiftError> {
 mod tests {
     use super::*;
 
+    /// TILE_ASCENDC_TO_RS is process-global and these tests run in parallel: one
+    /// test's override is briefly the world for the other. Same lock, same shape
+    /// as `backlog.rs` / `lower_rs.rs`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The override is what the CLI's own tests use, so it has to actually win.
     #[test]
     fn env_override_beats_path() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let f = std::env::temp_dir().join("tile-lift-probe-bin");
         std::fs::write(&f, b"#!/bin/sh\n").unwrap();
         std::env::set_var("TILE_ASCENDC_TO_RS", &f);
@@ -157,6 +163,7 @@ mod tests {
     /// "not installed" into a confusing exec failure at the moment of use.
     #[test]
     fn override_must_exist() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TILE_ASCENDC_TO_RS", "/nonexistent/ascendc-to-rs");
         assert!(locate().is_none());
         std::env::remove_var("TILE_ASCENDC_TO_RS");

@@ -94,6 +94,11 @@ pub mod kernel_writer;
 enum KernelType {
     /// A pointwise chain composed op-by-op. See [`analyze_elementwise_chain_checked`].
     ElementwiseChain,
+    /// A single pointwise intrinsic no structural arm claimed, composed from the
+    /// `chain_op` template rather than falling through to `Copy`. Set by the
+    /// pending record in [`classify_body`]; the expression lives in
+    /// [`MslContext::elementwise`].
+    ElementwiseExpr,
     /// A matvec composed from load/cast/mul/reduce/store. See [`analyze_matvec_chain`].
     MatvecChain,
     /// Elementwise compute composed over partition cells, with one or more
@@ -537,6 +542,15 @@ struct MslContext {
     /// Compile-time shape operands appended to a canned kernel's intrinsic:
     /// `Some(Ok(None))` when the call used its original operands only.
     shape_operands: Option<Result<Option<Vec<u32>>, String>>,
+    /// `(arity, template)` for [`KernelType::ElementwiseExpr`]: the pointwise
+    /// expression `chain_op` modelled but no structural classify arm claimed.
+    elementwise: Option<(usize, &'static str)>,
+    /// The eps literal the `__tile_rms_norm_*` call carries, baked into the body.
+    /// eps is the one operand the harness hands the references but not the kernel
+    /// (it is not a scalar the runner can bind), so the emitter must read it from
+    /// the MLIR and write it into the source. A hardcoded 1e-6 against a stated
+    /// 2.5e-2 disagrees by ~8.7e-3 on every element.
+    rms_eps: Option<String>,
 }
 
 impl MslContext {
@@ -557,6 +571,8 @@ impl MslContext {
             indexer_shape: None,
             indexer_one_n_head: None,
             shape_operands: None,
+            elementwise: None,
+            rms_eps: None,
         }
     }
 
@@ -565,6 +581,23 @@ impl MslContext {
             return n;
         }
         parse_const_arg(s)
+    }
+
+    /// A constant operand the IR actually proves, or `None` when nothing is proven
+    /// about it. `resolve_const` folds every unreadable name to 0, which is the right
+    /// answer for a caller that refuses on 0 — but a specialization guard must never
+    /// turn "I cannot read this operand" into evidence that it disagrees, so it asks
+    /// this instead: the constant map first, then only the readings `parse_const_arg`
+    /// documents as sound (a decimal, or an MLIR `%c<N>` name), and nothing else.
+    fn known_const(&self, s: &str) -> Option<u32> {
+        let t = s.trim();
+        if let Some(&n) = self.const_map.get(t) {
+            return Some(n);
+        }
+        match parse_const_arg(t) {
+            0 => None,
+            v => Some(v),
+        }
     }
 }
 
@@ -778,7 +811,7 @@ fn emit_sum_rows_f32_for_contract(out: &mut String) {
     emit_sum_rows_msl(out, "float");
 }
 fn emit_rms_norm_f32_for_contract(out: &mut String) {
-    emit_rms_norm_msl(out, "float");
+    emit_rms_norm_msl(out, "float", "1e-6");
 }
 
 pub(crate) const PORTED_KERNELS: &[LagunaEmitter] = &[
@@ -1569,8 +1602,8 @@ fn reject_unknown_intrinsics(module: &MlirModule) -> Result<(), String> {
             }
             return Err(format!(
                 "mlir_to_msl has no arm for `{name}`. Kernel-type detection would fall \
-                 through to Copy and emit a copy of the first operand — a kernel that \
-                 compiles, runs, and computes something else."
+                 through to the COPY arm — `KernelType::Copy` — and emit a copy of the \
+                 first operand: a kernel that compiles, runs, and computes something else."
             ));
         }
     }
@@ -1911,6 +1944,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
     if matches!(ctx.kernel_type, KernelType::Copy) {
         classify_body(&func.body_lines, &mut ctx);
     }
+    // The eps operand rides along as a literal, not a runtime parameter -- see
+    // `MslContext::rms_eps`.
+    ctx.rms_eps = find_rms_eps(&func.body_lines);
 
     // Batched (M=8) non-matmul kernels have exotic signatures (2D/3D grid position
     // attributes, in-place buffers, many params) that the generic signature machinery
@@ -2195,7 +2231,6 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::LagunaAttnDecodeGqaF16 => 5, // q(float), gate(float), key_cache(half), value_cache(half), out(float)
         _ => 2,
     });
-    let local_x: u32 = ctx.tile_width.min(1024).max(1);
     let msl_type = if ctx.dtype == "f16" { "half" } else { "float" };
     // Index of the constant-params buffer (after data buffers)
     let params_idx = num_bufs;
@@ -8366,6 +8401,10 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             // lane of a GPU.
             | KernelType::ArgMax
             | KernelType::TopK
+            // The row maxes fold through `sdata` too; without it their bodies
+            // indexed an array that was never declared.
+            | KernelType::ReduceMax
+            | KernelType::Absmax
     );
     let needs_cooperative_shared = matches!(
         ctx.kernel_type,
@@ -8375,7 +8414,23 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::GateUpSiLU | KernelType::AttentionDecode | KernelType::AttentionPrefill
     );
     if needs_reduction {
-        writeln!(out, "    threadgroup {} sdata[{}];", msl_type, local_x).unwrap();
+        // Sized for the DISPATCH ceiling, not the tile width. `tcount` is chosen
+        // at RUN time from the run shape (up to 1024), while `local_x` came from
+        // the tile width the MLIR happened to mention at EMIT time -- two
+        // independent sources for one quantity, equal only by coincidence. When
+        // they disagreed the body's `sdata[tid]` for tid < tcount wrote past the
+        // array, and softmax came back with max rel error 17.8 against torch on
+        // an M1 Ultra while our own reference and torch agreed to 6.7e-7. Pinned,
+        // device-free, by `tests/msl_threadgroup_bounds.rs`.
+        writeln!(out, "    constexpr uint MAX_TG = 1024;").unwrap();
+        // Always `float`, never `msl_type`: the folds here sum (softmax's
+        // exp terms, rms-style sums) or compare exact representable values
+        // (maxes, argmin/argmax indices). A `half sdata` rounded every fold
+        // step of an f16 kernel -- 64..512 additions at 10 mantissa bits --
+        // past the unit roundoff the f16 sweep judges at. Widening costs
+        // nothing for f32 kernels (byte-identical output) and f16 values are
+        // exactly representable in float.
+        writeln!(out, "    threadgroup float sdata[MAX_TG];").unwrap();
     }
     if needs_cooperative_shared {
         writeln!(out, "    constexpr uint MAX_SIMD_GROUPS = 1024 / 32;").unwrap();
@@ -8397,8 +8452,10 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::CausalMask
         | KernelType::WindowMask
         | KernelType::StridedMask
-        | KernelType::GemmChain
-        | KernelType::ElementwiseChain
+        |         KernelType::GemmChain
+        // ElementwiseChain INDEXES by `base` now (strided row walk), so it needs
+        // the shared prologue to declare it -- it was on this skip-list while the
+        // body used a flat `row * tcount + tid` that never touched `base`.
         | KernelType::PartitionChain
         | KernelType::PartitionCell
         | KernelType::PartitionCellStore
@@ -8634,6 +8691,10 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::GemmChain => emit_gemm_chain_msl(out, &ctx),
         KernelType::MatvecChain => emit_matvec_chain_msl(out, &ctx),
         KernelType::ElementwiseChain => emit_elementwise_chain_msl(out, &ctx),
+        KernelType::ElementwiseExpr => {
+            let (arity, tmpl) = ctx.elementwise.unwrap_or((1, "{0}"));
+            emit_elementwise_expr_msl(out, arity, tmpl);
+        }
         KernelType::PartitionChain => emit_partition_chain_msl(out, &ctx),
         KernelType::Softmax => emit_softmax_msl(out, msl_type),
         KernelType::Add => emit_binop_msl(out, "+"),
@@ -8679,7 +8740,9 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         KernelType::Repeat => emit_repeat_msl(out),
         KernelType::GetRows => emit_get_rows_msl(out),
         KernelType::SetRows => emit_set_rows_msl(out),
-        KernelType::RmsNorm => emit_rms_norm_msl(out, msl_type),
+        KernelType::RmsNorm => {
+            emit_rms_norm_msl(out, msl_type, ctx.rms_eps.as_deref().unwrap_or("1e-6"))
+        }
         KernelType::Absmax => emit_absmax_msl(out, msl_type),
         KernelType::Quantize => emit_quantize_msl(out, msl_type),
         KernelType::Dequantize => emit_dequantize_msl(out, msl_type),
@@ -9468,10 +9531,16 @@ fn analyze_elementwise_chain_checked(
         let built = if arity == 1 {
             tmpl.replace("{0}", &a0)
         } else {
-            if let Some(a) = args.get(1) {
+            // The bridge spells a binary call in DUP form -- `(v0, v0dup, v1, r,
+            // c)`, five arguments with the first tile id repeated -- so operand 1
+            // sits at index 2 whenever that duplicate is present. Reading index 1
+            // there built `fmin(a, a)` / `a * a`: the fused silu+mul kernel
+            // emitted `silu * silu` where the golden expects `silu * p1`.
+            let b_idx = if args.len() >= 5 { 2 } else { 1 };
+            if let Some(a) = args.get(b_idx) {
                 *use_count.entry(a.trim().to_string()).or_insert(0) += tmpl.matches("{1}").count();
             }
-            let a1 = match args.get(1).and_then(|a| expr.get(a.trim())) { Some(e) => e.clone(), None => return Ok(false) };
+            let a1 = match args.get(b_idx).and_then(|a| expr.get(a.trim())) { Some(e) => e.clone(), None => return Ok(false) };
             tmpl.replace("{0}", &a0).replace("{1}", &a1)
         };
         expr.insert(r, built);
@@ -9497,9 +9566,12 @@ fn analyze_elementwise_chain_checked(
     }
 
     ctx.chain_body.clear();
-    // Flat map over the vector: ceil(n / tcount) threadgroups of tcount threads each.
-    ctx.chain_body.push("    uint gid = row * tcount + tid;".to_string());
-    ctx.chain_body.push("    if (gid < num_elements) {".to_string());
+    // Strided over the row: one threadgroup per ROW, `tcount` threads walking
+    // `i += tcount` over `num_elements` elements at `base + i`. The flat map this
+    // replaces (`gid = row * tcount + tid`) covered only `tcount` elements of the
+    // row and mixed the rows together once there was more than one of them.
+    ctx.chain_body.push("    for (uint i = tid; i < num_elements; i += tcount) {".to_string());
+    ctx.chain_body.push("        uint gid = base + i;".to_string());
     for d in &decls {
         ctx.chain_body.push(d.clone());
     }
@@ -10291,6 +10363,36 @@ fn recorded_shape(ctx: &MslContext) -> Result<Option<Vec<u32>>, String> {
     ctx.shape_operands.clone().unwrap_or(Ok(None))
 }
 
+/// The head dims the vec-score kernel was written for, read where the call puts
+/// them: the 14-operand form is `p0..p6, dk, dv, ne01, ne11, nb01, nb11, scale`
+/// (the parameter list in `emit_flash_attn_ext_vec_score_msl`), so dk and dv are
+/// operands 7 and 8.
+///
+/// The emitter bakes them into the K-row stride and the staged tiles, so a proven
+/// constant that disagrees with the shipped shape is refused: `dk=128` used to emit
+/// this kernel at the dk=64 stride anyway and return wrong attention scores with no
+/// crash. An operand nothing is proven about still lowers — a guard that refused
+/// those would break working callers to look thorough.
+fn check_flash_vec_score_dims(args: &[String], ctx: &MslContext) -> Result<(), String> {
+    if args.len() < 9 {
+        return Ok(());
+    }
+    for (i, what, want) in [
+        (7usize, "dk", FLASH_STAGE_DK),
+        (8usize, "dv", FLASH_STAGE_DV),
+    ] {
+        if let Some(got) = ctx.known_const(&args[i]) {
+            if got != want {
+                return Err(format!(
+                    "flash_attn_ext_vec_score: the kernel is specialized to {what}={want}, \
+                     but was called with {what}={got}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read the shape of a `__tile_indexer_scores_tiled_*` call.
 ///
 /// The intrinsic takes 15 operands (4 buffers, 11 runtime scalars) followed by
@@ -10331,8 +10433,52 @@ fn indexer_shape_from_operands(
     Ok(shape)
 }
 
+/// The eps literal bound to `__tile_rms_norm_*` argument 2, verbatim from the
+/// MLIR (e.g. `"2.500000e-02"`), or `None`.
+///
+/// Only the FIVE-argument form carries eps: the four-argument call is
+/// `(tile, tile, rows, cols)`, so index 2 there is the ROW COUNT, whose constant
+/// is `1`. The same mistake, twice, is recorded in `Shape::rms_eps_from_mlir`.
+/// The literal is returned unparsed so the emitted source keeps the source's own
+/// spelling -- `1e-6` stays `1e-6` instead of becoming `0.000001`, which keeps
+/// the committed-artifact parity tests byte-identical.
+fn find_rms_eps(body_lines: &[String]) -> Option<String> {
+    let mut consts: HashMap<&str, &str> = HashMap::new();
+    let mut eps_ssa: Option<&str> = None;
+    for raw in body_lines {
+        let line = raw.trim();
+        if line.contains("llvm.mlir.constant(") && (line.contains(": f32") || line.contains(": f16")) {
+            let lhs = line.split('=').next()?.trim();
+            let open = line.find('(')? + 1;
+            let close = line.find(')')?;
+            if lhs.starts_with('%') {
+                consts.insert(lhs, line[open..close].split(':').next()?.trim());
+            }
+        }
+        if line.contains("__tile_rms_norm_") && line.contains('(') {
+            let open = line.find('(')?;
+            let close = line.find(')')?;
+            let args: Vec<&str> = line[open + 1..close].split(',').map(str::trim).collect();
+            if args.len() >= 5 {
+                eps_ssa = args.get(2).copied();
+            }
+        }
+    }
+    let eps_ssa = eps_ssa?;
+    // The constant map only ever holds `: f32` / `: f16` constants (the insert
+    // above requires the type annotation on the line), which is the same
+    // float-typedness check `Shape::rms_eps_from_mlir` applies to its reference
+    // side -- an integer-typed operand can never reach here to disagree with it.
+    consts.get(eps_ssa).map(|lit| lit.to_string())
+}
+
 fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
     let mut store_map: HashMap<String, String> = HashMap::new();
+    // The last pointwise intrinsic no structural arm claimed, as `chain_op`
+    // spells it. Recorded rather than applied inline: an arm LATER in the body
+    // may be the kernel's real shape, and only the loop as a whole knows
+    // whether anything claimed the kernel at all.
+    let mut pending: Option<(usize, &'static str)> = None;
 
     for line in body_lines {
         let line = line.trim();
@@ -10607,7 +10753,7 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                         ctx.kernel_type = KernelType::ReduceMax;
                     }
                 }
-                "__tile_sum_rows_f32" => {
+                "__tile_sum_rows_f32" | "__tile_reduce_sum_f32" | "__tile_reduce_sum_f16" => {
                     if ctx.kernel_type == KernelType::Copy {
                         ctx.kernel_type = KernelType::SumRows;
                     }
@@ -10941,13 +11087,19 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                         ctx.kernel_type = KernelType::FlashAttnExtVecScore;
                         // The shared tiles are sized at emit time; the runtime dk
                         // and dv above only say how much of them to walk.
-                        ctx.shape_operands = Some(trailing_shape_operands(
+                        let staged = trailing_shape_operands(
                             &callee,
                             &args,
                             14,
                             &["dk_staged", "dv_staged"],
                             ctx,
-                        ));
+                        );
+                        // ...and a walk length the IR proves is a head dim the
+                        // kernel was not written for is refused, because the
+                        // strides it would walk with are already baked.
+                        ctx.shape_operands = Some(staged.and_then(|staged| {
+                            check_flash_vec_score_dims(&args, ctx).map(|()| staged)
+                        }));
                     }
                 }
                 "__tile_flash_attn_ext_vec_out_f32" => {
@@ -12079,8 +12231,31 @@ fn classify_body(body_lines: &[String], ctx: &mut MslContext) {
                         ctx.kernel_type = KernelType::LagunaQ3KPairSwigluF32;
                     }
                 }
-                _ => {}
+                // No structural arm claimed this intrinsic. If `chain_op` models it
+                // as scalar math, record the expression and apply it after the loop
+                // -- only if the kernel is STILL Copy then. Falling through to
+                // `KernelType::Copy` instead emits `p1[...] = p0[...]`, a copy that
+                // compiles, runs, and computes something else; `__tile_neg_f32`,
+                // `__tile_abs_f32`, `__tile_relu_f32`, `__tile_tanh_f32`,
+                // `__tile_min_f32`/`_f16` and `__tile_sqrt_f16` all sat in that
+                // hole, known stems with no arm to catch them.
+                other => {
+                    if let Some(x) = chain_op(other) {
+                        pending = Some(x);
+                    }
+                }
             }
+        }
+    }
+
+    // An unclaimed pointwise op on a kernel nothing else classified becomes an
+    // ElementwiseExpr body. If some arm DID claim the kernel, the recorded op was
+    // a passenger (or the chain-rejected shape of a structured kernel) and the
+    // claimed body is what emits.
+    if ctx.kernel_type == KernelType::Copy {
+        if let Some((arity, tmpl)) = pending {
+            ctx.elementwise = Some((arity, tmpl));
+            ctx.kernel_type = KernelType::ElementwiseExpr;
         }
     }
 }
@@ -12097,6 +12272,35 @@ fn emit_softmax_msl(out: &mut String, msl_type: &str) {
     } else {
         "-MAXFLOAT"
     };
+    // exp and the sum are computed in f32 for BOTH precisions: the reference
+    // computes in f32 and judges f16 output at the f16 unit roundoff, which
+    // half-`tsum` accumulation (64..512 terms) blew through at 2.2e-3. The max
+    // stays in the buffer type -- a max of representable halfs is exact there,
+    // and the subtraction that follows is lifted to f32 explicitly below.
+    let acc = if msl_type == "half" { "float" } else { msl_type };
+    // The half path must not stage `e` in p1 between the passes: p1 is a
+    // half buffer, so that store rounds exp's result to 10 mantissa bits and
+    // the normalise pass then rounds again -- two roundings against a
+    // tolerance of exactly one (unit_roundoff("half")). Pass 3 recomputes
+    // exp instead; the float path stores through p1 as before, byte-identical.
+    let (e_decl, store_e, normalise) = if msl_type == "half" {
+        (
+            "        float e = exp((float)p0[base + i] - (float)row_max);",
+            None,
+            "        p1[base + i] = (half)(exp((float)p0[base + i] - (float)row_max) / row_sum);",
+        )
+    } else {
+        (
+            "        float e = exp(p0[base + i] - row_max);",
+            Some("        p1[base + i] = e;"),
+            "        p1[base + i] /= row_sum;",
+        )
+    };
+    let row_max_decl = if msl_type == "half" {
+        "    half row_max = (half)sdata[0];"
+    } else {
+        "    float row_max = sdata[0];"
+    };
     // Pass 1: thread-local max
     writeln!(out, "    // Pass 1: find row max").unwrap();
     writeln!(out, "    {} tmax = {};", msl_type, neg_max).unwrap();
@@ -12104,10 +12308,11 @@ fn emit_softmax_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "        tmax = max(tmax, p0[base + i]);").unwrap();
     writeln!(out, "    sdata[tid] = tmax;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
+    // Doubling stride: see the fold note in `emit_threadgroup_fold_max`.
+    writeln!(out, "    for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
     writeln!(
         out,
-        "        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);"
+        "        if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] = max(sdata[tid], sdata[tid + s]);"
     )
     .unwrap();
     writeln!(
@@ -12116,68 +12321,94 @@ fn emit_softmax_msl(out: &mut String, msl_type: &str) {
     )
     .unwrap();
     writeln!(out, "    }}").unwrap();
-    writeln!(out, "    {} row_max = sdata[0];", msl_type).unwrap();
+    writeln!(out, "{}", row_max_decl).unwrap();
     writeln!(out).unwrap();
     // Pass 2: exp(x - max) + partial sum
     writeln!(out, "    // Pass 2: exp(x - max), accumulate sum").unwrap();
-    writeln!(out, "    {} tsum = 0.0;", msl_type).unwrap();
+    writeln!(out, "    {} tsum = 0.0;", acc).unwrap();
     writeln!(
         out,
         "    for (uint i = tid; i < num_elements; i += tcount) {{"
     )
     .unwrap();
-    writeln!(out, "        {} e = exp(p0[base + i] - row_max);", msl_type).unwrap();
-    writeln!(out, "        p1[base + i] = e;").unwrap();
+    writeln!(out, "{}", e_decl).unwrap();
+    if let Some(s) = store_e {
+        writeln!(out, "{}", s).unwrap();
+    }
     writeln!(out, "        tsum += e;").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    sdata[tid] = tsum;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) sdata[tid] += sdata[tid + s];").unwrap();
+    // Doubling stride: see the fold note in `emit_threadgroup_fold_max`.
+    writeln!(out, "    for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
+    writeln!(out, "        if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] += sdata[tid + s];").unwrap();
     writeln!(
         out,
         "        threadgroup_barrier(mem_flags::mem_threadgroup);"
     )
     .unwrap();
     writeln!(out, "    }}").unwrap();
-    writeln!(out, "    {} row_sum = sdata[0];", msl_type).unwrap();
+    writeln!(out, "    {} row_sum = sdata[0];", acc).unwrap();
     writeln!(out).unwrap();
     // Pass 3: normalise
     writeln!(out, "    // Pass 3: normalise").unwrap();
     writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
-    writeln!(out, "        p1[base + i] /= row_sum;").unwrap();
+    writeln!(out, "{}", normalise).unwrap();
 }
 
-/// Element-wise binary op: dispatched with one thread per element (gid-based).
-/// No batch dimension needed for pointwise ops.
+/// One pointwise expression no structural arm claimed, composed from the
+/// `chain_op` template -- the body `KernelType::Copy` would otherwise have
+/// emitted for `__tile_neg_f32` et al, minus the part where that computes a
+/// copy of operand 0.
+///
+/// Strided over the row, like every other row-dispatched body: the dispatch is
+/// one threadgroup per ROW with `tcount` threads, so `i += tcount` walks the
+/// whole `num_elements`-wide row while `base + i` lands in THIS row. The old
+/// pointwise form `gid = row * tcount + tid` covered only `tcount` elements of
+/// the row and strided the rows together -- right only when `rows == 1` and
+/// `tcount >= num_elements`, which is how it survived being tested at one row.
+fn emit_elementwise_expr_msl(out: &mut String, arity: usize, tmpl: &str) {
+    let lhs = if arity == 2 { "p2" } else { "p1" };
+    let mut expr = tmpl.replace("{0}", "p0[base + i]");
+    if arity >= 2 {
+        expr = expr.replace("{1}", "p1[base + i]");
+    }
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        {}[base + i] = {};", lhs, expr).unwrap();
+    writeln!(out, "    }}").unwrap();
+}
+
+/// Element-wise binary op over the row: one threadgroup per row, threads stride
+/// the row's elements.
 fn emit_binop_msl(out: &mut String, op: &str) {
-    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
     writeln!(
         out,
-        "    if (gid < num_elements) p2[gid] = p0[gid] {} p1[gid];",
+        "        p2[base + i] = p0[base + i] {} p1[base + i];",
         op
     )
     .unwrap();
 }
 
-/// Element-wise unary op. Same flat global index as [`emit_binop_msl`] -- see the note there
-/// on why `base` is wrong for pointwise kernels.
+/// Element-wise unary op over the row. See [`emit_binop_msl`] for why the
+/// stride, and [`emit_elementwise_expr_msl`] for why the flat `gid` form was
+/// only ever right at one row.
 fn emit_unary_msl(out: &mut String, func_name: &str) {
-    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
     writeln!(
         out,
-        "    if (gid < num_elements) p1[gid] = {}(p0[gid]);",
+        "        p1[base + i] = {}(p0[base + i]);",
         func_name
     )
     .unwrap();
 }
 
-/// Scalar multiply. Same flat global index as [`emit_binop_msl`].
+/// Scalar multiply over the row. Same stride as [`emit_binop_msl`].
 fn emit_scale_msl(out: &mut String, _msl_type: &str) {
-    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
     writeln!(
         out,
-        "    if (gid < num_elements) p1[gid] = p0[gid] * scale_val;"
+        "        p1[base + i] = p0[base + i] * scale_val;"
     )
     .unwrap();
 }
@@ -12193,8 +12424,9 @@ fn emit_layernorm_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "        tsum += p0[base + i];").unwrap();
     writeln!(out, "    sdata[tid] = tsum;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) sdata[tid] += sdata[tid + s];").unwrap();
+    // Doubling stride: see the fold note in `emit_threadgroup_fold_max`.
+    writeln!(out, "    for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
+    writeln!(out, "        if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] += sdata[tid + s];").unwrap();
     writeln!(
         out,
         "        threadgroup_barrier(mem_flags::mem_threadgroup);"
@@ -12221,8 +12453,9 @@ fn emit_layernorm_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    sdata[tid] = tvar;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) sdata[tid] += sdata[tid + s];").unwrap();
+    // Doubling stride: see the fold note in `emit_threadgroup_fold_max`.
+    writeln!(out, "    for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
+    writeln!(out, "        if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] += sdata[tid + s];").unwrap();
     writeln!(
         out,
         "        threadgroup_barrier(mem_flags::mem_threadgroup);"
@@ -12279,10 +12512,10 @@ fn emit_l2dist_msl(out: &mut String, msl_type: &str) {
         "        threadgroup_barrier(mem_flags::mem_threadgroup);"
     )
     .unwrap();
-    writeln!(out, "        for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
+    writeln!(out, "        for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
     writeln!(
         out,
-        "            if (tid < s) sdata[tid] += sdata[tid + s];"
+        "            if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] += sdata[tid + s];"
     )
     .unwrap();
     writeln!(
@@ -12333,14 +12566,15 @@ fn emit_argmin_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    }}").unwrap();
     // Store (min, index) pairs — pack as two separate threadgroup arrays
     writeln!(out, "    sdata[tid] = local_min;").unwrap();
-    writeln!(out, "    threadgroup uint idx_data[256];").unwrap();
+    writeln!(out, "    threadgroup uint idx_data[MAX_TG];").unwrap();
     writeln!(out, "    idx_data[tid] = local_idx;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    // Tree reduction keeping (min, argmin) pair
-    writeln!(out, "    for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
+    // Tree reduction keeping (min, argmin) pair; doubling stride, see the fold note
+    // in `emit_threadgroup_fold_max` on why the halving form dropped elements.
+    writeln!(out, "    for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
     writeln!(
         out,
-        "        if (tid < s && sdata[tid + s] < sdata[tid]) {{"
+        "        if (tid % (2*s) == 0 && tid + s < tcount && sdata[tid + s] < sdata[tid]) {{"
     )
     .unwrap();
     writeln!(out, "            sdata[tid]   = sdata[tid + s];").unwrap();
@@ -12360,11 +12594,10 @@ fn emit_argmin_msl(out: &mut String, msl_type: &str) {
     .unwrap();
 }
 
-/// Cast: p1[i] = target_type(p0[i]).
+/// Cast over the row: p1[i] = target_type(p0[i]).
 fn emit_cast_msl(out: &mut String, target_type: &str) {
-    writeln!(out, "    uint gid = base + tid;").unwrap();
-    writeln!(out, "    if (gid < num_elements)").unwrap();
-    writeln!(out, "        p1[gid] = {}(p0[gid]);", target_type).unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
+    writeln!(out, "        p1[base + i] = {}(p0[base + i]);", target_type).unwrap();
 }
 
 /// Slice: copy a subrange of columns from src to dst.
@@ -12535,20 +12768,29 @@ fn emit_matmul_f16_msl(out: &mut String) {
     writeln!(out, "    uint m = row;").unwrap();
     writeln!(out, "    if (m >= M) return;").unwrap();
     writeln!(out, "    for (uint n = tid * 4; n + 3 < N; n += tcount * 4) {{").unwrap();
-    writeln!(out, "        half4 acc = half4(0.0h);").unwrap();
+    // Products round to the buffer type (half) -- the `u_product` term every
+    // summation budget budgets for -- and the ACCUMULATOR is f32, which the
+    // budget assumes ("f32 (assumed)") and reports rather than widens for when
+    // it is violated. A `half4 acc` accumulated K-fold in half drifted to
+    // 1.2e-2 against a 9.2e-3 bound at K=16 and was blamed on the lowering.
+    writeln!(out, "        float4 acc = float4(0.0f);").unwrap();
     writeln!(out, "        for (uint kk = 0; kk < K; kk++)").unwrap();
     writeln!(
         out,
-        "            acc += p0[m * K + kk] * (*(device const half4 *)(p1 + kk * N + n));"
+        "            acc += (float4)(p0[m * K + kk] * (*(device const half4 *)(p1 + kk * N + n)));"
     )
     .unwrap();
-    writeln!(out, "        *(device half4 *)(p2 + m * N + n) = acc;").unwrap();
+    writeln!(out, "        *(device half4 *)(p2 + m * N + n) = (half4)acc;").unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    for (uint n = (N & ~3u) + tid; n < N; n += tcount) {{").unwrap();
-    writeln!(out, "        half acc = 0.0h;").unwrap();
+    writeln!(out, "        float acc = 0.0f;").unwrap();
     writeln!(out, "        for (uint kk = 0; kk < K; kk++)").unwrap();
-    writeln!(out, "            acc += p0[m * K + kk] * p1[kk * N + n];").unwrap();
-    writeln!(out, "        p2[m * N + n] = acc;").unwrap();
+    writeln!(
+        out,
+        "            acc += (float)(p0[m * K + kk] * p1[kk * N + n]);"
+    )
+    .unwrap();
+    writeln!(out, "        p2[m * N + n] = (half)acc;").unwrap();
     writeln!(out, "    }}").unwrap();
 }
 
@@ -12867,18 +13109,45 @@ fn emit_fill_msl(out: &mut String) {
 }
 
 fn emit_max_msl(out: &mut String) {
-    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
-    writeln!(out, "    if (gid >= num_elements) return;").unwrap();
-    writeln!(out, "    p2[gid] = max(p0[gid], p1[gid]);").unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount)").unwrap();
+    writeln!(out, "        p2[base + i] = max(p0[base + i], p1[base + i]);").unwrap();
 }
 
+/// Row-wise max reduction: one workgroup per row, threads stride the row, then a
+/// threadgroup fold over `sdata` combines the partials. The previous body did no
+/// reduction at all -- `simd_max` over a single thread's own value, then
+/// `if (tid == 0) p1[row] = val`, so the row's max was whichever element thread 0
+/// happened to hold, and only at `tcount >= num_elements` did that coincide.
 fn emit_reduce_max_msl(out: &mut String, msl_type: &str) {
-    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
-    writeln!(out, "    if (gid >= num_elements) return;").unwrap();
-    writeln!(out, "    {} val = p0[gid];", msl_type).unwrap();
-    writeln!(out, "    // simd reduction for max").unwrap();
-    writeln!(out, "    val = simd_max(val);").unwrap();
-    writeln!(out, "    if (tid == 0) p1[row] = val;").unwrap();
+    let neg_max = if msl_type == "half" { "-MAXHALF" } else { "-MAXFLOAT" };
+    writeln!(out, "    {} local = {};", msl_type, neg_max).unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        {} v = p0[base + i];", msl_type).unwrap();
+    writeln!(out, "        if (v > local) local = v;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    sdata[tid] = local;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    emit_threadgroup_fold_max(out, "    ");
+    writeln!(out, "    if (tid == 0) p1[row] = sdata[0];").unwrap();
+}
+
+/// The threadgroup-wide max fold over `sdata`, doubling stride: `s` walks
+/// 1, 2, 4, ... and each step folds every pair `(2k·s, (2k+1)·s)` that is still
+/// inside the live `tcount` range.
+///
+/// The halving form this replaces (`for (s = tcount/2; s > 0; s >>= 1) if
+/// (tid < s) ...`) silently drops elements whenever `tcount` is not a power of
+/// two: at tcount=96 it never reads index 2, at 33 it never reads 32, at 129 it
+/// never reads 128. Simulated against every tcount before this was written.
+fn emit_threadgroup_fold_max(out: &mut String, indent: &str) {
+    writeln!(out, "{indent}for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
+    writeln!(
+        out,
+        "{indent}    if (tid % (2*s) == 0 && tid + s < tcount && sdata[tid + s] > sdata[tid]) sdata[tid] = sdata[tid + s];"
+    )
+    .unwrap();
+    writeln!(out, "{indent}    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "{indent}}}").unwrap();
 }
 
 /// Row-wise sum reduction. One workgroup per row, threads cooperate over columns.
@@ -12974,14 +13243,33 @@ fn charge_cross_simd_scratch(out: &mut String, array: &'static str) {
 /// RMS normalization with proper cross-SIMD reduction.
 /// One workgroup per row, threads cooperate over columns.
 /// Uses simd_sum for intra-SIMD reduction, then shared memory for cross-SIMD.
-fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
+fn emit_rms_norm_msl(out: &mut String, msl_type: &str, eps_lit: &str) {
+    let half = msl_type == "half";
+    // Sum of squares and the fold run in f32 for both precisions: a `half`
+    // accumulator walking 64..512 squared terms drifted ~1e-3, past the f16
+    // unit roundoff this kernel is judged at. Everything stays byte-identical
+    // for `float` -- the committed artifact comparison depends on that.
+    let acc = if half { "float" } else { msl_type };
     let vec4 = format!("{}4", msl_type);
+    let (vec_sum_decl, vec_store, scalar_store) = if half {
+        (
+            "            float4 v = (float4)p0v[i];",
+            "            p1v[i] = (half4)((float4)p0v[i] * rms);",
+            "            p1[base + i] = (half)(p0[base + i] * rms);",
+        )
+    } else {
+        (
+            "            float4 v = p0v[i];",
+            "            p1v[i] = p0v[i] * rms;",
+            "            p1[base + i] = p0[base + i] * rms;",
+        )
+    };
     writeln!(
         out,
         "    // RMS norm: one workgroup per row, float4-vectorized stride loop"
     )
     .unwrap();
-    writeln!(out, "    {} local_sum = ({})0.0;", msl_type, msl_type).unwrap();
+    writeln!(out, "    {} local_sum = ({})0.0;", acc, acc).unwrap();
     writeln!(out, "    bool vec_ok = (num_elements % 4u) == 0u;").unwrap();
     writeln!(out, "    if (vec_ok) {{").unwrap();
     writeln!(
@@ -12992,7 +13280,7 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
     .unwrap();
     writeln!(out, "        uint n4 = num_elements / 4u;").unwrap();
     writeln!(out, "        for (uint i = tid; i < n4; i += tcount) {{").unwrap();
-    writeln!(out, "            {} v = p0v[i];", vec4).unwrap();
+    writeln!(out, "{}", vec_sum_decl).unwrap();
     writeln!(out, "            local_sum += dot(v, v);").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }} else {{").unwrap();
@@ -13001,7 +13289,7 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
         "        for (uint i = tid; i < num_elements; i += tcount) {{"
     )
     .unwrap();
-    writeln!(out, "            {} v = p0[base + i];", msl_type).unwrap();
+    writeln!(out, "            {} v = p0[base + i];", acc).unwrap();
     writeln!(out, "            local_sum += v * v;").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
@@ -13009,7 +13297,7 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    local_sum = simd_sum(local_sum);").unwrap();
     writeln!(out, "    // Cross-SIMD reduction via shared memory").unwrap();
     writeln!(out, "    constexpr uint MAX_SG = 1024 / 32;").unwrap();
-    writeln!(out, "    threadgroup {} rms_shared[MAX_SG];", msl_type).unwrap();
+    writeln!(out, "    threadgroup {} rms_shared[MAX_SG];", acc).unwrap();
     writeln!(out, "    uint simd_lane = tid % 32;").unwrap();
     writeln!(out, "    uint simd_group = tid / 32;").unwrap();
     writeln!(
@@ -13021,7 +13309,7 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
     writeln!(
         out,
         "    if (simd_group == 0 && simd_lane < MAX_SG) rms_shared[simd_lane] = ({})0.0;",
-        msl_type
+        acc
     )
     .unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
@@ -13040,7 +13328,7 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
     writeln!(
         out,
         "        {} v = (simd_lane < num_sg) ? rms_shared[simd_lane] : ({})0.0;",
-        msl_type, msl_type
+        acc, acc
     )
     .unwrap();
     writeln!(out, "        v = simd_sum(v);").unwrap();
@@ -13049,8 +13337,8 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
     writeln!(
         out,
-        "    {} rms = rsqrt(rms_shared[0] / {}(num_elements) + ({})1e-6);",
-        msl_type, msl_type, msl_type
+        "    {} rms = rsqrt(rms_shared[0] / {}(num_elements) + ({}){});",
+        acc, acc, acc, eps_lit
     )
     .unwrap();
     writeln!(out, "    if (vec_ok) {{").unwrap();
@@ -13068,27 +13356,34 @@ fn emit_rms_norm_msl(out: &mut String, msl_type: &str) {
     .unwrap();
     writeln!(out, "        uint n4 = num_elements / 4u;").unwrap();
     writeln!(out, "        for (uint i = tid; i < n4; i += tcount)").unwrap();
-    writeln!(out, "            p1v[i] = p0v[i] * rms;").unwrap();
+    writeln!(out, "{}", vec_store).unwrap();
     writeln!(out, "    }} else {{").unwrap();
     writeln!(
         out,
         "        for (uint i = tid; i < num_elements; i += tcount)"
     )
     .unwrap();
-    writeln!(out, "            p1[base + i] = p0[base + i] * rms;").unwrap();
+    writeln!(out, "{}", scalar_store).unwrap();
     writeln!(out, "    }}").unwrap();
 
     charge_cross_simd_scratch(out, "rms_shared");
 
 }
 
+/// Row-wise max-|x| reduction. Same skeleton as [`emit_reduce_max_msl`]; the
+/// previous body had the same no-reduction defect, with `fabs` on one thread's
+/// own value standing in for a row scan.
 fn emit_absmax_msl(out: &mut String, msl_type: &str) {
-    writeln!(out, "    uint gid = row * tcount + tid;").unwrap();
-    writeln!(out, "    if (gid >= num_elements) return;").unwrap();
-    writeln!(out, "    {} val = fabs(p0[gid]);", msl_type).unwrap();
-    writeln!(out, "    // simd reduction for max of absolute values").unwrap();
-    writeln!(out, "    val = simd_max(val);").unwrap();
-    writeln!(out, "    if (tid == 0) p1[row] = val;").unwrap();
+    let neg_max = if msl_type == "half" { "-MAXHALF" } else { "-MAXFLOAT" };
+    writeln!(out, "    {} local = {};", msl_type, neg_max).unwrap();
+    writeln!(out, "    for (uint i = tid; i < num_elements; i += tcount) {{").unwrap();
+    writeln!(out, "        {} v = fabs(p0[base + i]);", msl_type).unwrap();
+    writeln!(out, "        if (v > local) local = v;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    sdata[tid] = local;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    emit_threadgroup_fold_max(out, "    ");
+    writeln!(out, "    if (tid == 0) p1[row] = sdata[0];").unwrap();
 }
 
 fn emit_quantize_msl(out: &mut String, msl_type: &str) {
@@ -13205,8 +13500,8 @@ fn emit_argmax_fused_final_msl(out: &mut String, name: &str) {
     writeln!(out, "    sv[tid] = best;").unwrap();
     writeln!(out, "    si[tid] = bidx;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = tcount / 2u; s > 0u; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s && (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid]))) {{").unwrap();
+    writeln!(out, "    for (uint s = 1u; s < tcount; s <<= 1) {{").unwrap();
+    writeln!(out, "        if (tid % (2*s) == 0 && tid + s < tcount && (sv[tid + s] > sv[tid] || (sv[tid + s] == sv[tid] && si[tid + s] < si[tid]))) {{").unwrap();
     writeln!(out, "            sv[tid] = sv[tid + s]; si[tid] = si[tid + s];").unwrap();
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
@@ -13241,11 +13536,16 @@ fn emit_argmax_msl(out: &mut String, msl_type: &str) {
     .unwrap();
     writeln!(out, "    }}").unwrap();
     writeln!(out, "    sdata[tid] = local_max;").unwrap();
-    writeln!(out, "    threadgroup uint idx_data[1024];").unwrap();
+    writeln!(out, "    threadgroup uint idx_data[MAX_TG];").unwrap();
     writeln!(out, "    idx_data[tid] = local_idx;").unwrap();
     writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = tcount/2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) {{").unwrap();
+    // Doubling stride: see the fold note in `emit_threadgroup_fold_max`.
+    writeln!(out, "    for (uint s = 1; s < tcount; s <<= 1) {{").unwrap();
+    writeln!(
+        out,
+        "        if (tid % (2*s) == 0 && tid + s < tcount) {{"
+    )
+    .unwrap();
     writeln!(
         out,
         "            bool take = sdata[tid + s] > sdata[tid] || \
@@ -16473,7 +16773,6 @@ fn emit_set_rows_t_t_msl(out: &mut String, src_ty: &str, dst_ty: &str, index_ty:
 /// Buffers: p0=src (char* const), p1=dst (char* writable).
 /// Params: ne0_4, nb_src, nb_dst.
 fn emit_unary_f32_4_msl(out: &mut String, op_expr: &str) {
-    writeln!(out, "    if (tid >= ne0_4) return;").unwrap();
     writeln!(
         out,
         "    device const float4 * s = (device const float4 *)(p0 + (uint64_t)row * nb_src);"
@@ -16484,8 +16783,10 @@ fn emit_unary_f32_4_msl(out: &mut String, op_expr: &str) {
         "    device       float4 * d = (device       float4 *)(p1 + (uint64_t)row * nb_dst);"
     )
     .unwrap();
-    writeln!(out, "    const float4 x = s[tid];").unwrap();
-    writeln!(out, "    d[tid] = {op_expr};").unwrap();
+    writeln!(out, "    for (uint i = tid; i < ne0_4; i += tcount) {{").unwrap();
+    writeln!(out, "        const float4 x = s[i];").unwrap();
+    writeln!(out, "        d[i] = {op_expr};").unwrap();
+    writeln!(out, "    }}").unwrap();
 }
 
 /// SigmoidF16: per-row scalar half lanewise unary op. DS4 sources this from
@@ -16494,7 +16795,6 @@ fn emit_unary_f32_4_msl(out: &mut String, op_expr: &str) {
 /// Buffers: p0=src (char* const), p1=dst (char* writable).
 /// Params: ne0 (scalar half cols per row), nb_src, nb_dst.
 fn emit_unary_f16_msl(out: &mut String, op_expr: &str) {
-    writeln!(out, "    if (tid >= ne0) return;").unwrap();
     writeln!(
         out,
         "    device const half * s = (device const half *)(p0 + (uint64_t)row * nb_src);"
@@ -16505,12 +16805,13 @@ fn emit_unary_f16_msl(out: &mut String, op_expr: &str) {
         "    device       half * d = (device       half *)(p1 + (uint64_t)row * nb_dst);"
     )
     .unwrap();
-    writeln!(out, "    const float x = (float) s[tid];").unwrap();
-    writeln!(out, "    d[tid] = (half)({op_expr});").unwrap();
+    writeln!(out, "    for (uint i = tid; i < ne0; i += tcount) {{").unwrap();
+    writeln!(out, "        const float x = (float) s[i];").unwrap();
+    writeln!(out, "        d[i] = (half)({op_expr});").unwrap();
+    writeln!(out, "    }}").unwrap();
 }
 
 fn emit_unary_f32_msl(out: &mut String, op_expr: &str) {
-    writeln!(out, "    if (tid >= ne0) return;").unwrap();
     writeln!(
         out,
         "    device const float * s = (device const float *)(p0 + (uint64_t)row * nb_src);"
@@ -16521,8 +16822,10 @@ fn emit_unary_f32_msl(out: &mut String, op_expr: &str) {
         "    device       float * d = (device       float *)(p1 + (uint64_t)row * nb_dst);"
     )
     .unwrap();
-    writeln!(out, "    const float x = s[tid];").unwrap();
-    writeln!(out, "    d[tid] = {op_expr};").unwrap();
+    writeln!(out, "    for (uint i = tid; i < ne0; i += tcount) {{").unwrap();
+    writeln!(out, "        const float x = s[i];").unwrap();
+    writeln!(out, "        d[i] = {op_expr};").unwrap();
+    writeln!(out, "    }}").unwrap();
 }
 
 /// MulMvF32F32Short / MulMvF16F32Short: scalar-fallback dense matvec for
@@ -24054,8 +24357,11 @@ module {
     #[test]
     fn test_msl_add() {
         let msl = convert_mlir_to_msl(add_mlir()).unwrap();
-        assert!(msl.contains("p0[gid] + p1[gid]"), "missing add expression");
-        assert!(msl.contains("p2[gid]"), "missing output buffer write");
+        assert!(
+            msl.contains("p0[base + i] + p1[base + i]"),
+            "missing add expression"
+        );
+        assert!(msl.contains("p2[base + i]"), "missing output buffer write");
         // 3 buffer bindings
         assert!(msl.contains("buffer(0)"), "missing binding 0");
         assert!(msl.contains("buffer(1)"), "missing binding 1");
@@ -24070,8 +24376,8 @@ module {
     #[test]
     fn test_msl_exp() {
         let msl = convert_mlir_to_msl(exp_mlir()).unwrap();
-        assert!(msl.contains("exp(p0[gid])"), "missing exp call");
-        assert!(msl.contains("p1[gid]"), "missing output write");
+        assert!(msl.contains("exp(p0[base + i])"), "missing exp call");
+        assert!(msl.contains("p1[base + i]"), "missing output write");
         // 2 data buffers (0,1) + num_elements param at buffer(2)
         assert!(
             msl.contains("buffer(2)"),
@@ -24293,8 +24599,8 @@ module {
     fn test_msl_rsqrt() {
         let msl = convert_mlir_to_msl(rsqrt_mlir()).unwrap();
         assert!(msl.contains("kernel void vec_rsqrt"), "missing kernel name");
-        assert!(msl.contains("rsqrt(p0[gid])"), "missing rsqrt call");
-        assert!(msl.contains("p1[gid]"), "missing output write");
+        assert!(msl.contains("rsqrt(p0[base + i])"), "missing rsqrt call");
+        assert!(msl.contains("p1[base + i]"), "missing output write");
     }
 
     // ── Log tests ──
@@ -24319,8 +24625,8 @@ module {
     fn test_msl_log() {
         let msl = convert_mlir_to_msl(log_mlir()).unwrap();
         assert!(msl.contains("kernel void vec_log"), "missing kernel name");
-        assert!(msl.contains("log(p0[gid])"), "missing log call");
-        assert!(msl.contains("p1[gid]"), "missing output write");
+        assert!(msl.contains("log(p0[base + i])"), "missing log call");
+        assert!(msl.contains("p1[base + i]"), "missing output write");
     }
 
     // ── Sigmoid tests ──
@@ -24349,10 +24655,10 @@ module {
             "missing kernel name"
         );
         assert!(
-            msl.contains("1.0f / (1.0f + exp(-p0[gid]))"),
+            msl.contains("1.0f / (1.0f + exp(-p0[base + i]))"),
             "missing sigmoid formula"
         );
-        assert!(msl.contains("p1[gid]"), "missing output write");
+        assert!(msl.contains("p1[base + i]"), "missing output write");
     }
 
     // ── Clamp tests ──
@@ -24378,7 +24684,7 @@ module {
         let msl = convert_mlir_to_msl(clamp_mlir()).unwrap();
         assert!(msl.contains("kernel void vec_clamp"), "missing kernel name");
         assert!(
-            msl.contains("clamp(p0[gid], clamp_min, clamp_max)"),
+            msl.contains("clamp(p0[base + i], clamp_min, clamp_max)"),
             "missing clamp call"
         );
         assert!(msl.contains("clamp_min"), "missing clamp_min param");
@@ -24410,8 +24716,8 @@ module {
             msl.contains("kernel void cast_f32_f16"),
             "missing kernel name"
         );
-        assert!(msl.contains("half(p0[gid])"), "missing half cast");
-        assert!(msl.contains("p1[gid]"), "missing output write");
+        assert!(msl.contains("half(p0[base + i])"), "missing half cast");
+        assert!(msl.contains("p1[base + i]"), "missing output write");
     }
 
     // ── Cast f16→f32 tests ──
@@ -24439,8 +24745,8 @@ module {
             msl.contains("kernel void cast_f16_f32"),
             "missing kernel name"
         );
-        assert!(msl.contains("float(p0[gid])"), "missing float cast");
-        assert!(msl.contains("p1[gid]"), "missing output write");
+        assert!(msl.contains("float(p0[base + i])"), "missing float cast");
+        assert!(msl.contains("p1[base + i]"), "missing output write");
     }
 
     // ── Slice tests ──
@@ -24790,12 +25096,14 @@ module {
             msl.contains("kernel void tile_matmul"),
             "missing kernel name"
         );
-        assert!(msl.contains("half acc = 0.0h"), "missing half accumulator");
+        // Products round to half; the ACCUMULATOR is f32 (see `error_budget`:
+        // "f32 (assumed)", and reported rather than widened for when violated).
+        assert!(msl.contains("float acc = 0.0f"), "missing f32 accumulator");
         assert!(
             msl.contains("p0[m * K + kk] * p1[kk * N + n]"),
             "missing matmul inner loop"
         );
-        assert!(msl.contains("p2[m * N + n] = acc"), "missing output write");
+        assert!(msl.contains("p2[m * N + n] = (half)acc"), "missing output write");
         assert!(msl.contains("half"), "missing half type for f16 matmul");
     }
 
@@ -24879,8 +25187,8 @@ module {
 "#;
         let msl = convert_mlir_to_msl(mlir).unwrap();
         assert!(
-            msl.contains("simd_max"),
-            "reduce_max must use simd_max:\n{}",
+            msl.contains("if (tid % (2*s) == 0 && tid + s < tcount && sdata[tid + s] > sdata[tid]"),
+            "reduce_max must fold the threadgroup, not take one lane:\n{}",
             msl
         );
     }
@@ -24923,8 +25231,8 @@ module {
         let msl = convert_mlir_to_msl(mlir).unwrap();
         assert!(msl.contains("fabs("), "absmax must use fabs():\n{}", msl);
         assert!(
-            msl.contains("simd_max"),
-            "absmax must use simd_max:\n{}",
+            msl.contains("if (tid % (2*s) == 0 && tid + s < tcount && sdata[tid + s] > sdata[tid]"),
+            "absmax must fold the threadgroup, not take one lane:\n{}",
             msl
         );
     }
@@ -25363,7 +25671,7 @@ module {
             "SiLU must compute x/(1+exp(-x)):\n{}",
             msl
         );
-        assert!(msl.contains("p1[gid]"), "SiLU must write output:\n{}", msl);
+        assert!(msl.contains("p1[base + i]"), "SiLU must write output:\n{}", msl);
     }
 
     #[test]
@@ -25549,8 +25857,8 @@ module {
 "#;
         let msl = convert_mlir_to_msl(mlir).unwrap();
         // Standalone SiLU should have 2 buffers (src, dst), not 3
-        assert!(msl.contains("p0[gid]"), "must read from p0:\n{}", msl);
-        assert!(msl.contains("p1[gid]"), "must write to p1:\n{}", msl);
+        assert!(msl.contains("p0[base + i]"), "must read from p0:\n{}", msl);
+        assert!(msl.contains("p1[base + i]"), "must write to p1:\n{}", msl);
         assert!(
             !msl.contains("p2"),
             "standalone SiLU should not have p2:\n{}",
@@ -26367,7 +26675,7 @@ module {
     fn test_msl_sub_dispatch() {
         let msl = convert_mlir_to_msl(SUB_MLIR).unwrap();
         assert!(
-            msl.contains("p0[gid] - p1[gid]"),
+            msl.contains("p0[base + i] - p1[base + i]"),
             "missing sub expr:\n{msl}"
         );
     }
@@ -26376,7 +26684,7 @@ module {
     fn test_msl_mul_dispatch() {
         let msl = convert_mlir_to_msl(MUL_MLIR).unwrap();
         assert!(
-            msl.contains("p0[gid] * p1[gid]"),
+            msl.contains("p0[base + i] * p1[base + i]"),
             "missing mul expr:\n{msl}"
         );
     }
@@ -26385,7 +26693,7 @@ module {
     fn test_msl_scale_dispatch() {
         let msl = convert_mlir_to_msl(SCALE_MLIR).unwrap();
         assert!(
-            msl.contains("p0[gid] * scale_val"),
+            msl.contains("p0[base + i] * scale_val"),
             "missing scale expr:\n{msl}"
         );
         assert!(msl.contains("scale_val"), "missing scale param:\n{msl}");
@@ -26394,7 +26702,7 @@ module {
     #[test]
     fn test_msl_sqrt_dispatch() {
         let msl = convert_mlir_to_msl(SQRT_MLIR).unwrap();
-        assert!(msl.contains("sqrt(p0[gid])"), "missing sqrt call:\n{msl}");
+        assert!(msl.contains("sqrt(p0[base + i])"), "missing sqrt call:\n{msl}");
     }
 
     #[test]
@@ -26642,12 +26950,219 @@ mod emit_tail_tests {
             &a.chars().take(300).collect::<String>()
         );
     }
+    #[test]
+    fn t_emit_emit_mul_mv_q4_K_f32_ggml_ds4() {
+        check(
+            |o| emit_mul_mv_q4_K_f32_ggml_ds4(o),
+            "    const uint ix = (uint)(tiisg / 8);   // 0..3  (which of 4 blocks this lane group reads)",
+            "emit_mul_mv_q4_K_f32_ggml_ds4",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_attn_decode_v4_batched_msl() {
+        check(
+            |o| emit_attn_decode_v4_batched_msl(o),
+            "kernel void attn_decode_v4_batched(device const float* Q[[buffer(0)]],device const float* Kc[[buffer(1)]],device const float* Vc[[buffer(2)]],",
+            "emit_attn_decode_v4_batched_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_attn_decode_splitk_v2_msl() {
+        check(
+            |o| emit_attn_decode_splitk_v2_msl(o),
+            "kernel void attn_decode_splitk_v2(device const float* q[[buffer(0)]],device const half* kc[[buffer(1)]],device const half* vc[[buffer(2)]],",
+            "emit_attn_decode_splitk_v2_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_attn_decode_batched_msl() {
+        check(
+            |o| emit_attn_decode_batched_msl(o),
+            "kernel void attn_decode_batched(device const float* Q[[buffer(0)]],device const float* Kc[[buffer(1)]],device const float* Vc[[buffer(2)]],",
+            "emit_attn_decode_batched_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_matvec_i8_v4_batched_msl() {
+        check(
+            |o| emit_matvec_i8_v4_batched_msl(o),
+            "    threadgroup float shared_m[32*8];",
+            "emit_matvec_i8_v4_batched_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_attn_decode_splitk_msl() {
+        check(
+            |o| emit_attn_decode_splitk_msl(o),
+            "kernel void attn_decode_splitk(device const float* q[[buffer(0)]],device const float* kc[[buffer(1)]],device const float* vc[[buffer(2)]],",
+            "emit_attn_decode_splitk_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_rope_inplace_split_msl() {
+        check(
+            |o| emit_rope_inplace_split_msl(o),
+            "    uint gid = row * tcount + tid;",
+            "emit_rope_inplace_split_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_rms_norm_mul_v4_batched_msl() {
+        check(
+            |o| emit_rms_norm_mul_v4_batched_msl(o),
+            "kernel void rms_norm_mul_v4_batched(device const float* x[[buffer(0)]],device const half* w[[buffer(1)]],device float* y[[buffer(2)]],",
+            "emit_rms_norm_mul_v4_batched_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_rms_norm_mul_batched_msl() {
+        check(
+            |o| emit_rms_norm_mul_batched_msl(o),
+            "kernel void rms_norm_mul_batched(device const float* x[[buffer(0)]],device const half* w[[buffer(1)]],device float* y[[buffer(2)]],",
+            "emit_rms_norm_mul_batched_msl",
+        );
+    }
+
+    #[test]
+    fn t_contract_table_is_generated_from_the_emitters_it_names() {
+        let table = ported_contract_table();
+        assert!(table.contains("pub enum Obligation"), "the obligation enum is missing");
+        assert!(table.contains("PORTED"), "the family name is missing");
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_q3_K_f32_ggml() {
+        check(
+            |o| emit_mul_mv_q3_K_f32_ggml(o),
+            "void kernel_mul_mv_q3_K_f32_impl(",
+            "emit_mul_mv_q3_K_f32_ggml",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_q5_K_f32_ggml() {
+        check(
+            |o| emit_mul_mv_q5_K_f32_ggml(o),
+            "void kernel_mul_mv_q5_K_f32_impl(",
+            "emit_mul_mv_q5_K_f32_ggml",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl() {
+        check(
+            |o| emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl(o),
+            "    constexpr short NW   = 32;",
+            "emit_mul_mv_rms_gate_up_swiglu_q4_K_f32_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_q2_K_f32_ggml() {
+        check(
+            |o| emit_mul_mv_q2_K_f32_ggml(o),
+            "void kernel_mul_mv_q2_K_f32_impl(",
+            "emit_mul_mv_q2_K_f32_ggml",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_gate_up_swiglu_q4_K_f32_msl() {
+        check(
+            |o| emit_mul_mv_gate_up_swiglu_q4_K_f32_msl(o),
+            "    constexpr short NW   = 32;",
+            "emit_mul_mv_gate_up_swiglu_q4_K_f32_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_id_mxfp4_pair_swiglu_f32_msl() {
+        check(
+            |o| emit_mul_mv_id_mxfp4_pair_swiglu_f32_msl(o),
+            "    constexpr short NSG  = 2;",
+            "emit_mul_mv_id_mxfp4_pair_swiglu_f32_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_q6_K_f32_ggml() {
+        check(
+            |o| emit_mul_mv_q6_K_f32_ggml(o),
+            "void kernel_mul_mv_q6_K_f32_impl(",
+            "emit_mul_mv_q6_K_f32_ggml",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_qkv_q4_K_f32_msl() {
+        check(
+            |o| emit_mul_mv_qkv_q4_K_f32_msl(o),
+            "    constexpr short NW   = 32;",
+            "emit_mul_mv_qkv_q4_K_f32_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_mul_mv_id_mxfp4_sum6_f32_msl() {
+        check(
+            |o| emit_mul_mv_id_mxfp4_sum6_f32_msl(o),
+            "    constexpr short NSG  = 2;",
+            "emit_mul_mv_id_mxfp4_sum6_f32_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_matvec_q4k_coop_msl() {
+        check(
+            |o| emit_matvec_q4k_coop_msl(o),
+            "kernel void matvec_q4k_coop(",
+            "emit_matvec_q4k_coop_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_matvec_q4k_reg_msl() {
+        check(
+            |o| emit_matvec_q4k_reg_msl(o),
+            "kernel void matvec_q4k_reg(device const uchar *w [[buffer(0)]], device const float *x [[buffer(1)]],",
+            "emit_matvec_q4k_reg_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_matvec_argmax_f16_msl() {
+        check(
+            |o| emit_matvec_argmax_f16_msl(o),
+            "    // p0=activation(f32,K), p1=weight(half,N*K), p2=pv(f32,G), p3=pi(f32,G)",
+            "emit_matvec_argmax_f16_msl",
+        );
+    }
+
+    #[test]
+    fn t_emit_emit_matvec_q4k_msl() {
+        check(
+            |o| emit_matvec_q4k_msl(o),
+            "    if (row >= d_out) return;",
+            "emit_matvec_q4k_msl",
+        );
+    }
+
 
     #[test]
     fn t_emit_absmax_msl() {
         check(
             |o| emit_absmax_msl(o, "float"),
-            "uint gid = row * tcount + tid;",
+            // Strided scan over the row plus the threadgroup fold: the old body
+            // took `fabs` of ONE thread's value and called it a row reduction.
+            "float v = fabs(p0[base + i]);",
             "emit_absmax_msl",
         );
     }
@@ -26861,10 +27376,11 @@ mod emit_tail_tests {
     fn t_emit_binop_msl() {
         check(
             |o| emit_binop_msl(o, "+"),
-            // Flat global index. `base = row * num_elements` is the row-per-
-            // threadgroup form and is WRONG here: group 1 would start past the end,
-            // so every group but the first wrote nothing.
-            "uint gid = row * tcount + tid;",
+            // Strided row walk: dispatch is one threadgroup per ROW, so
+            // `gid = row * tcount + tid` strided the rows together and covered
+            // only `tcount` elements of each. The `-O4` sweep measured it right
+            // only where rows==1 and tcount >= num_elements.
+            "p2[base + i] = p0[base + i] + p1[base + i];",
             "emit_binop_msl",
         );
     }
@@ -26880,7 +27396,7 @@ mod emit_tail_tests {
     fn t_emit_cast_msl() {
         check(
             |o| emit_cast_msl(o, "half"),
-            "uint gid = base + tid;",
+            "p1[base + i] = half(p0[base + i]);",
             "emit_cast_msl",
         );
     }
@@ -26896,7 +27412,7 @@ mod emit_tail_tests {
     fn t_emit_clamp_msl() {
         check(
             |o| emit_clamp_msl(o),
-            "p1[gid] = clamp(p0[gid], clamp_min, clamp_max);",
+            "p1[base + i] = clamp(p0[base + i], clamp_min, clamp_max);",
             "emit_clamp_msl",
         );
     }
@@ -27942,7 +28458,7 @@ module {
         type Emit = fn(&mut String, &str);
         const CASES: &[(&str, Emit)] = &[
             ("attention", emit_attention_msl),
-            ("norm_rms", emit_rms_norm_msl),
+            ("norm_rms", |o: &mut String, t: &str| emit_rms_norm_msl(o, t, "1e-6")),
             ("rope", emit_rope_msl),
             ("softmax", |o: &mut String, _t: &str| emit_softmax_row_f32_simd8_msl(o)),
             ("sum_rows", emit_sum_rows_msl),
@@ -28463,7 +28979,7 @@ module {
     fn t_emit_max_msl() {
         check(
             |o| emit_max_msl(o),
-            "p2[gid] = max(p0[gid], p1[gid]);",
+            "p2[base + i] = max(p0[base + i], p1[base + i]);",
             "emit_max_msl",
         );
     }
@@ -28774,7 +29290,9 @@ module {
     fn t_emit_reduce_max_msl() {
         check(
             |o| emit_reduce_max_msl(o, "float"),
-            "uint gid = row * tcount + tid;",
+            // The doubling fold, not a single lane's value: the old body was
+            // `max` of `p0[gid]` for gid = row*tcount + tid, i.e. no reduction.
+            "if (tid % (2*s) == 0 && tid + s < tcount && sdata[tid + s] > sdata[tid]",
             "emit_reduce_max_msl",
         );
     }
@@ -28810,7 +29328,7 @@ module {
     #[test]
     fn t_emit_rms_norm_msl() {
         check(
-            |o| emit_rms_norm_msl(o, "float"),
+            |o| emit_rms_norm_msl(o, "float", "1e-6"),
             "if (simd_group == 0 && simd_lane < MAX_SG) rms_shared[simd_lane] = (",
             "emit_rms_norm_msl",
         );
@@ -28859,7 +29377,7 @@ module {
     fn t_emit_scale_msl() {
         check(
             |o| emit_scale_msl(o, "float"),
-            "if (gid < num_elements) p1[gid] = p0[gid] * scale_val;",
+            "p1[base + i] = p0[base + i] * scale_val;",
             "emit_scale_msl",
         );
     }
@@ -28904,7 +29422,7 @@ module {
     fn t_emit_sigmoid_msl() {
         check(
             |o| emit_sigmoid_msl(o),
-            "p1[gid] = 1.0f / (1.0f + exp(-p0[gid]));",
+            "p1[base + i] = 1.0f / (1.0f + exp(-p0[base + i]));",
             "emit_sigmoid_msl",
         );
     }
@@ -28912,7 +29430,7 @@ module {
     fn t_emit_silu_msl() {
         check(
             |o| emit_silu_msl(o),
-            "p1[gid] = v / (1.0f + exp(-v));",
+            "p1[base + i] = v / (1.0f + exp(-v));",
             "emit_silu_msl",
         );
     }
@@ -28920,7 +29438,7 @@ module {
     fn t_emit_silu_mul_msl() {
         check(
             |o| emit_silu_mul_msl(o),
-            "p2[gid] = (v / (1.0f + exp(-v))) * p1[gid];",
+            "p2[base + i] = (v / (1.0f + exp(-v))) * p1[base + i];",
             "emit_silu_mul_msl",
         );
     }
@@ -29059,7 +29577,7 @@ module {
     fn t_emit_softmax_msl() {
         check(
             |o| emit_softmax_msl(o, "float"),
-            "if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);",
+            "if (tid % (2*s) == 0 && tid + s < tcount) sdata[tid] = max(sdata[tid], sdata[tid + s]);",
             "emit_softmax_msl",
         );
     }
@@ -29067,7 +29585,7 @@ module {
     fn t_emit_softplus_msl() {
         check(
             |o| emit_softplus_msl(o),
-            "p1[gid] = (x > 20.0f) ? x : log(1.0f + exp(x));",
+            "p1[base + i] = (x > 20.0f) ? x : log(1.0f + exp(x));",
             "emit_softplus_msl",
         );
     }
@@ -29163,10 +29681,9 @@ module {
     fn t_emit_unary_msl() {
         check(
             |o| emit_unary_msl(o, "exp"),
-            // Flat global index. `base = row * num_elements` is the row-per-
-            // threadgroup form and is WRONG here: group 1 would start past the end,
-            // so every group but the first wrote nothing.
-            "uint gid = row * tcount + tid;",
+            // Strided row walk: see `t_emit_binop_msl` for why the flat gid was
+            // only right at one row.
+            "p1[base + i] = exp(p0[base + i]);",
             "emit_unary_msl",
         );
     }
