@@ -26,6 +26,13 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # The action defaults to RUSTFLAGS=-D warnings. This job MEASURES, it
+          # does not lint: tile_spec's `cucumber` target #[path]-includes the
+          # emitters and so carries two hundred-odd dead-code/unreachable warnings
+          # that are legal there and nowhere else. Linting is the `lint` job's
+          # (same opt-out as tile-cli.yml).
+          rustflags: ""
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -41,11 +48,12 @@ jobs:
         # This supersedes holding out the WHOLE of mlir_to_msl.rs: with the canned
         # tail in its own file, mlir_to_msl.rs's real dispatch logic is gated on
         # its own merits instead of being excluded with it. The gated surface
-        # therefore grew from 31,160 lines to 69,132 -- more code measured, not
+        # therefore grew from 31,160 lines to 69,137 -- more code measured, not
         # less -- and the total is a truthful 79.71% rather than a 89.93% that
         # quietly omitted 35k lines.
         #
-        # 78 keeps the usual ~2 points of headroom (measured 79.71%, 55107/69132,
-        # after the ISSTA campaign added 23 emitter smoke tests). Covering the
+        # 78 keeps the usual ~2 points of headroom (measured 79.71%, 55112/69137,
+        # after the ISSTA campaign added 23 emitter smoke tests and the CI-red
+        # follow-up added its own regression tests). Covering the
         # canned emitters is the remaining work; their row prints every run.
         run: bash scripts/coverage.sh --gate 78

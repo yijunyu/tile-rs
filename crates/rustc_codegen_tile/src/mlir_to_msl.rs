@@ -2708,6 +2708,13 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
         // so the default "everything but the last is const" is wrong for it.
         else if ctx.kernel_type == KernelType::MatvecArgmaxF16 {
             if i >= 2 { "" } else { "const" }
+        }
+        // TopK writes TWO buffers: p1 is the top-k VALUES (initialised to -inf, then
+        // updated by the insertion sort) and p2 the indices. The default left p1
+        // `device const` while the arm assigns it -- `read-only variable is not
+        // assignable` the moment anything compiled the output.
+        else if ctx.kernel_type == KernelType::TopK {
+            if i == 0 { "const" } else { "" }
         } else if i + 1 < num_bufs {
             "const"
         } else {
@@ -8681,6 +8688,16 @@ fn generate_func_msl(func: &MlirFunc, out: &mut String) -> Result<(), String> {
             | KernelType::LagunaQ2KPairSwigluF32
             | KernelType::LagunaQ3KRoutedDownF32
             | KernelType::LagunaQ3KPairSwigluF32
+        // The kv-cache arms compute their own `gid` from num_heads/max_seq/head_dim
+        // and never touch `base`, and their signatures carry those shape uniforms
+        // instead of `num_elements` — the shared prologue emitted
+        // `uint base = row * num_elements;` against an identifier the signature does
+        // not bind, so `kv_cache_update` emitted Metal that did not compile.
+        | KernelType::KvCacheUpdate
+        | KernelType::KvCacheUpdatePrefill
+        // DraftVerify declares its own `uint base = row * cols` inside the arm; the
+        // shared prologue's `uint base = row * num_elements` made it a redefinition.
+        | KernelType::DraftVerify
     );
     if !is_cooperative && !has_own_indexing {
         writeln!(out, "    uint base = row * num_elements;").unwrap();
@@ -23940,10 +23957,20 @@ fn emit_attention_prefill_msl(out: &mut String) {
 
 /// BF16→F32 cast: reinterpret bfloat16 (stored as uint16) as float32.
 /// bfloat16 has the same exponent bits as float32, just shift left 16.
+///
+/// The source buffer is typed `float*` by the lowering that reads it, so the 16-bit
+/// pattern comes out through `as_type<uint>` — Metal rejects `as_type<ushort>` on a
+/// float outright ("a cast between types of different size"), which is why the
+/// straightforward reading of the hand-written `uint(src[gid]) << 16` template does
+/// not survive translation: the template's source is `ushort*`.
 fn emit_cast_bf16_msl(out: &mut String) {
     writeln!(out, "    uint gid = base + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
-    writeln!(out, "        uint bits = uint(as_type<ushort>(p0[gid])) << 16;").unwrap();
+    writeln!(
+        out,
+        "        uint bits = (as_type<uint>(p0[gid]) & 0xFFFFu) << 16;"
+    )
+    .unwrap();
     writeln!(out, "        p1[gid] = as_type<float>(bits);").unwrap();
     writeln!(out, "    }}").unwrap();
 }
@@ -27388,7 +27415,7 @@ mod emit_tail_tests {
     fn t_emit_cast_bf16_msl() {
         check(
             |o| emit_cast_bf16_msl(o),
-            "uint bits = uint(as_type<ushort>(p0[gid])) << 16;",
+            "uint bits = (as_type<uint>(p0[gid]) & 0xFFFFu) << 16;",
             "emit_cast_bf16_msl",
         );
     }

@@ -21851,12 +21851,16 @@ pub(super) fn emit_attention_prefill_msl(out: &mut String) {
 }
 /// BF16→F32 cast: reinterpret bfloat16 (stored as uint16) as float32.
 /// bfloat16 has the same exponent bits as float32, just shift left 16.
+///
+/// The source buffer is `float*` here (the lowering that reads it types it so), so the
+/// 16-bit pattern is taken through `as_type<uint>`: Metal rejects `as_type<ushort>` on
+/// a float. Kept byte-identical with the shadowing copy in `mlir_to_msl.rs`.
 pub(super) fn emit_cast_bf16_msl(out: &mut String) {
     writeln!(out, "    uint gid = base + tid;").unwrap();
     writeln!(out, "    if (gid < num_elements) {{").unwrap();
     writeln!(
         out,
-        "        uint bits = uint(as_type<ushort>(p0[gid])) << 16;"
+        "        uint bits = (as_type<uint>(p0[gid]) & 0xFFFFu) << 16;"
     )
     .unwrap();
     writeln!(out, "        p1[gid] = as_type<float>(bits);").unwrap();

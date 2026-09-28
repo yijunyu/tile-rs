@@ -75,8 +75,14 @@ static inline int __float2int_ru(float x) { return (int)x + 1; }
 static inline int __float2int_rz(float x) { return (int)x; }
 static inline float __int2float_rn(int x) { return (float)x; }
 static inline float rsqrtf(float x) { return 1.0f / sqrtf(x); }
-static inline float __expf(float x) { return expf(x); }
-static inline float __logf(float x) { return logf(x); }
+/* Not definitions: glibc's <math.h> declares both `__expf` and `__logf` (it
+   spells every `X` as `__X` too), and a `static inline` definition after that
+   declaration is a hard error under gcc -- which is why every gpu/musa file
+   failed on ubuntu while mac, whose math.h declares nothing of the kind,
+   passed. Emitted code that wants the CUDA spelling gets the libc one spelled
+   the way libc spells it. */
+#define __expf expf
+#define __logf logf
 static inline float __fdividef(float a, float b) { return a / b; }
 "#;
 
@@ -1118,6 +1124,12 @@ fn pico_listings_are_self_consistent() {
 /// containing the right idiom is still a string.
 #[test]
 fn metal_kernels_compile_with_the_real_compiler() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(xcrun) = which("xcrun") else {
         eprintln!("emitted_parses: skipped, no xcrun");
         return;
@@ -1194,17 +1206,21 @@ fn metal_kernels_compile_with_the_real_compiler() {
 /// emitter's test module holds seventy-odd MLIR modules written by whoever wrote each
 /// lowering — the authoritative call form for each intrinsic, including arities no caller
 /// in this repo exercises. Their tests assert on SUBSTRINGS of the emitted text
-/// (`msl.contains("threadgroup")`), which is why nine of them emitted Metal that does not
-/// compile while every test passed:
+/// (`msl.contains("threadgroup")`), so Metal that does not compile has repeatedly passed
+/// every unit test, and this gate is where each instance was found:
 ///
-///   * `argmax`, `draft_verify` and `sample_top_p` each got a second `uint base` on top of
-///     the shared row-striding prologue — a redefinition;
-///   * `causal_mask` and both `kv_cache_update` kernels got a prologue reading a
-///     `num_elements` their signature does not declare;
+///   * `argmax` and `sample_top_p` got a second `uint base` on top of the shared
+///     row-striding prologue — a redefinition (`draft_verify` was the same shape);
+///   * `causal_mask` and `kv_cache_update` got a prologue reading a `num_elements`
+///     their signature does not declare;
 ///   * `quantize` and `dequantize` emitted a three-statement loop body with no braces, so
 ///     `gid` was out of scope for the two statements that used it;
-///   * `cast_bf16_f32` declared its 16-bit source buffer as `float*` and then read it with
-///     `as_type<ushort>`, a cast between types of different size.
+///   * `cast_bf16_f32` read its `float*` source buffer with `as_type<ushort>`, a cast
+///     between types of different size;
+///   * `tile_topk` declared its top-k VALUES buffer `const` while the arm writes it;
+///   * five ds4 `mul_mv_id_*` kernels lost their only call to -O2's dead-op elimination
+///     — the MLIR discards the call's result, and a result nobody reads looked like
+///     nothing to delete — leaving a plain copy where the quantized matvec belonged.
 ///
 /// This gate needs no list to maintain: a fixture added to the emitter is compiled here
 /// the moment it appears.
@@ -1212,6 +1228,12 @@ fn metal_kernels_compile_with_the_real_compiler() {
 /// Needs `xcrun`; skips with a note otherwise.
 #[test]
 fn every_msl_fixture_in_the_emitter_compiles() {
+    if !cfg!(feature = "emitters") {
+        // A build without the emitters cannot run this. It must still SAY so
+        // rather than reporting a green run that checked nothing.
+        eprintln!("skipped: built without --features emitters");
+        return;
+    }
     let Some(xcrun) = which("xcrun") else {
         eprintln!("emitted_parses: skipped, no xcrun");
         return;

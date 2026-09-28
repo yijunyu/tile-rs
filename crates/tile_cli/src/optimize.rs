@@ -200,6 +200,37 @@ module {
     }
 
     #[test]
+    fn a_matvec_whose_result_is_unused_keeps_its_call() {
+        // The ds4 `mul_mv_id_*` kernels return a result nobody reads and write their
+        // destination through pointer arguments. Treating that result as dead took the
+        // optimizer to the same conclusion it would reach for any discarded value: delete
+        // the call, then cascade to the constants feeding it, and emit a copy where the
+        // quantized matvec belonged. The result being unused says nothing about the
+        // buffers.
+        let src = "  %m = llvm.mlir.constant(4 : i32) : i32\n  \
+                   %r = llvm.call @__tile_mul_mv_id_q6_K_down_f32(%a, %b, %m, %m) : \
+                   (i32, i32, i32, i32) -> i32\n  \
+                   llvm.return\n";
+        for level in 1..=3u8 {
+            let (out, report) = optimize(src, level);
+            assert!(
+                out.contains("__tile_mul_mv_id_q6_K_down_f32"),
+                "O{level} deleted a call whose result was unused but whose buffers were not"
+            );
+            let dead = report
+                .ran
+                .iter()
+                .find(|p| p.name == "dead-op-elimination")
+                .cloned();
+            assert!(
+                dead.is_none_or(|p| p.fired == 0),
+                "O{level} claimed the matvec was dead: {}",
+                report.render()
+            );
+        }
+    }
+
+    #[test]
     fn optimization_is_a_pure_function_of_its_input() {
         for level in 0..=3u8 {
             assert_eq!(optimize(LIVE, level).0, optimize(LIVE, level).0, "O{level}");

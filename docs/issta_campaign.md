@@ -92,7 +92,7 @@ These were red at HEAD — the campaign ran the *entire* suite, not just its own
    non-empty, deterministic, needle must be rendered output) covering the self-contained
    `fn emit_x(out: &mut String)` family plus `emit_mul_mv_q4_K_f32_ggml_ds4` (which
    pulls in the shared `emit_q4k_compute_core`) and `ported_contract_table()` (the
-   obligation-table generator). Gate now reads **79.71% (55107/69132)** — ~1.7 points
+   obligation-table generator). Gate now reads **79.71% (55112/69137)** — ~1.7 points
    of headroom, matching the workflow's intended margin.
 6. **Flaky `lift_cpp` unit test** (surfaced only after the suite grew): two tests
    raced on the process-global `TILE_ASCENDC_TO_RS` — `override_must_exist` could
@@ -112,12 +112,59 @@ These were red at HEAD — the campaign ran the *entire* suite, not just its own
 | `cargo test --locked --features stats` | — | green |
 | `cargo clippy --all-targets -- -D warnings` | 2 errors (issta_fuzz) | clean |
 | `cargo fmt --check` | 1 diff | clean |
-| `coverage.sh --gate 78` (coverage.yml) | red — 76.42% | **green — 79.71%** (55107/69132) |
+| `coverage.sh --gate 78` (coverage.yml) | red — 76.42% | **green — 79.71%** (55112/69137) |
 | `tile_spec` standalone | — | green — 14 + 966 tests |
 | CI ISSTA step (`issta_fuzz` + `issta_metamorphic`) | absent | added to `tile-cli.yml` |
 | spec (181 scenarios), doctor, identify, exit-4 contract, no-C graph, dep budget | — | verified locally |
 
-## Left undriven (documented, not silently green)
+## CI red after the push (follow-up)
+
+The push (`478a80b`) was green locally and red on CI — three jobs, every failure
+pre-existing at tag `tile-v0.1.0` (coverage's first-ever run excepted), so the campaign
+had measured its own gates against a machine that could not see them: stable had moved
+1.96 → 1.98 under the lint job, and this Mac had no Metal Toolchain until
+`xcodebuild -downloadComponent MetalToolchain` installed one.
+
+| Job | Failure | Root cause | Fix |
+|---|---|---|---|
+| lint | 2 clippy errors in `sha256.rs` | the `chunks_exact().as_chunks()` lint is new in clippy 1.98 | `msg.as_chunks::<64>()` / `as_chunks::<4>()` |
+| coverage | 216 `-D warnings` errors in `tile_spec`'s `cucumber` target | `setup-rust-toolchain` defaults `RUSTFLAGS=-D warnings`; this job never passed the `rustflags: ""` opt-out `tile-cli.yml` uses | pass `rustflags: ""` (same rationale comment) |
+| test (ubuntu) | every `gpu`/`musa` file: `static declaration of '__expf' follows non-static` | glibc's `<math.h>` declares `__expf` and `__logf` (every `X` also as `__X`); the stub's `static inline` definitions collide with them | `#define __expf expf` / `#define __logf logf` — libc spelling, no definition |
+| test (macOS) | 9 of 91 MSL fixtures fail `xcrun metal -c` | four emitter defects + one optimizer defect, below | emitter and optimizer fixes |
+
+The nine fixture failures, by class:
+
+1. **`-O2`'s dead-op elimination deleted five ds4 `mul_mv_id_*` kernels.** The MLIR
+   discards the call's result, `Op::is_pure` said any `__tile_*` call was pure, and a
+   result nobody reads looked like nothing to delete — so the call went, the constants
+   feeding it cascaded after it, and the emitter classified the hollow kernel as a copy
+   (`p1[gid] = p0[gid]` writing a `const` buffer). The matvec/matmul families are now
+   in the IMPURE list: they write their destination through pointer arguments, and the
+   unused result says nothing about the buffers. Regression tests in `mlir.rs` and
+   `optimize.rs`.
+2. **`tile_topk` declared its VALUES buffer `const`.** The default writability rule
+   ("everything but the last is writable") left `p1` read-only while the insertion-sort
+   arm initialises and updates it. TopK now has an explicit entry: `p0` const, `p1`/`p2`
+   writable — the buffer count comment always said `input, out_values, out_indices`.
+3. **The shared prologue against arms that do not want it.** `DraftVerify` declares its
+   own `uint base = row * cols` (a redefinition on top of the prologue's), and
+   `kv_cache_update`'s signature carries `num_heads/max_seq/head_dim/position` instead
+   of `num_elements` (the prologue read an identifier that was never bound — the same
+   shape as the `causal_mask` bug its list comment already documents). Both, and the
+   prefill sibling, join `has_own_indexing`.
+4. **`cast_bf16_f32` read a `float*` with `as_type<ushort>`** — a cast between types of
+   different size, which Metal rejects outright. The hand-written template's source is
+   `ushort*`; through a `float*` the same intent is `(as_type<uint>(p0[gid]) & 0xFFFFu)
+   << 16`. Both copies of the emitter (the shadowing one in `mlir_to_msl.rs` and the
+   canned split) and the `t_emit` expectation moved together.
+
+Two instrument problems surfaced while reproducing: the `tile` on `~/.cargo/bin` was
+four days stale (repro must use the workspace build), and the two metal-compile tests
+lacked the `cfg!(feature = "emitters")` guard every other test in the file has —
+invisible while the toolchain was absent, a hard failure the moment it was installed.
+
+With those in, every gate in the table above is green again locally, including
+`cargo test --no-default-features` (23 targets) and `--features stats` (23 targets).
 
 `emit_fill_msl`, concat/scatter/gather, `splitk_reduce`, `silu_mul_fused`,
 quantize/dequantize, rope/kv-cache, `emit_repeat`, `emit_copy_msl`, and the f16

@@ -90,6 +90,16 @@ impl Op {
             "init_sort_buf",
             "cache",
             "view",
+            // The matvec/matmul families write their destination through pointer
+            // arguments while RETURNING a result the MLIR often discards. Calling
+            // them pure let dead-op elimination delete the whole kernel body under
+            // the default -O2 whenever that result went unused: five ds4
+            // `mul_mv_id_*` fixtures emitted a plain `p1[gid] = p0[gid]` copy in
+            // place of the quantized matvec, which the fixture gate then caught as
+            // `read-only variable is not assignable`.
+            "mul_mv",
+            "mul_mm",
+            "matmul",
         ];
         if IMPURE.iter().any(|m| name.contains(m)) {
             return false;
@@ -459,6 +469,26 @@ mod tests {
         // one direction.
         let m = parse("  %x = llvm.call @mystery(%a) : (i32) -> i32\n");
         assert!(!m.ops().next().unwrap().is_pure());
+    }
+
+    #[test]
+    fn a_matvec_with_an_unused_result_is_still_impure() {
+        // The result value is a formality: the destination buffer is written through
+        // pointer arguments. Classifying it pure let -O2's dead-op elimination delete
+        // the call — and every constant feeding it — leaving a copy behind.
+        for name in [
+            "__tile_mul_mv_id_q6_K_down_f32",
+            "__tile_mul_mm_id_q8_0_f32",
+        ] {
+            let m = parse(&format!(
+                "  %x = llvm.call @{name}(%a, %b) : (i32, i32) -> i32\n"
+            ));
+            assert!(!m.ops().next().unwrap().is_pure(), "{name} was called pure");
+            assert!(
+                !m.ops().next().unwrap().removable_when_unused(),
+                "{name} was removable when its result was unused"
+            );
+        }
     }
 
     #[test]
