@@ -5247,11 +5247,15 @@ fn register(r: &mut Runner) {
                 e.contains("serving the kernel tools without a model"),
                 "losing the model lost the tools too: {e}"
             );
-            // And the refusal has to carry a reason, not just a failure.
-            assert!(
-                e.contains("not implemented") || e.contains("not present") || e.contains("needs"),
-                "no reason given: {e}"
-            );
+            // And the refusal has to carry a reason, not just a failure. On a machine
+            // with an accelerator that reason is "not on this machine" or a weights
+            // line; with none detected it is that no engine maps to the "none" family.
+            // Matching three substrings of the Apple-laptop wording rejected that
+            // sentence on every CI runner.
+            let reason = e.lines().any(|l| {
+                l.starts_with("tile:") && !l.contains("serving the kernel tools")
+            });
+            assert!(reason, "no reason given: {e}");
         },
     );
 
