@@ -69,15 +69,29 @@ func inputValues(_ b: Int, _ n: Int, _ seed: Int = 0) -> [Float] {
     // so `exp` does not overflow f16.
     let k: Float = seed == 0 ? 1.0 : 1.37
     let o: Float = seed == 0 ? 0.0 : 0.11
-    return (0..<n).map {
-        (Float(($0 + 7 * b + seed) % 17) * 0.25 - 2.0) * k + o + Float($0) * 1e-4
+    // A single `map` here is one expression the Intel Swift type-checker gives up on
+    // ("unable to type-check this expression in reasonable time"), which made the -O4
+    // sweep fail on macos-15-intel before it measured anything. The loop is the same
+    // arithmetic, in pieces the compiler will finish.
+    var out = [Float]()
+    out.reserveCapacity(n)
+    for i in 0..<n {
+        let base = Float((i + 7 * b + seed) % 17) * 0.25 - 2.0
+        out.append(base * k + o + Float(i) * 1e-4)
     }
+    return out
 }
 
 func fill(_ buf: MTLBuffer, _ v: [Float], _ dtype: String) {
     if dtype == "half" {
+        // Float16 is an arm64 type. Leaving the call in the file fails the Intel
+        // Swift compile even for an f32 kernel, because the branch is still type-checked.
+        #if arch(arm64)
         let p = buf.contents().bindMemory(to: Float16.self, capacity: v.count)
         for i in 0..<v.count { p[i] = Float16(v[i]) }
+        #else
+        die("half buffers need Float16, which this Mac's Swift does not provide", 1)
+        #endif
     } else {
         let p = buf.contents().bindMemory(to: Float.self, capacity: v.count)
         for i in 0..<v.count { p[i] = v[i] }
@@ -86,8 +100,15 @@ func fill(_ buf: MTLBuffer, _ v: [Float], _ dtype: String) {
 
 func readOut(_ buf: MTLBuffer, _ n: Int, _ dtype: String) -> [Float] {
     if dtype == "half" {
+        #if arch(arm64)
         let p = buf.contents().bindMemory(to: Float16.self, capacity: n)
-        return (0..<n).map { Float(p[$0]) }
+        var out = [Float]()
+        out.reserveCapacity(n)
+        for i in 0..<n { out.append(Float(p[i])) }
+        return out
+        #else
+        die("half buffers need Float16, which this Mac's Swift does not provide", 1)
+        #endif
     }
     let p = buf.contents().bindMemory(to: Float.self, capacity: n)
     return (0..<n).map { p[$0] }

@@ -40,6 +40,8 @@ pub enum ProvisionError {
     /// The manifest says a person has to do this.
     Barrier {
         id: String,
+        os: String,
+        arch: String,
         barrier: String,
         remedy: String,
     },
@@ -71,9 +73,16 @@ impl fmt::Display for ProvisionError {
                 f,
                 "no manifest entry for {id} on {os}/{arch}; tile-rs cannot provision it here"
             ),
-            ProvisionError::Barrier { id, barrier, remedy } => write!(
+            ProvisionError::Barrier {
+                id,
+                os,
+                arch,
+                barrier,
+                remedy,
+            } => write!(
                 f,
-                "{id} cannot be installed for you ({barrier}).\n  Run this instead:\n    {remedy}\n  \
+                "{id} cannot be installed for you on {os}/{arch} ({barrier}).\n  \
+                 Run this instead:\n    {remedy}\n  \
                  Then re-run the same command; nothing else is needed."
             ),
             ProvisionError::Unpinned { id, note } => write!(
@@ -82,7 +91,10 @@ impl fmt::Display for ProvisionError {
                  downloaded.\n  {note}"
             ),
             ProvisionError::Declined { id, how } => {
-                write!(f, "{id} is not installed and {how} was given; run `tile install {id}`")
+                write!(
+                    f,
+                    "{id} is not installed and {how} was given; run `tile install {id}`"
+                )
             }
             ProvisionError::Fetch(e) => write!(f, "fetch failed: {e}"),
             ProvisionError::Checksum { id, want, got } => write!(
@@ -170,6 +182,8 @@ pub fn plan(id: &str, os: &str, arch: &str) -> Result<manifest::Tool, ProvisionE
     if let Some(b) = &t.barrier {
         return Err(ProvisionError::Barrier {
             id: t.id.clone(),
+            os: os.to_string(),
+            arch: arch.to_string(),
             barrier: b.clone(),
             remedy: t
                 .remedy
