@@ -576,7 +576,7 @@ mod tests {
         let ours = crate::run::input_values(8);
         assert_eq!(ours[0], -2.0);
         let swift = include_str!("../assets/harness/metal.swift");
-        assert!(swift.contains("Float(($0 + 7 * b + seed) % 17) * 0.25 - 2.0"));
+        assert!(swift.contains("Float((i + 7 * b + seed) % 17) * 0.25 - 2.0"));
     }
 
     #[test]

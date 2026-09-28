@@ -2827,7 +2827,7 @@ fn register(r: &mut Runner) {
                 "same_rule",
                 b0[0] == -2.0
                     && b0 != b1
-                    && swift.contains("Float(($0 + 7 * b + seed) % 17) * 0.25 - 2.0")
+                    && swift.contains("Float((i + 7 * b + seed) % 17) * 0.25 - 2.0")
                     && py_soft.contains("(i % 17) * 0.25 - 2.0")
                     && py_mm.contains("(i % 17) * 0.25 - 2.0")
                     && py_mm.contains("((i + 7) % 17) * 0.25 - 2.0"),

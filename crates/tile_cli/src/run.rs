@@ -2993,7 +2993,7 @@ mod tests {
         // The Swift harness computes the same rule, generalised over the buffer index.
         let swift = include_str!("../assets/harness/metal.swift");
         assert!(
-            swift.contains("Float(($0 + 7 * b + seed) % 17) * 0.25 - 2.0"),
+            swift.contains("Float((i + 7 * b + seed) % 17) * 0.25 - 2.0"),
             "the harness and the reference have drifted apart"
         );
     }
