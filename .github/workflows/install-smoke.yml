@@ -1,11 +1,14 @@
-name: install-smoke
+name: pinned-codegen-release
 
-# End-to-end test of the public installer (scripts/install.sh): runs it exactly as
-# a user would and asserts it completes cleanly, the backend + USAGE land, the
-# bundle is self-contained, and — critically — that NO runtime error leaks (the
-# kind a `bash -n` syntax check misses, e.g. the EXIT-trap `tmp: unbound variable`
-# scope bug). Runs on macOS, where the codegen release asset exists; free on the
-# public tile-rs repo.
+# Smoke test of the published codegen tarball, not of the commit under test.
+#
+# scripts/install.sh downloads a pinned GitHub release
+# (v0.0.1+nightly-2025-08-04) and unpacks it. The backend source is not in this
+# public tree, so this workflow cannot build HEAD, and a change anywhere except
+# install.sh or this file cannot make it fail. The name says that: it checks the
+# pinned release asset, the way a user would install it, including that no shell
+# error leaks (the EXIT-trap `tmp: unbound variable` bug). Runs on macOS, where
+# the codegen release asset exists.
 #
 # Source of truth: maintained in the PRIVATE repo at ci/tile-rs-public/install-smoke.yml
 # and deployed here via deploy.toml. Edit it there.

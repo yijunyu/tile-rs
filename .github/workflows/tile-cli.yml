@@ -12,6 +12,10 @@ name: tile-cli
 # key to hang off, GitHub's workflow schema rejects keys it does not know, and an invalid
 # workflow does not run at all -- which would be the opposite of this fix, and is not
 # something that can be checked from a laptop.
+#
+# The path filter is a choice, not an accident. This workflow is a live gate for the
+# trees listed below and silent for every other commit. A green main after a commit
+# that touches none of them did not re-run these tests.
 on:
   push:
     paths:

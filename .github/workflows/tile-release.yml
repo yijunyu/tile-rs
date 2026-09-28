@@ -9,11 +9,21 @@
 # NOTE: `scripts/install.sh` is deployed from the private repo (see its header) and is not
 # edited here. Teaching it to install `tile` belongs in that repo; this workflow publishes
 # the assets it would fetch.
+#
+# The test matrix used to run only on a `tile-v*` tag, so a pull request was never checked
+# by the broadest suite in the repo. Tests run on every push to main and every pull
+# request. Packaging and the GitHub release stay on the tag (and on a manual dispatch).
+#
+# `macos-13` is retired (December 2025). The Intel job on tile-v0.1.0 sat for 24 hours
+# with no runner and was cancelled. x86_64 macOS is `macos-15-intel` now; the Rust
+# target triple is still `x86_64-apple-darwin`.
 name: tile-release
 
 on:
   push:
+    branches: [main]
     tags: ["tile-v*"]
+  pull_request:
   workflow_dispatch:
     inputs:
       version:
@@ -39,7 +49,7 @@ jobs:
       matrix:
         include:
           - { os: macos-14,     target: aarch64-apple-darwin }
-          - { os: macos-13,     target: x86_64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     steps:
@@ -86,6 +96,7 @@ jobs:
           test "$rc" -eq 2
 
       - name: package
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         run: |
           set -e
           # Copy while still in crates/tile_cli (../../vendor = repo root), then pack
@@ -101,6 +112,7 @@ jobs:
           tar tzf tile-${{ matrix.target }}.tar.gz
 
       - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         with:
           name: tile-${{ matrix.target }}
           path: |
@@ -109,6 +121,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
