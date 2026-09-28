@@ -755,30 +755,38 @@ fn run_one(
     // unusual, so `--cross` looked like the only way to do it and the artifact's
     // unrunnability here was left for the user to discover. `--cross` remains the way to
     // say it deliberately; this is the same fact observed rather than declared.
-    if args.cross.is_none()
-        && out_form.family != "*"
+    // `cpu` on a machine with no accelerator is the local linalg bridge, not a foreign
+    // target. Everything else named with `-t` still cannot run here, and staying silent
+    // made the spec's cross-generation scenario fail on CI, where detection is `none`.
+    let foreign = out_form.family != "*"
         && out_form.family != family
-        && family != "none"
-    {
+        && !(family == "none" && out_form.family == "cpu");
+    if args.cross.is_none() && foreign {
         // "Cannot be run here" is a claim about a HARNESS, not about a family name.
         // Comparing families alone said spirv could not be run or measured on this
         // machine, and then it was: Mesa's Vulkan driver sits on the same Apple GPU, so
         // the two families are not disjoint. The note now reports which of the two facts
-        // holds instead of inferring the stronger one from the weaker.
-        if tile_cli::run::harness_source(out_form).is_ok() {
+        // holds instead of inferring the stronger one from the weaker. With no
+        // accelerator there is no "same device" to share, so that branch stays closed.
+        let here = if family == "none" {
+            "this machine has no accelerator".to_string()
+        } else {
+            format!("this machine is {family}")
+        };
+        if family != "none" && tile_cli::run::harness_source(out_form).is_ok() {
             eprintln!(
-                "tile: note: {} targets {} and this machine is {} — a different API on the \
+                "tile: note: {} targets {} and {here} — a different API on the \
                  same device. There is a harness for it, so `-r` runs and measures here. \
                  Pass --cross {} to silence this.",
-                out_form.id, out_form.family, family, out_form.family
+                out_form.id, out_form.family, out_form.family
             );
         } else {
             eprintln!(
-                "tile: note: {} targets {} but this machine is {} — this is cross \
+                "tile: note: {} targets {} but {here} — this is cross \
                  generation, and there is no harness for it here, so the result cannot be \
                  run or measured. Pass --cross {} to say so deliberately (and to silence \
                  this).",
-                out_form.id, out_form.family, family, out_form.family
+                out_form.id, out_form.family, out_form.family
             );
         }
     }
