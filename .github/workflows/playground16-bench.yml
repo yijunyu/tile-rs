@@ -126,3 +126,62 @@ jobs:
           echo "PTO:     ${{ steps.pto.outcome }}"
           echo "AscendC: ${{ steps.cpp.outcome }}"
           [ "${{ steps.pto.outcome }}" = success ] && [ "${{ steps.cpp.outcome }}" = success ]
+
+  # `tile_codegen`'s `emitters` and `ascend` features had rotted to the point of not
+  # compiling — 11 and 19 errors — and nothing anywhere built them, which is why. They
+  # need no LLVM, no CANN and no NPU, so there was never a hardware excuse; there was
+  # only no job. This is that job.
+  #
+  # It rides this workflow because this workflow is on the PUBLIC repo, which is the only
+  # place Actions can currently spend money (see the header). It therefore runs weekly
+  # rather than per-push, which is weaker than it should be and is the honest cost of the
+  # billing block. Move it into private CI the day that clears.
+  #
+  # Unlike the bench job this one checks out MAIN: the feature-gated skeleton is a
+  # main-only shape. The viewpoint branches split it into separate pto_codegen /
+  # ascendc_codegen crates, so there are no `--features` there to test.
+  feature-matrix:
+    name: tile_codegen builds under every feature set
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PRIVATE source, on main
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPO }}
+          ref: main
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install nightly-2025-08-04 --profile minimal
+
+      - name: Build against crates.io, not the vendor dir
+        run: rm -f .cargo/config.toml
+
+      # Three separate runs, not one `--all-features`: the point of the default build is
+      # that it pulls in NOTHING, and a combined run cannot observe that.
+      - name: default — the open skeleton, zero dependencies
+        working-directory: crates/tile_codegen
+        run: |
+          set -euo pipefail
+          cargo +nightly-2025-08-04 test
+          # The property the skeleton exists to have. `cargo tree` prints one line, the
+          # crate itself, when nothing is depended on.
+          n=$(cargo +nightly-2025-08-04 tree | wc -l)
+          [ "$n" -eq 1 ] || { cargo +nightly-2025-08-04 tree; echo "::error::default build gained a dependency"; exit 1; }
+
+      - name: emitters — the 14 open targets, and NO closed file in the graph
+        working-directory: crates/tile_codegen
+        run: |
+          set -euo pipefail
+          cargo +nightly-2025-08-04 test --features emitters
+          # What the repair was actually about: ten open emitters imported their parser
+          # from mlir_to_pto, the CLOSED file, so "open" could not build without it. If
+          # that creeps back, this fails before the type error does.
+          if grep -rn 'crate::mlir_to_pto' ../rustc_codegen_tile/src/mlir_to_{aie,bang,gaudi,gpu,linalg,msl,musa,nki,spirv,tpu}.rs; then
+            echo "::error::an open emitter imports from mlir_to_pto again; import from crate::mlir_parse"
+            exit 1
+          fi
+
+      - name: ascend — the closed AscendC + PTO targets as peers
+        working-directory: crates/tile_codegen
+        run: cargo +nightly-2025-08-04 test --features ascend
