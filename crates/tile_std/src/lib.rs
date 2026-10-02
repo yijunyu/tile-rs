@@ -40,6 +40,16 @@ pub mod buf;
 pub mod core;
 pub mod kernel_ops;
 pub mod pipeline;
+// Host-only. These exist to be TYPE-CHECKED by `cargo check` (see the module header);
+// they are dead code crate-wide. Code-generating them is a different matter: the tile
+// backend emits MLIR for every function in the crate, so a `pub` module of kernels lands
+// in EVERY kernel's merged module — and `emitted_kernels::window_mask` calls
+// `tile_window_mask_f32`, which `mlir_to_pto` has no arm for. Since
+// `reject_unknown_intrinsics` scans the whole module text, that one dead kernel made
+// Rust -> PTO impossible for every kernel, including one that only loads, adds and
+// stores. `davinci-huawei-none.json` sets "os": "cuda", so this gate keeps the
+// type-checking and drops the codegen.
+#[cfg(not(target_os = "cuda"))]
 pub mod emitted_kernels;
 pub mod tile;
 
