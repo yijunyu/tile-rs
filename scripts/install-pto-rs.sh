@@ -36,21 +36,28 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar  >/dev/null 2>&1 || die "tar is required"
 
 # --- resolve the release -----------------------------------------------------
-# No jq: read the tag out of the redirect that /releases/latest issues. Falls back to a
-# caller-supplied PTO_RS_TAG, which is also the escape hatch if the newest release is a
-# prerelease (GitHub's /latest skips those).
+# Resolve the newest pto-rs-v* release from the releases API, NOT from the redirect that
+# /releases/latest issues. Two reasons, both load-bearing:
+#   * /releases/latest SKIPS prereleases, and every codegen-backend release in this repo
+#     is one — so that redirect currently lands on /releases and yields no tag at all.
+#   * this repository publishes two unrelated things, the CLI and the codegen backend, so
+#     "latest" is the wrong question anyway. Filtering on the tag prefix is the right one.
+# No jq: the API response is split on commas and the tag read with sed. The API returns
+# releases newest-first, so the first match is the newest CLI release.
 if [ -z "$TAG" ]; then
-    TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-          "https://github.com/$REPO/releases/latest" 2>/dev/null |
-          sed -n 's|.*/tag/\(.*\)$|\1|p')
+    TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=50" 2>/dev/null |
+          tr ',' '\n' |
+          sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(pto-rs-v[^"]*\)".*/\1/p' |
+          head -1)
 fi
-[ -n "$TAG" ] || die "could not determine the latest release tag.
-  Set PTO_RS_TAG=pto-rs-v0.0.1 (prereleases are not returned by /releases/latest)."
+[ -n "$TAG" ] || die "no pto-rs-v* release found on $REPO.
+  Set PTO_RS_TAG=pto-rs-v0.0.1 to pick one explicitly, or check:
+    https://github.com/$REPO/releases"
 
 case "$TAG" in
     pto-rs-v*) : ;;
-    *) die "the latest release is '$TAG', which is not a pto-rs build.
-  This repository also publishes the codegen backend. Set PTO_RS_TAG to a pto-rs-v* tag." ;;
+    *) die "PTO_RS_TAG='$TAG' is not a pto-rs build. This repository also publishes the
+  codegen backend; the CLI tags look like pto-rs-v0.0.1." ;;
 esac
 
 ASSET="pto-rs-$TRIPLE.tar.gz"

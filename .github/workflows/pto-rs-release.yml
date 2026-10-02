@@ -111,6 +111,10 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # -R on every gh call: this job downloads artifacts and never checks the
+          # repository out, so gh has no git remote to infer the repo from and fails with
+          # "not a git repository". The builds passed and only the publish broke on it.
+          REPO="${{ github.repository }}"
           mapfile -t ASSETS < <(find artifacts -name '*.tar.gz' | sort)
           [ "${#ASSETS[@]}" -gt 0 ] || { echo "no assets"; exit 1; }
           NOTES=$(cat <<'EOF'
@@ -128,9 +132,9 @@ jobs:
           binary here, the same split the codegen backend uses.
           EOF
           )
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "pto-rs $TAG" --notes "$NOTES"
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$REPO" --title "pto-rs $TAG" --notes "$NOTES"
           else
-            gh release create "$TAG" --title "pto-rs $TAG" --notes "$NOTES" --prerelease
+            gh release create "$TAG" -R "$REPO" --title "pto-rs $TAG" --notes "$NOTES" --prerelease
           fi
-          for a in "${ASSETS[@]}"; do gh release upload "$TAG" "$a" --clobber; done
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" -R "$REPO" "$a" --clobber; done
