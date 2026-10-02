@@ -29,7 +29,11 @@ on:
 
 env:
   PRIVATE_SOURCE_REPO: yijunyu/ascend-rs-priv
-  PRIVATE_SOURCE_REF: ascendc-rs-viewpoint
+  # pto-rs-viewpoint, NOT ascendc-rs-viewpoint: one branch in the monorepo carries both
+  # viewpoints and both CLIs. This file was derived from pto-rs-release.yml by renaming
+  # pto-rs to ascendc-rs throughout, which silently rewrote this line too and pointed the
+  # checkout at a branch that does not exist — the builds failed before compiling anything.
+  PRIVATE_SOURCE_REF: pto-rs-viewpoint
 
 jobs:
   build:
