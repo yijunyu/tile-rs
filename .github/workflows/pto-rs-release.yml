@@ -60,7 +60,13 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install nightly-2025-08-04 --profile minimal
 
+      # Stamp the tile-rs commit this release is built from, so `pto-rs install` fetches
+      # exactly the tile_std it was released alongside. Without it the CLI falls back to
+      # archive/refs/heads/main.tar.gz, which GitHub CACHES — two installs of one CLI
+      # version could get different tile_std, and did.
       - name: Build the CLI
+        env:
+          PTO_RS_TILE_RS_SHA: ${{ github.sha }}
         run: cargo +nightly-2025-08-04 build --release --manifest-path crates/pto_cli/Cargo.toml
 
       # Prove the binary runs before shipping it. `--check` exits 4 when the codegen
