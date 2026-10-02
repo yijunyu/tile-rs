@@ -1,0 +1,109 @@
+# The shared 16-kernel bench, run in ONE place.
+#
+# WHY IT RUNS ON THE PUBLIC REPO AND NOT BESIDE THE CODE
+#
+# It was written as .github/workflows/ in the private monorepo and never ran: Actions on
+# this private repo is blocked at the account level ("recent account payments have failed
+# or your spending limit needs to be increased"), so the job was created and refused
+# before its first step. Public repositories bill differently, which is the same reason
+# codegen-release.yml and the two CLI release workflows already live there and reach back
+# in with PRIVATE_SOURCE_TOKEN. A bench that cannot run is worse than no bench, because
+# it looks like coverage.
+#
+# Source of truth is ci/tile-rs-public/ here; deploy.toml maps it to
+# .github/workflows/playground16-bench.yml on PUBLIC yijunyu/tile-rs, where it runs.
+# Kept out of .github/workflows/ privately so it never queues here again.
+#
+# Secret required on the public repo (already set, used by the release workflows):
+#   gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/tile-rs
+#
+# benchmarks/playground16/ is mapped into three viewpoints (pto-rs, ascendc-rs,
+# kunlunxin-rs) and each could lower it in its own CI. That gives three partial answers
+# over the same corpus and no owner for the whole, which is the shape where a kernel
+# regresses in the one emitter nobody checked. This job is the single answer; the
+# viewpoints are free to drop their own copies of it.
+#
+# WHY IT CHECKS OUT A DIFFERENT BRANCH OF THIS REPO
+#
+# The corpus is on main, but the harnesses that lower it hermetically — pto_codegen and
+# ascendc_codegen, no LLVM, no CANN, no NPU — are on pto-rs-viewpoint. The obvious
+# alternative was `tile_codegen --features ascend`, which is meant to be exactly this and
+# does not build: 29 errors on main today, starting with ascend_memorybank not being a
+# dependency at all. Fixing that is a real job and not this one, so this checks out the
+# branch where the working harness lives. The corpus subtree is byte-identical on both
+# branches, so running the branch's bench is running main's corpus.
+name: playground16 bench
+
+on:
+  # No push/pull_request triggers: this workflow runs on the PUBLIC repo and the corpus
+  # it tests lives in the private one, so there is no local path to filter on. A private
+  # push cannot start a public workflow without a repository_dispatch, which would need a
+  # token on the private side that its blocked Actions cannot spend. Scheduled plus
+  # manual is therefore the honest set, and the weekly run is the one that matters:
+  # three repositories depend on this corpus.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  PRIVATE_SOURCE_REPO: yijunyu/ascend-rs-priv
+  # The branch carrying the hermetic harnesses. See the header.
+  PRIVATE_SOURCE_REF: pto-rs-viewpoint
+
+jobs:
+  bench:
+    name: Lower the corpus through both Ascend emitters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PRIVATE source, on the branch carrying the harness
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPO }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+
+      # Assert the thing that makes this job meaningful: the corpus here is the corpus on
+      # main. If the two ever diverge, this job is silently testing the wrong copy, and
+      # that is worse than not running it.
+      - name: The corpus must be identical to main's
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin main
+          HERE=$(git rev-parse HEAD:benchmarks/playground16)
+          MAIN=$(git rev-parse FETCH_HEAD:benchmarks/playground16)
+          echo "harness branch: $HERE"
+          echo "main:           $MAIN"
+          if [ "$HERE" != "$MAIN" ]; then
+            echo "::error::benchmarks/playground16 has diverged between main and pto-rs-viewpoint."
+            echo "This job lowers the branch's copy and claims it covers main's. Re-sync them:"
+            echo "  git read-tree --prefix=benchmarks/playground16 <branch>:benchmarks/playground16"
+            exit 1
+          fi
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install nightly-2025-08-04 --profile minimal
+
+      # The monorepo's .cargo/config.toml replaces crates.io with vendor/, which holds
+      # serde 1.0.219 while these crates' lockfiles resolve 1.0.229. Right for the
+      # monorepo, wrong here — the same removal the release workflows do.
+      - name: Build against crates.io, not the vendor dir
+        run: rm -f .cargo/config.toml
+
+      # Separate steps so a failure names the emitter. Both run even if the first fails:
+      # "PTO regressed" and "both regressed" are different diagnoses and the second is
+      # worth having in one run.
+      - name: PTO — all 19 inputs
+        id: pto
+        continue-on-error: true
+        run: cargo +nightly-2025-08-04 test --manifest-path crates/pto_codegen/Cargo.toml --test playground16 -- --nocapture
+
+      - name: AscendC — all 19 inputs
+        id: cpp
+        continue-on-error: true
+        run: cargo +nightly-2025-08-04 test --manifest-path crates/ascendc_codegen/Cargo.toml --test playground16 -- --nocapture
+
+      - name: Fail if either emitter regressed
+        run: |
+          echo "PTO:     ${{ steps.pto.outcome }}"
+          echo "AscendC: ${{ steps.cpp.outcome }}"
+          [ "${{ steps.pto.outcome }}" = success ] && [ "${{ steps.cpp.outcome }}" = success ]
