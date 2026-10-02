@@ -68,6 +68,15 @@ jobs:
       # exactly the tile_std it was released alongside. Without it the CLI falls back to
       # archive/refs/heads/main.tar.gz, which GitHub CACHES — two installs of one CLI
       # version could get different tile_std, and did.
+      # The monorepo's .cargo/config.toml replaces crates.io with its vendor/ directory.
+      # That is right for the monorepo and wrong here: the CLI's Cargo.lock is resolved
+      # against crates.io, so the vendored set produces "failed to select a version for
+      # the requirement serde = ^1.0 (locked to 1.0.229)" — vendor has 1.0.219. The
+      # viewpoint repos ship a .cargo/config.toml without the replacement for the same
+      # reason. pto_cli only escaped this by having no serde dependency at all.
+      - name: Build against crates.io, not the vendor dir
+        run: rm -f .cargo/config.toml
+
       - name: Build the CLI
         env:
           ASCENDC_RS_TILE_RS_SHA: ${{ github.sha }}
