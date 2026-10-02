@@ -79,7 +79,7 @@ jobs:
 
       - name: Build the CLI
         env:
-          ASCENDC_RS_TILE_RS_SHA: ${{ github.sha }}
+          TILE_LOWER_TILE_RS_SHA: ${{ github.sha }}
         run: cargo +nightly-2025-08-04 build --release --manifest-path crates/ascendc_cli/Cargo.toml
 
       # Prove the binary runs before shipping it. `--check` exits 4 when the codegen
