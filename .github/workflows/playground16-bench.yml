@@ -32,6 +32,25 @@
 # dependency at all. Fixing that is a real job and not this one, so this checks out the
 # branch where the working harness lives. The corpus subtree is byte-identical on both
 # branches, so running the branch's bench is running main's corpus.
+#
+# IS THE BRANCH'S EMITTER MAIN'S EMITTER? For this corpus, yes — measured, not assumed.
+#
+# crates/rustc_codegen_tile/src/mlir_to_pto.rs differs between main (45b427ee6) and
+# pto-rs-viewpoint (41441c8a7) by roughly 660 lines, in BOTH directions, so the question
+# is fair. Emitted every corpus input through each copy and compared the output bytes:
+#
+#   16/16 byte-identical, refusal texts included.
+#
+# So the divergence does not touch what this corpus exercises, and the bench's answer is
+# main's answer. The limit is exactly that: it says nothing about inputs outside the
+# corpus, where 660 lines of difference may well matter. The emitter divergence itself is
+# unresolved and is NOT what this job is for.
+#
+# That the gap can matter is not hypothetical. A third, older copy of this emitter
+# (a330b135b, in a sibling viewpoint's tree) REFUSES fixed/attn_gqa.mlir outright —
+# "attention_gqa: unknown Q tile %c0" — where both copies here emit it. Same corpus, three
+# emitter versions, three answers. That is the argument for one owner running one bench
+# rather than each consumer reporting its own number.
 name: playground16 bench
 
 on:
