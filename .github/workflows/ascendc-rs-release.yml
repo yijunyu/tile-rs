@@ -1,0 +1,149 @@
+# Publish the `ascendc-rs` CLI as a public release asset.
+#
+# Source of truth is ci/tile-rs-public/ in the private monorepo; deploy.toml maps this
+# to .github/workflows/ascendc-rs-release.yml in the PUBLIC yijunyu/tile-rs repo, where it
+# runs. Kept out of .github/workflows/ privately so it never runs there.
+#
+# Why here and not in the ascendc-rs repo: ascendc-rs is private, so a release asset there needs
+# authentication, and `curl | sh` does not have any. Publishing from the public repo is
+# what makes a one-line install possible. The same split the codegen backend already
+# uses — closed source, public binary — via codegen-release.yml, which this mirrors.
+#
+# The CLI is cheap to build compared with the backend: no LLVM, no bundling, no install
+# name rewriting. It needs only the pinned toolchain (the workspace's rust-toolchain.toml
+# resolves it) because the emitter sources are edition 2024.
+#
+# Secret required on the public repo:
+#   gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/tile-rs
+name: ascendc-rs Release
+
+on:
+  push:
+    tags:
+      - 'ascendc-rs-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. ascendc-rs-v0.0.1)'
+        required: true
+
+env:
+  PRIVATE_SOURCE_REPO: yijunyu/ascend-rs-priv
+  PRIVATE_SOURCE_REF: ascendc-rs-viewpoint
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPO }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+
+      # MINIMAL profile and an explicit +toolchain, rather than letting rustup honour
+      # the repo's rust-toolchain.toml. That file pins nine components — rustc-dev,
+      # llvm-tools, rust-src, miri, rust-analyzer and more — because the LLVM codegen
+      # backend needs them. ascendc_cli needs none of them, and a nightly missing any one
+      # would fail this build for a reason that has nothing to do with the CLI.
+      # `+toolchain` on the cargo invocation overrides the file.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install nightly-2025-08-04 --profile minimal
+
+      # Stamp the tile-rs commit this release is built from, so `ascendc-rs install` fetches
+      # exactly the tile_std it was released alongside. Without it the CLI falls back to
+      # archive/refs/heads/main.tar.gz, which GitHub CACHES — two installs of one CLI
+      # version could get different tile_std, and did.
+      - name: Build the CLI
+        env:
+          ASCENDC_RS_TILE_RS_SHA: ${{ github.sha }}
+        run: cargo +nightly-2025-08-04 build --release --manifest-path crates/ascendc_cli/Cargo.toml
+
+      # Prove the binary runs before shipping it. `--check` exits 4 when the codegen
+      # backend is absent, which it is on a clean runner — that is the expected answer
+      # here, not a failure, so only `--version` is asserted.
+      - name: Smoke-test
+        run: |
+          BIN=crates/ascendc_cli/target/release/ascendc-rs
+          "$BIN" --version
+          "$BIN" --help > /dev/null
+          "$BIN" --check || test $? -eq 4
+
+      # The .mlir mode needs no toolchain, so it can be proven here end to end.
+      # The .mlir mode needs no toolchain, so it is proven here end to end against the
+      # bench corpus rather than a per-crate fixture.
+      - name: Emit AscendC from the bench corpus
+        run: |
+          BIN=crates/ascendc_cli/target/release/ascendc-rs
+          "$BIN" benchmarks/playground16/vec_add.mlir -o /tmp/smoke.cpp
+          grep -q 'kernel_operator.h' /tmp/smoke.cpp
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp crates/ascendc_cli/target/release/ascendc-rs dist/
+          tar -czf "ascendc-rs-${{ matrix.triple }}.tar.gz" -C dist ascendc-rs
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascendc-rs-${{ matrix.triple }}
+          path: ascendc-rs-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release on this repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          # -R on every gh call: this job downloads artifacts and never checks the
+          # repository out, so gh has no git remote to infer the repo from and fails with
+          # "not a git repository". The builds passed and only the publish broke on it.
+          REPO="${{ github.repository }}"
+          mapfile -t ASSETS < <(find artifacts -name '*.tar.gz' | sort)
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "no assets"; exit 1; }
+          NOTES=$(cat <<'EOF'
+          The `ascendc-rs` command: lower a tile-rs kernel to AscendC C++.
+
+          Two input modes:
+          * `ascendc-rs kernel.mlir` — needs nothing at all.
+          * `ascendc-rs kernel.rs` — needs the codegen backend; `ascendc-rs install` fetches it.
+
+          `--soc` sets the unified-buffer budget (910b default, or 950/950pr/950dt).
+
+          Install:
+              curl -fsSL https://raw.githubusercontent.com/yijunyu/tile-rs/main/scripts/install-ascendc-rs.sh | sh
+
+          The source is not in this repository: the emitter and the CLI live in the
+          private monorepo, and this workflow builds them there and publishes the
+          binary here, the same split the codegen backend uses.
+          EOF
+          )
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$REPO" --title "ascendc-rs $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" -R "$REPO" --title "ascendc-rs $TAG" --notes "$NOTES" --prerelease
+          fi
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" -R "$REPO" "$a" --clobber; done
