@@ -21,6 +21,8 @@ pub enum BackendKind {
     Bang,
     /// Intel Gaudi (via TPC-C).
     Gaudi,
+    /// AMD GPU (via HIP).
+    Hip,
 }
 
 impl BackendKind {
@@ -31,6 +33,7 @@ impl BackendKind {
             "gpu" => Some(BackendKind::Cuda),
             "musa" => Some(BackendKind::Musa),
             "aie" => Some(BackendKind::Aie),
+            "hip" => Some(BackendKind::Hip),
             "nki" => Some(BackendKind::Nki),
             "spirv" => Some(BackendKind::Spirv),
             "msl" => Some(BackendKind::Msl),
@@ -47,6 +50,7 @@ impl BackendKind {
             BackendKind::Cuda => "gpu",
             BackendKind::Musa => "musa",
             BackendKind::Aie => "aie",
+            BackendKind::Hip => "hip",
             BackendKind::Nki => "nki",
             BackendKind::Spirv => "spirv",
             BackendKind::Msl => "msl",
@@ -107,6 +111,11 @@ impl BackendSelector {
             #[cfg(feature = "aie")]
             BackendKind::Aie => {
                 let dev = crate::aie::AieDevice::new(ordinal)?;
+                Ok(Box::new(dev))
+            }
+            #[cfg(feature = "hip")]
+            BackendKind::Hip => {
+                let dev = crate::hip::HipDevice::new(ordinal)?;
                 Ok(Box::new(dev))
             }
             other => Err(HalError::BackendNotAvailable(format!(
