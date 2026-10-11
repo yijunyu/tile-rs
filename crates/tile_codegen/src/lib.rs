@@ -28,21 +28,47 @@
 //! tests at the bottom of this file.
 
 pub mod bandit;
+pub mod clustering;
+pub mod driver;
+pub mod hardware;
+pub mod frontier;
 pub mod hazard;
+pub mod layout;
 pub mod pointwise;
 pub mod registry;
+pub mod roofline;
 pub mod schedule;
 pub mod target;
 pub mod targets;
 
 pub use bandit::{ArmStat, BanditState, bandit_enabled};
+pub use clustering::{BehaviourVector, Centroids, ClusterTracker, kmeans};
+pub use driver::{DriveReport, Pull, RunOutcome, drive, drive_masked, load_or_new, save};
+pub use frontier::{Candidate, Flags, Frontier, Strategy, Transform, transforms_for};
+pub use hazard::{
+    BufId, Buffers, Edge, Hazard, VecOp, barrier_points, hazards, report, unsynced,
+};
+pub use hardware::{HwSignature, Resource, SATURATION};
+pub use layout::{
+    BLOCK_BYTES, GuardedTransform, LayoutError, PlanReason, RowLayout, TRANSFORMS, TransferPlan,
+    proxy_disagrees,
+};
 pub use pointwise::{
     AxisClass, Collapsed, InstanceKey, Operand, OperandKind, PointwiseSchema, Promoted,
     PromotionKind, ScalarType, TilePlan, TypeCategory, collapse, elementwise_dtypes, plan_tiles,
     promote_types,
 };
 pub use registry::TargetRegistry;
-pub use schedule::{K_UNROLL_ARMS, MAX_K_UNROLL, Schedule};
+pub use roofline::{
+    BYTES_PER_GB, BOUND_FRACTION, MIN_TRANSFER_BYTES, ROOFLINE_TRANSFORMS, Regime, Roofline,
+    BATCH_FORMULA_CAP_2B, Feasibility, Staging, StagingPlan, TILE_CAP_2B, Traffic,
+    TransferShape, achieved_gbps, classify, max_footprint_bytes, plan_staging,
+    rows_per_transfer_needed, tile_cap, whole_row_admissible,
+};
+pub use schedule::{
+    KNOBS, K_UNROLL_ARMS, Knob, KnobSite, MAX_K_UNROLL, MAX_TILE, SPLIT_P_ARMS, Schedule,
+    TILE_ARMS, TargetKnobs, ValueEffect,
+};
 pub use target::{
     CodegenTarget, EmitOpts, EmitOut, HardwareParams, NanTest, TargetMeta, TargetSemantics,
 };
@@ -210,6 +236,57 @@ mod tests {
         // and the refusal is not "everything is fine": a shape the 910B accepts
         // is still refused for the 950, because nobody has looked.
         assert!(a.check_ub(1024).is_ok());
+    }
+
+    #[test]
+    fn the_config_capacities_unblock_the_cube_without_relaxing_the_refusal() {
+        // The _unmeasured trio must keep refusing: the policy they encode is about
+        // whether anybody looked at the SILICON, and a vendor platform config is not
+        // that. Flipping `measured` inside them would make the name contradict the
+        // value and would silently license planning everywhere.
+        for a in [
+            HardwareParams::ascend_950_unmeasured(),
+            HardwareParams::ascend_950pr_unmeasured(),
+            HardwareParams::ascend_950dt_unmeasured(),
+        ] {
+            assert!(!a.measured);
+            assert!(a.check_ub(1024).is_err());
+            assert!(a.check_cube_tile(128, 128, 64, 2).is_err());
+        }
+
+        // The measured variants carry the config numbers and are opt-in by name.
+        let pr = HardwareParams::ascend_950pr();
+        let dt = HardwareParams::ascend_950dt();
+        for a in [pr, dt] {
+            assert!(a.measured);
+            assert_eq!(a.npu_arch, "DAV_3510");
+            assert_eq!(a.ub_size, 253952);
+            assert_eq!(a.l0c_bytes, 262144);
+            // L0_A, L0_B and L1 are UNCHANGED from 910B; only UB and L0_C move.
+            assert_eq!(a.l0a_bytes, HardwareParams::ascend_910b().l0a_bytes);
+            assert_eq!(a.l0b_bytes, HardwareParams::ascend_910b().l0b_bytes);
+        }
+        // Different silicon ids survive, so a ceiling still cannot be misfiled.
+        assert_ne!(pr.chip, dt.chip);
+        // The DT eval-image OP gap is not a capacity and must survive measurement.
+        assert!(pr.check_vendor_op("Cat").is_ok());
+        assert!(dt.check_vendor_op("ConcatD").is_err());
+
+        // THE POINT OF THE EXERCISE: 2x L0_C admits a 2x larger fp32 output block.
+        // 256x256 needs 262144B of L0_C -- fits on 950, refused on 910B.
+        let b = HardwareParams::ascend_910b();
+        assert!(pr.check_cube_tile(256, 256, 64, 2).is_ok());
+        assert!(b.check_cube_tile(256, 256, 64, 2).is_err());
+        // and the 910B-sized block is still legal on both
+        assert!(pr.check_cube_tile(256, 128, 64, 2).is_ok());
+        assert!(b.check_cube_tile(256, 128, 64, 2).is_ok());
+
+        // AND THE COUNTER-EXAMPLE, so the extra UB is not read as a tile target:
+        // group_norm's float32 working set at the whole-budget tile 11072 is ~238976B.
+        // It is INSIDE ub_size and it failed correctness on both 950 boards
+        // (job_0fa673447733, job_63f8c3262ae4). check_ub therefore passing it is
+        // CORRECT and is not a promise that the tile is sound.
+        assert!(pr.check_ub(238_976).is_ok());
     }
 
     #[test]

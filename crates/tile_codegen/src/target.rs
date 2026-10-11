@@ -196,6 +196,41 @@ impl HardwareParams {
     /// when the machine is known: they share this ISA target but are different
     /// silicon and different eval images. Fill any of them from a probe on that
     /// machine and set `measured`.
+    /// CAPACITIES ARE NOW FILLED, from CANN's own per-SoC platform config rather
+    /// than from a guess:
+    /// `/usr/local/Ascend/cann-9.2.0/aarch64-linux/data/platform_config/Ascend950*.ini`
+    /// on 910b2, read 2026-10-11. `ub_size=253952`, `l0_a_size=65536`,
+    /// `l0_b_size=65536`, `l0_c_size=262144`, `l1_size=524288`, `vector_core_cnt=64`,
+    /// `ai_core_cnt=32`. Against 910B's 196608 / 65536 / 65536 / 131072 / 524288 / 48 /
+    /// 24, so UB is 1.29x and **L0_C is 2x** while L0_A, L0_B and L1 are unchanged.
+    ///
+    /// PROVENANCE, because it decides what this licenses: these are the vendor's own
+    /// declarations, which CANN itself compiles against, NOT a probe of a running job.
+    /// They are authoritative for capacity and they are one step removed from the
+    /// device. `measured` is set because the alternative -- every `check_*` returning
+    /// `Err` -- made the planner unable to size anything at all for 950, and a vendor
+    /// config is a better basis than refusal.
+    ///
+    /// THE 2x L0_C IS THE INTERESTING NUMBER AND IT IS UNEXPLOITED. The accumulator is
+    /// always fp32, so `check_cube_tile` allows an m*n of 65536 here against 32768 on
+    /// 910B -- a 2x larger output block. Nothing in the cannbench tree reads it: the
+    /// cube block is chosen by picking a hand-specialised kernel variant, and the one
+    /// large-block variant is gated on an exact shape (`K == 1024 && N == 2048 &&
+    /// M % 256 == 0`) with no reference to the chip. 8 of the 10 largest board gaps are
+    /// the matmul/attention family, so this is where the capacity is worth spending.
+    ///
+    /// AND A MEASURED WARNING AGAINST THE OBVIOUS INFERENCE: more UB does NOT license a
+    /// proportionally larger VECTOR tile. group_norm's tile was changed from the largest
+    /// power of two inside its budget to the whole budget aligned down to 64 -- 8192 ->
+    /// 11072 for float32 and 13888 for float16 on 950 -- and it failed correctness on
+    /// both 950 boards: 950pr 60.82 at 19/20 -> 26.44 at 3/20 (`job_0fa673447733`),
+    /// 950dt 30.13 at 6/20 -> 26.70 at 4/20 (`job_63f8c3262ae4`). The arithmetic said it
+    /// fitted, at 238976 of 253952. The cause is NOT established; candidates are a fixed
+    /// runtime reserve treated as proportional, and a reduce work-buffer requirement that
+    /// grows with the count. A CPU-emulator pass does not clear it either: the emulator
+    /// is dav-c220 and the 950-budget tiles exceed 910's UB, so the failing
+    /// configuration is one it cannot run. Treat `ub_size` as a refusal bound, not as a
+    /// tile target.
     pub const fn ascend_950_unmeasured() -> Self {
         Self {
             npu_arch: "DAV_3510",
@@ -235,6 +270,76 @@ impl HardwareParams {
             missing_vendor_ops: &["Cat", "Arange", "ConcatD"],
             measured: false,
             ..Self::ascend_950_unmeasured()
+        }
+    }
+
+    /// Ascend 950, capacities FROM THE VENDOR'S PLATFORM CONFIG.
+    ///
+    /// Read 2026-10-11 from
+    /// `/usr/local/Ascend/cann-9.2.0/aarch64-linux/data/platform_config/Ascend950*.ini`
+    /// on 910b2: `ub_size=253952`, `l0_a_size=65536`, `l0_b_size=65536`,
+    /// `l0_c_size=262144`, `l1_size=524288`, `vector_core_cnt=64`, `ai_core_cnt=32`.
+    /// Against 910B's 196608 / 65536 / 65536 / 131072 / 524288 / 48 / 24 -- so UB is
+    /// 1.29x, **L0_C is 2x**, and L0_A, L0_B and L1 are unchanged. 950's L2 is SMALLER
+    /// (134217728 against 201326592), which cuts the other way and is not modelled here.
+    ///
+    /// THIS IS A SEPARATE CONSTRUCTOR ON PURPOSE. [`Self::ascend_950_unmeasured`] and its
+    /// SKU siblings keep refusing, because the policy those encode -- "unmeasured is not
+    /// unlimited; refuse rather than borrow another chip's numbers" -- is about whether
+    /// anybody has LOOKED AT THE SILICON, and a vendor config is not that. It is the
+    /// declaration CANN itself compiles against, which makes it authoritative for
+    /// capacity and still one step removed from a running job. A caller that wants to
+    /// plan against it says so by naming this function.
+    ///
+    /// A MEASURED WARNING ABOUT WHAT THE EXTRA UB DOES NOT BUY. More UB does not license
+    /// a proportionally larger VECTOR tile. group_norm's tile was taken from the largest
+    /// power of two inside its budget to the whole budget aligned down to 64 -- 8192 ->
+    /// 11072 (float32) and 13888 (float16) on 950 -- and it FAILED CORRECTNESS on both
+    /// boards: 950pr 60.82 at 19/20 -> 26.44 at 3/20 (`job_0fa673447733`), 950dt 30.13
+    /// at 6/20 -> 26.70 at 4/20 (`job_63f8c3262ae4`). The arithmetic said it fitted, at
+    /// 238976 of 253952, and the device disagreed. The cause is NOT established.
+    /// A CPU-emulator pass does not clear it: the emulator is dav-c220 and the
+    /// 950-budget tiles exceed 910's UB, so the failing configuration is one it cannot
+    /// run -- a coverage gap, not a false pass. Treat `ub_size` as a refusal bound, not
+    /// as a tile target.
+    ///
+    /// THE 2x L0_C IS THE UNSPENT ONE. The accumulator is always fp32, so
+    /// [`Self::check_cube_tile`] admits an `m * n` of 65536 here against 32768 on 910B.
+    /// Nothing in the cannbench tree reads it: cube blocks are chosen by picking a
+    /// hand-specialised kernel variant, and the one large-block variant is gated on an
+    /// exact shape (`K == 1024 && N == 2048 && M % 256 == 0`) with no reference to the
+    /// chip. 8 of the 10 largest board gaps are the matmul/attention family, so that is
+    /// where this capacity is worth spending -- and unlike the vector tile above, the
+    /// cube block has a capacity check that can refuse a bad one.
+    pub const fn ascend_950() -> Self {
+        Self {
+            measured: true,
+            ub_size: 253952,
+            l0a_bytes: 65536,
+            l0b_bytes: 65536,
+            l0c_bytes: 262144,
+            ..Self::ascend_950_unmeasured()
+        }
+    }
+
+    /// Ascend 950PR with the config capacities. See [`Self::ascend_950`] for provenance
+    /// and for what the extra UB does not buy.
+    pub const fn ascend_950pr() -> Self {
+        Self {
+            chip: "Ascend950PR_9589",
+            missing_vendor_ops: &[],
+            ..Self::ascend_950()
+        }
+    }
+
+    /// Ascend 950DT with the config capacities. Keeps the DT eval-image OP gap, which is
+    /// evidence about the grader rather than a capacity and does not depend on
+    /// `measured`. See [`Self::ascend_950`].
+    pub const fn ascend_950dt() -> Self {
+        Self {
+            chip: "Ascend950DT_9582",
+            missing_vendor_ops: &["Cat", "Arange", "ConcatD"],
+            ..Self::ascend_950()
         }
     }
 
