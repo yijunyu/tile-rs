@@ -64,18 +64,44 @@ done
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
-# --- resolve the release ------------------------------------------------------
-if [ -z "$TAG" ]; then
-    TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
-          sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+# --- resolve the release -----------------------------------------------------
+# NOT just /releases/latest: a tag can exist with zero assets uploaded yet (a
+# release mid-publish upstream) -- confirmed happening live against this exact
+# repo, not a hypothetical. So this checks the asset actually resolves before
+# committing to a tag, walking back through the last few releases if the
+# newest one's upload for this platform+python isn't there yet.
+if [ -n "$TAG" ]; then
+    CANDIDATES="$TAG"
+else
+    CANDIDATES=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=5" 2>/dev/null |
+                 sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 fi
-[ -n "$TAG" ] || die "could not resolve the latest release from $REPO.
+[ -n "$CANDIDATES" ] || die "could not list releases from $REPO.
   Set PTOAS_TAG=v0.67 to pick one explicitly, or check:
     https://github.com/$REPO/releases"
 
-VER="${TAG#v}"
-WHEEL="ptoas-${VER}-${PYTAG}-${PYTAG}-${PLAT}.whl"
-URL="https://github.com/$REPO/releases/download/$TAG/$WHEEL"
+TAG="" WHEEL="" URL=""
+for cand in $CANDIDATES; do
+    case "$cand" in v*) : ;; *) continue ;; esac   # skip non-"vN.N" tags (e.g. vmi-*)
+    cver="${cand#v}"
+    cwheel="ptoas-${cver}-${PYTAG}-${PYTAG}-${PLAT}.whl"
+    # -I -L: HEAD, following GitHub's redirect to the real asset host, so this is a
+    # cheap existence check rather than downloading the ~20-30 MB wheel just to look.
+    # A bare `curl -o /dev/null -w '%{http_code}'` without -L reports the FIRST hop's
+    # code -- 302 for an asset that exists, not 200 -- which would have rejected every
+    # real release; caught by checking a known-good tag, not by reading the man page.
+    code=$(curl -sI -L -o /dev/null -w '%{http_code}' \
+           "https://github.com/$REPO/releases/download/$cand/$cwheel" 2>/dev/null)
+    if [ "$code" = "200" ]; then
+        TAG="$cand"; WHEEL="$cwheel"
+        URL="https://github.com/$REPO/releases/download/$TAG/$WHEEL"
+        break
+    fi
+    say "install-ptoas: $cand has no $cwheel yet, trying the previous release"
+done
+[ -n "$TAG" ] || die "no release of the last 5 has a $PYTAG/$PLAT wheel.
+  Set PTOAS_TAG=v0.67 to pick one explicitly, or check:
+    https://github.com/$REPO/releases"
 
 say "install-ptoas: $TAG, $PYBIN ($PYTAG), $PLAT"
 
