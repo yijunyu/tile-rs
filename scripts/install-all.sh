@@ -1,7 +1,13 @@
 #!/bin/sh
-# One-line install for the whole pipeline (steps 1-7; step 0 is an agent, not a binary):
+# One-line install for the whole pipeline, steps 0-7:
 #
 #   curl -fsSL https://raw.githubusercontent.com/yijunyu/tile-rs/main/scripts/install-all.sh | sh
+#
+# Step 0 (install-agent.sh) installs an agent CLI (claude by default) but never
+# INVOKES one on its own -- that costs real API usage, so this script's step-0 call
+# carries no --author/-o and just installs. Set AGENT=codex or AGENT=icode before
+# running this script to install one of those instead of claude for step 0; see
+# install-agent.sh's own header for why icode is not the default.
 #
 # This is deliberately an ORCHESTRATOR, not a reimplementation: each tool already has its
 # own tested install-<name>.sh (platform detection, release resolution, checksum or
@@ -68,6 +74,15 @@ $name skipped"
     RESULTS="$RESULTS
 $name $rc"
 }
+
+# Step 0 does not fit run_one's signature (it takes AGENT, not a BIN_DIR var, and its
+# default behaviour -- install only, no --author/-o -- is already the safe one).
+say ""
+say "install-all: === agent (step 0) ==="
+AGENT="${AGENT:-claude}" sh -c "curl -fsSL '$BASE/install-agent.sh' | sh"
+rc=$?
+RESULTS="$RESULTS
+agent $rc"
 
 run_one ascendc-to-rs install-ascendc-to-rs.sh ASCENDC_TO_RS_BIN_DIR
 run_one pto-rs        install-pto-rs.sh        PTO_RS_BIN_DIR
