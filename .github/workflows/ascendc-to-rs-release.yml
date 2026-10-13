@@ -54,7 +54,7 @@ jobs:
         run: rm -f .cargo/config.toml
 
       - name: Build the CLI
-        run: cargo build --release --manifest-path crates/ascendc_to_rs/Cargo.toml --bin ascendc-to-rs
+        run: cargo build --release -p ascendc_to_rs --bin ascendc-to-rs
 
       # Prove the binary runs before shipping it, and that it actually transpiles --
       # starting is not the same guarantee as working. ascendc-to-rs has no --version
@@ -62,7 +62,7 @@ jobs:
       # the start check.
       - name: Smoke-test
         run: |
-          BIN=crates/ascendc_to_rs/target/release/ascendc-to-rs
+          BIN=target/release/ascendc-to-rs
           "$BIN" --help
 
       # No ready-made small AscendC .cpp sample exists in this branch (playground16 only
@@ -79,14 +79,14 @@ jobs:
               zGm.SetGlobalBuffer((__gm__ float*)z, n);
           }
           CPP
-          BIN=crates/ascendc_to_rs/target/release/ascendc-to-rs
+          BIN=target/release/ascendc-to-rs
           "$BIN" /tmp/smoke.cpp --stdout > /tmp/smoke.rs
           grep -q 'tile_std::tile_kernel' /tmp/smoke.rs
 
       - name: Package
         run: |
           mkdir -p dist
-          cp crates/ascendc_to_rs/target/release/ascendc-to-rs dist/
+          cp target/release/ascendc-to-rs dist/
           tar -czf "ascendc-to-rs-${{ matrix.triple }}.tar.gz" -C dist ascendc-to-rs
 
       - name: Upload build artifact
