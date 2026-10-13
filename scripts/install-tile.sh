@@ -11,9 +11,12 @@
 # ascendc-rs-release.yml and vendor/pto_to_ascendc/README.md), published only as a
 # prebuilt binary inside this same tarball.
 #
-# Four platforms ship here, not two (tile-release.yml's own matrix):
-#   aarch64-apple-darwin / x86_64-apple-darwin / x86_64-unknown-linux-gnu /
-#   aarch64-unknown-linux-gnu
+# Three platforms ship in tile-v0.0.1, not the four the matrix in tile-release.yml
+# builds: x86_64-apple-darwin (Intel macOS) is missing because that leg's own test
+# suite (the_specification_runs, unrelated to this release) currently fails there --
+# the torch wheels tile's own tests fetch don't cover macosx_14_0_x86_64 at all. See
+# that release's own NOTES for the detail; published manually from the three matrix
+# legs that built and tested clean rather than blocking on an unrelated gap.
 #
 # POSIX sh on purpose: this runs before anything is installed, on whatever the machine
 # has. No bashisms, no jq, no gh.
@@ -31,11 +34,14 @@ os="$(uname -s)"
 arch="$(uname -m)"
 case "$os-$arch" in
     Darwin-arm64)   TRIPLE=aarch64-apple-darwin ;;
-    Darwin-x86_64)  TRIPLE=x86_64-apple-darwin ;;
+    Darwin-x86_64)  die "no build is currently published for Intel macOS -- that leg's
+  own test suite fails there for a reason unrelated to this release (see
+  https://github.com/$REPO/releases/tag/tile-v0.0.1). Released triples are
+  aarch64-apple-darwin, x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu." ;;
     Linux-x86_64)   TRIPLE=x86_64-unknown-linux-gnu ;;
     Linux-aarch64)  TRIPLE=aarch64-unknown-linux-gnu ;;
     *) die "unsupported platform $os-$arch. Released triples are aarch64-apple-darwin,
-  x86_64-apple-darwin, x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu." ;;
+  x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu." ;;
 esac
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
