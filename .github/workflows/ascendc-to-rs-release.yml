@@ -1,0 +1,137 @@
+# Publish the `ascendc-to-rs` CLI as a public release asset.
+#
+# Same split as ascendc-rs and pto-rs: closed source, public binary. Checks the private
+# monorepo out with PRIVATE_SOURCE_TOKEN (already configured for the sibling releases;
+# ascendc_to_rs and pto_to_rust are both already present on PRIVATE_SOURCE_REF, so no new
+# branch or secret was needed for this one).
+#
+# Unlike ascendc-rs/pto-rs, this crate needs no pinned nightly: it is a plain parser/lift
+# tool (ascendc_to_rs, edition 2021, one dependency -- anyhow) with no custom codegen
+# backend involved, confirmed by building it locally on stable before writing this file.
+# `rm -f .cargo/config.toml` is kept anyway, defensively, for the same crates.io-vs-vendor
+# reason ascendc-rs-release.yml needed it -- cheap insurance, not assumed necessary.
+#
+# Secret required on the public repo (already set for the sibling releases):
+#   gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/tile-rs
+
+name: ascendc-to-rs Release
+
+on:
+  push:
+    tags:
+      - 'ascendc-to-rs-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. ascendc-to-rs-v0.0.1)'
+        required: true
+
+env:
+  PRIVATE_SOURCE_REPO: yijunyu/ascend-rs-priv
+  PRIVATE_SOURCE_REF: pto-rs-viewpoint
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPO }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+
+      - name: Build against crates.io, not the vendor dir
+        run: rm -f .cargo/config.toml
+
+      - name: Build the CLI
+        run: cargo build --release --manifest-path crates/ascendc_to_rs/Cargo.toml --bin ascendc-to-rs
+
+      # Prove the binary runs before shipping it, and that it actually transpiles --
+      # starting is not the same guarantee as working. ascendc-to-rs has no --version
+      # flag (confirmed locally: it errors "unknown option '--version'"), so --help is
+      # the start check.
+      - name: Smoke-test
+        run: |
+          BIN=crates/ascendc_to_rs/target/release/ascendc-to-rs
+          "$BIN" --help
+
+      # No ready-made small AscendC .cpp sample exists in this branch (playground16 only
+      # carries the .mlir/.rs sides of the round trip), so the smoke kernel is inline --
+      # verified locally against this exact binary before writing this step.
+      - name: Transpile a minimal kernel
+        run: |
+          cat > /tmp/smoke.cpp <<'CPP'
+          #include "kernel_operator.h"
+          extern "C" __global__ __aicore__ void vec_add_kernel(GM_ADDR x, GM_ADDR y, GM_ADDR z, int32_t n) {
+              AscendC::GlobalTensor<float> xGm, yGm, zGm;
+              xGm.SetGlobalBuffer((__gm__ float*)x, n);
+              yGm.SetGlobalBuffer((__gm__ float*)y, n);
+              zGm.SetGlobalBuffer((__gm__ float*)z, n);
+          }
+          CPP
+          BIN=crates/ascendc_to_rs/target/release/ascendc-to-rs
+          "$BIN" /tmp/smoke.cpp --stdout > /tmp/smoke.rs
+          grep -q 'tile_std::tile_kernel' /tmp/smoke.rs
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp crates/ascendc_to_rs/target/release/ascendc-to-rs dist/
+          tar -czf "ascendc-to-rs-${{ matrix.triple }}.tar.gz" -C dist ascendc-to-rs
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascendc-to-rs-${{ matrix.triple }}
+          path: ascendc-to-rs-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release on this repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          REPO="${{ github.repository }}"
+          mapfile -t ASSETS < <(find artifacts -name '*.tar.gz' | sort)
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "no assets"; exit 1; }
+          NOTES=$(cat <<'EOF'
+          The `ascendc-to-rs` command: lift an AscendC C++ kernel to tile-rs Rust.
+
+              ascendc-to-rs kernel.cpp -o kernel.rs
+
+          Install:
+              curl -fsSL https://raw.githubusercontent.com/yijunyu/tile-rs/main/scripts/install-ascendc-to-rs.sh | sh
+
+          The source is not in this repository: the transpiler lives in the private
+          monorepo, and this workflow builds it there and publishes the binary here,
+          the same split ascendc-rs and pto-rs already use.
+          EOF
+          )
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$REPO" --title "ascendc-to-rs $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" -R "$REPO" --title "ascendc-to-rs $TAG" --notes "$NOTES" --prerelease
+          fi
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" -R "$REPO" "$a" --clobber; done
