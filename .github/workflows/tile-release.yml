@@ -138,7 +138,9 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/SHA256SUMS
-          prerelease: ${{ inputs.prerelease || true }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('tile-v{0}', inputs.version) || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
           body: |
             `tile` — the tile-rs kernel swissknife.
 
