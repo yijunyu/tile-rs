@@ -1,0 +1,122 @@
+# Publish the `pto-diff` CLI as a public release asset.
+#
+# Same split as ascendc-rs and pto-rs: closed source, public binary. Checks the private
+# monorepo out with PRIVATE_SOURCE_TOKEN (already configured for the sibling releases;
+# pto_to_rust is already present on PRIVATE_SOURCE_REF, so no new branch or secret was
+# needed for this one).
+#
+# Needs no pinned nightly: pto_to_rust is edition 2021 with zero external dependencies
+# (not even anyhow), confirmed by building it locally on stable before writing this file.
+# `rm -f .cargo/config.toml` kept anyway, defensively, as the sibling releases do.
+#
+# Secrets required on the public repo (already set for the sibling releases):
+#   gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/tile-rs
+
+#   gh secret set PRIVATE_SOURCE_REPO  --repo yijunyu/tile-rs
+name: pto-diff Release
+
+on:
+  push:
+    tags:
+      - 'pto-diff-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. pto-diff-v0.0.1)'
+        required: true
+
+env:
+  PRIVATE_SOURCE_REF: pto-rs-viewpoint
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+
+      - name: Build against crates.io, not the vendor dir
+        run: rm -f .cargo/config.toml
+
+      - name: Build the CLI
+        working-directory: crates/pto_to_rust
+        run: cargo build --release --bin pto-diff
+
+      # pto-diff has no --version flag (confirmed locally: it errors "unknown flag
+      # '--version'"), so the start check is --help, and the real check is running it
+      # against an in-repo fixture known to be clean -- starting is not the same
+      # guarantee as working.
+      - name: Smoke-test
+        working-directory: crates/pto_to_rust
+        run: |
+          BIN=target/release/pto-diff
+          "$BIN" --help
+          "$BIN" --stage1 tests/fixtures/stage1_softmax_clean.mlir | grep -q '0 safety findings'
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp crates/pto_to_rust/target/release/pto-diff dist/
+          tar -czf "pto-diff-${{ matrix.triple }}.tar.gz" -C dist pto-diff
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pto-diff-${{ matrix.triple }}
+          path: pto-diff-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release on this repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          REPO="${{ github.repository }}"
+          mapfile -t ASSETS < <(find artifacts -name '*.tar.gz' | sort)
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "no assets"; exit 1; }
+          NOTES=$(cat <<'EOF'
+          The `pto-diff` command: advisory safety checks on ptoas stage-1/stage-2 MLIR
+          (OOB partition bounds, plan-memory differences).
+
+              pto-diff kernel_stage2.mlir
+              pto-diff --stage1 kernel_stage1.mlir
+
+          Install:
+              curl -fsSL https://raw.githubusercontent.com/yijunyu/tile-rs/main/scripts/install-pto-diff.sh | sh
+
+          The source is not in this repository: the checker lives in the private
+          monorepo, and this workflow builds it there and publishes the binary here,
+          the same split ascendc-rs and pto-rs already use.
+          EOF
+          )
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$REPO" --title "pto-diff $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" -R "$REPO" --title "pto-diff $TAG" --notes "$NOTES" --prerelease
+          fi
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" -R "$REPO" "$a" --clobber; done

@@ -1,0 +1,134 @@
+# Publish the `pto-to-tilers` CLI as a public release asset.
+#
+# Same split as ascendc-rs, pto-rs, ascendc-to-rs and pto-diff: closed source, public
+# binary. Checks the private monorepo out with PRIVATE_SOURCE_TOKEN (already configured
+# for the sibling releases).
+#
+# Unlike the other four, this one checks out PRIVATE_SOURCE_REF: main, not
+# pto-rs-viewpoint. That branch's history turned out to be machine-regenerated (rewritten
+# commits with "Upstream-Commit" trailers from a deploy-viewpoint tool) rather than a
+# place for a new binary's source to be hand-added, and it was 8 days stale relative to
+# main for the exact crate this builds -- main's own copy passes a test
+# (all_repo_pto_artifacts_roundtrip) that fails on the viewpoint branch. There is no
+# security difference between the two for a build-privately-ship-only-the-binary
+# workflow: source never leaves the runner either way, only the compiled artifact does.
+#
+# Needs no pinned nightly: pto_to_rust is edition 2021 with zero external dependencies,
+# confirmed by building it locally on stable before writing this file.
+#
+# Secrets required on the public repo (already set for the sibling releases):
+#   gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/tile-rs
+#   gh secret set PRIVATE_SOURCE_REPO  --repo yijunyu/tile-rs
+
+name: pto-to-tilers Release
+
+on:
+  push:
+    tags:
+      - 'pto-to-tilers-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. pto-to-tilers-v0.0.1)'
+        required: true
+
+env:
+  PRIVATE_SOURCE_REF: main
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout PRIVATE source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+
+      - name: Build against crates.io, not the vendor dir
+        run: rm -f .cargo/config.toml
+
+      - name: Build the CLI
+        working-directory: crates/pto_to_rust
+        run: cargo build --release --bin pto-to-tilers
+
+      # pto-to-tilers has no --version flag, so the start check is --help. The real check
+      # runs it against the same in-repo fixture the library's own softmax tests use and
+      # checks the coverage line this CLI prints, not just the exit code -- a module the
+      # parser accepts while modelling nothing would otherwise still read as success.
+      - name: Smoke-test
+        working-directory: crates/pto_to_rust
+        run: |
+          BIN=target/release/pto-to-tilers
+          "$BIN" --help
+          "$BIN" tests/fixtures/softmax.pto --stdout 2>/tmp/err.txt | grep -q 'pub unsafe extern "C" fn tile_softmax'
+          grep -q 'coverage 21 modelled op(s), 0 unmodelled' /tmp/err.txt
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp crates/pto_to_rust/target/release/pto-to-tilers dist/
+          tar -czf "pto-to-tilers-${{ matrix.triple }}.tar.gz" -C dist pto-to-tilers
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pto-to-tilers-${{ matrix.triple }}
+          path: pto-to-tilers-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release on this repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          REPO="${{ github.repository }}"
+          mapfile -t ASSETS < <(find artifacts -name '*.tar.gz' | sort)
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "no assets"; exit 1; }
+          NOTES=$(cat <<'EOF'
+          The `pto-to-tilers` command: lift PTO-dialect MLIR assembly to tile-rs Rust
+          (the reverse of `pto-rs`/`ascendc-rs`'s direction).
+
+              pto-to-tilers kernel.pto -o kernel.rs
+
+          Prints a coverage line (modelled/unmodelled op count) on every run, and exits
+          4 rather than 0 when nothing in the input was recognised -- the parser accepts
+          malformed input without erroring, so the coverage line is the signal to check,
+          not just the exit code.
+
+          Install:
+              curl -fsSL https://raw.githubusercontent.com/yijunyu/tile-rs/main/scripts/install-pto-to-tilers.sh | sh
+
+          The source is not in this repository: the lifter lives in the private
+          monorepo, and this workflow builds it there and publishes the binary here,
+          the same split ascendc-rs, pto-rs, ascendc-to-rs and pto-diff already use.
+          EOF
+          )
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$REPO" --title "pto-to-tilers $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" -R "$REPO" --title "pto-to-tilers $TAG" --notes "$NOTES" --prerelease
+          fi
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" -R "$REPO" "$a" --clobber; done

@@ -1,0 +1,57 @@
+name: install-smoke
+
+# End-to-end test of the public installer (scripts/install.sh): runs it exactly as
+# a user would and asserts it completes cleanly, the backend + USAGE land, the
+# bundle is self-contained, and — critically — that NO runtime error leaks (the
+# kind a `bash -n` syntax check misses, e.g. the EXIT-trap `tmp: unbound variable`
+# scope bug). Runs on macOS, where the codegen release asset exists; free on the
+# public tile-rs repo.
+#
+# Source of truth: maintained in the PRIVATE repo at ci/tile-rs-public/install-smoke.yml
+# and deployed here via deploy.toml. Edit it there.
+
+on:
+  push:
+    paths:
+      - 'scripts/install.sh'
+      - '.github/workflows/install-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run the installer end-to-end
+        env:
+          TILERS_CODEGEN_HOME: ${{ runner.temp }}/tilers-codegen
+        run: |
+          set -euo pipefail
+          # Capture all output; a non-zero install is an immediate failure (pipefail).
+          bash scripts/install.sh 2>&1 | tee "$RUNNER_TEMP/install.log"
+          # The EXIT-trap bug exited the user's shell with a message but could still
+          # report success — so scan the log for ANY leaked shell error, not just $?.
+          if grep -qiE 'unbound variable|: line [0-9]+:|command not found|No such file' "$RUNNER_TEMP/install.log"; then
+            echo "::error::install.sh leaked a runtime shell error (see log above)"
+            exit 1
+          fi
+
+      - name: Verify the installed backend
+        env:
+          DEST: ${{ runner.temp }}/tilers-codegen
+        run: |
+          set -euo pipefail
+          test -f "$DEST/USAGE.md"                            || { echo "::error::USAGE.md missing"; exit 1; }
+          test -f "$DEST/.cargo/config.toml"                  || { echo "::error::.cargo/config.toml missing"; exit 1; }
+          test -f "$DEST/lib/librustc_codegen_tile.dylib"     || { echo "::error::backend dylib missing"; exit 1; }
+          test -f "$DEST/lib/libtile_std_macros.dylib"        || { echo "::error::macros dylib missing"; exit 1; }
+          # The bundle must be self-contained: the backend's only external (non-system,
+          # non-@loader_path) dep is the librustc_driver ABI pin. No homebrew abspaths.
+          STRAY="$(otool -L "$DEST/lib/librustc_codegen_tile.dylib" | tail -n +2 | awk '{print $1}' \
+                   | grep -vE '/usr/lib|/System|@loader_path|librustc_codegen_tile|librustc_driver' || true)"
+          if [ -n "$STRAY" ]; then echo "::error::backend has unexpected deps:"; echo "$STRAY"; exit 1; fi
+          # The shipped config must select the backend via the debranded register_tool(tile).
+          grep -q 'register_tool(tile)' "$DEST/.cargo/config.toml" || { echo "::error::config not debranded (register_tool)"; exit 1; }
+          echo "install-smoke OK — backend installed, self-contained, config debranded."

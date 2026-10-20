@@ -1,0 +1,4 @@
+# Local artifacts
+.DS_Store
+*.swp
+target/
