@@ -1,0 +1,55 @@
+name: tile-cli
+
+# This job runs on public Actions runners while checking out source from the
+# private repository. It tests source there; release packaging is handled by
+# tile-release.yml and publishes only the binary archives.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/tile-cli.yml"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Private source branch, tag, or commit (defaults to main)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: crates/tile_cli
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          ref: ${{ inputs.source_ref || secrets.PRIVATE_SOURCE_REF || 'main' }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+      - name: use the standalone CLI lockfile against crates.io
+        run: rm -f ../../.cargo/config.toml
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - run: cargo test --locked --features stats
+      - name: smoke test
+        run: |
+          set -e
+          cargo run --locked -q -- doctor
+          cargo run --locked -q -- --list-forms >/dev/null
+          cargo run --locked -q -- testdata/forms/softmax.mlir -t msl -o /tmp/ci.metal
+          grep -q "kernel void" /tmp/ci.metal
