@@ -59,6 +59,7 @@ const DECLS: &[&str] = &["tile_std/src/lib.rs", "tile_std/src/tile.rs"];
 /// appears in the source at all. Collecting tokens rather than full names is what lets
 /// the prefix rule below see those arms.
 fn tokens(src: &str) -> BTreeSet<String> {
+    let src = &strip_comments(src);
     let mut out = BTreeSet::new();
     let b = src.as_bytes();
     let pat = b"__tile_";
@@ -78,12 +79,71 @@ fn tokens(src: &str) -> BTreeSet<String> {
     out
 }
 
+/// Rust source with its comments removed, string literals intact.
+///
+/// A name in a COMMENT is not an arm, and every emitter documents the intrinsics it
+/// handles in a header table -- `mlir_to_pto.rs` alone names 10 that appear nowhere in
+/// its code. Crediting those would make the report claim arms that do not exist, which
+/// is the mirror of the under-report above and just as bad.
+///
+/// String state is tracked, so a `//` inside a literal does not start a comment: the
+/// emitters carry paths and MLIR fragments in strings, and truncating one would drop
+/// real tokens. Nested block comments are not handled; Rust allows them and no emitter
+/// uses one, so the residue is a known and empty case rather than an unknown one.
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let (mut i, mut in_str, mut esc) = (0usize, false, false);
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c as char);
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+        } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else {
+            out.push(c as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// `pub fn __tile_<name>(` -- the declaration, with the line it is on.
 fn declarations(src: &str) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     for (n, line) in src.lines().enumerate() {
         let t = line.trim_start();
-        let Some(rest) = t.strip_prefix("pub fn __tile_") else {
+        // `pub unsafe fn` is a declaration too, and the first version of this scan
+        // matched only `pub fn `. Measured: 22 intrinsics -- the whole `__tile_v_*`
+        // family -- are declared `pub unsafe fn` in two of the three trees, so the
+        // surface under-reported by 22 while claiming to be the whole of it. An
+        // under-report is the one failure this command exists to remove.
+        let Some(rest) = t
+            .strip_prefix("pub fn __tile_")
+            .or_else(|| t.strip_prefix("pub unsafe fn __tile_"))
+        else {
             continue;
         };
         let name: String = std::iter::once("__tile_")
@@ -114,6 +174,29 @@ fn covers(have: &str, want: &str) -> bool {
         return false;
     }
     have.ends_with('_') || want.as_bytes()[have.len()] == b'_'
+}
+
+/// `use crate::<mod>` in an emitter: the shared modules it dispatches through.
+///
+/// `mlir_to_csl` names no intrinsic at all and lowers a whole matmul family, because
+/// `classify_callee` is in `mlir_emit_context`. Trimmed to the module name only, so
+/// `use crate::mlir_emit_context::{classify_callee, Op}` and a bare
+/// `use crate::mlir_parse;` both resolve to one name.
+fn helper_mods(src: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in src.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("use crate::") else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            out.insert(name);
+        }
+    }
+    out
 }
 
 /// Each readable backend seeded with itself as the first element of its basis chain.
@@ -147,6 +230,7 @@ fn main() {
     // backend that lowers nothing.
     let mut sets: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     let mut sets_merged: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    let mut helpers: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     let mut sets_src: BTreeMap<&str, String> = BTreeMap::new();
     let mut srcs: BTreeMap<&str, &str> = BTreeMap::new();
     for (id, rel) in EMITTERS {
@@ -159,17 +243,31 @@ fn main() {
         }
     }
 
-    // DELEGATION, because two backends have no translator of their own and a
-    // name-based scan reported their whole surface as absent. `mlir_to_rvv` is a thin
-    // wrapper over the linalg egress ("this backend has no translator of its own",
-    // says its own header) and `mlir_to_musa` delegates to `mlir_to_gpu` and rewrites
-    // CUDA spellings. The probe lowers 25 ops on rvv and 14 on musa that neither file
-    // mentions -- which the cross-check in `intrinsics.rs` caught, and which is exactly
-    // the under-report a derived table is prone to and a measured one is not.
+    // DELEGATION AND SHARED HELPERS, because two kinds of arm live outside the
+    // emitter's own file and a name-based scan reported both as absent.
     //
-    // Derived rather than declared: a call to another emitter's entry point IS the
-    // delegation. Matched with the open paren so a doc link like [`convert_mlir_to_linalg`]
-    // does not count as one, and iterated to a fixed point so a chain composes.
+    //  * `mlir_to_rvv` is a thin wrapper over the linalg egress ("this backend has no
+    //    translator of its own", says its own header) and `mlir_to_musa` delegates to
+    //    `mlir_to_gpu` and rewrites CUDA spellings. The probe lowers 25 ops on rvv and
+    //    14 on musa that neither file mentions.
+    //  * `classify_callee` lives in the shared `mlir_emit_context`, so `csl`, `hexagon`
+    //    and `ttmetal` dispatch a whole family from a file of their own that names no
+    //    intrinsic at all -- three more under-reports, on a second tree.
+    //
+    // Both were caught by the cross-check in `intrinsics.rs` against the MEASURED
+    // `--list-ops` probe, which is the failure a derived table has and a measured one
+    // does not.
+    //
+    // Derived rather than declared, and the two kinds are kept apart on purpose:
+    //  - a CALL to another emitter's entry point IS delegation, so it counts only when
+    //    `convert_mlir_to_X(` appears -- matched with the open paren so a doc link like
+    //    [`convert_mlir_to_linalg`] does not count, and iterated to a fixed point so a
+    //    chain composes. `mlir_to_msl` IMPORTS `mlir_to_pto` for helpers without ever
+    //    calling its entry point, and crediting msl with pto's whole vocabulary would be
+    //    the over-claim the vacuity control exists to catch.
+    //  - a `use crate::<mod>` where <mod> is NOT an emitter is a shared helper and is
+    //    always included. Measured: those modules name 9 and 10 `__tile_*` tokens, so
+    //    this adds a dispatch table, not a vocabulary.
     let mut basis: BTreeMap<&str, Vec<&str>> = ids_of(&sets);
     for _ in 0..EMITTERS.len() {
         let mut grew = false;
@@ -199,6 +297,22 @@ fn main() {
             if let Some(t) = sets.get(*c) {
                 merged.extend(t.iter().cloned());
             }
+            // The shared helpers this file imports, read in the same pass. A module that
+            // is itself an emitter is excluded here: that is the delegation case above,
+            // and it needs a CALL rather than an import.
+            for m in helper_mods(sets_src.get(*c).map(String::as_str).unwrap_or("")) {
+                if EMITTERS.iter().any(|(e, _)| *e == m) {
+                    continue;
+                }
+                let hp = root.join(format!("rustc_codegen_tile/src/{m}.rs"));
+                if let Ok(src) = std::fs::read_to_string(&hp) {
+                    merged.extend(tokens(&src));
+                    helpers
+                        .entry(*id)
+                        .or_insert_with(BTreeSet::new)
+                        .insert(format!("rustc_codegen_tile/src/{m}.rs"));
+                }
+            }
         }
         sets_merged.insert(*id, merged);
     }
@@ -211,7 +325,10 @@ fn main() {
     s.push_str("/// the surface was derived from -- its own, plus any it delegates to.\n");
     s.push_str("pub const BACKENDS: &[(&str, &str)] = &[\n");
     for id in &ids {
-        let chain: Vec<&str> = basis[id].iter().map(|c| srcs[c]).collect();
+        let mut chain: Vec<String> = basis[id].iter().map(|c| srcs[c].to_string()).collect();
+        if let Some(h) = helpers.get(*id) {
+            chain.extend(h.iter().cloned());
+        }
         s.push_str(&format!("    ({:?}, {:?}),\n", id, chain.join(" + ")));
     }
     s.push_str("];\n");

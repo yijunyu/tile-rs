@@ -37,8 +37,21 @@
 include!(concat!(env!("OUT_DIR"), "/intrinsics_table.rs"));
 
 /// The status of one intrinsic on one backend.
+///
+/// `Lowered` is the only MEASURED verdict and it wins wherever it exists, because the
+/// two instruments compose rather than compete: the probe is the authority for the ops
+/// it can build a module for, and the derived table answers the several hundred it
+/// cannot. Without that overlay this report said `-` for three msl rows the probe
+/// demonstrably lowers -- `mlir_to_msl` strips `_f32` and dispatches on the STEM
+/// (`strip_suffix("_f32")` at four sites, and its own comment says "matching is by
+/// known prefix: several arms dispatch on a stem"), so no name-derived scan can see
+/// those arms. A third dispatch mechanism after delegation and a shared classifier, and
+/// the reason this enum has a measured member at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
+    /// The probe LOWERED it: a real module went through the emitter and used the
+    /// intrinsic. Measured, not derived.
+    Lowered,
     /// The emitter source names this intrinsic.
     Exact,
     /// The emitter names a family prefix of it and dispatches on the suffix.
@@ -58,24 +71,53 @@ pub fn source_of(form: &str) -> Option<&'static str> {
 }
 
 /// Every declared intrinsic with its status on `form`, in name order.
+///
+/// Derived from the tree, with the MEASURED probe laid over the rows it can reach.
 pub fn surface(form: &str) -> Option<Vec<(&'static str, &'static str, usize, Arm)>> {
     let bit = 1u32 << BACKENDS.iter().position(|(id, _)| *id == form)?;
-    Some(
-        INTRINSICS
-            .iter()
-            .map(|(name, file, line, exact, pref)| {
-                let arm = if exact & bit != 0 {
-                    Arm::Exact
-                } else if pref & bit != 0 {
-                    Arm::Prefix
-                } else {
-                    Arm::Absent
-                };
-                (*name, *file, *line, arm)
-            })
-            .collect(),
-    )
+    let mut rows: Vec<(&'static str, &'static str, usize, Arm)> = INTRINSICS
+        .iter()
+        .map(|(name, file, line, exact, pref)| {
+            let arm = if exact & bit != 0 {
+                Arm::Exact
+            } else if pref & bit != 0 {
+                Arm::Prefix
+            } else {
+                Arm::Absent
+            };
+            (*name, *file, *line, arm)
+        })
+        .collect();
+    measure_over(form, &mut rows);
+    Some(rows)
 }
+
+/// Lay the `--list-ops` probe over the rows it can reach.
+///
+/// Only the probe set, and only upgrades: a row the probe lowers becomes `Lowered`
+/// whatever the source said, while a row the probe REFUSES keeps its derived verdict --
+/// the probe fixes one shape and one dtype, so its refusal is not evidence that no arm
+/// exists. That asymmetry is the whole content of the overlay.
+#[cfg(feature = "emitters")]
+fn measure_over(form: &str, rows: &mut [(&'static str, &'static str, usize, Arm)]) {
+    let Some(f) = crate::forms::by_id(form) else {
+        return;
+    };
+    for (op, shape) in crate::emit::PROBE_OPS {
+        if !crate::emit::lowers_op(f, op, *shape) {
+            continue;
+        }
+        let want = format!("__tile_{op}_f32");
+        if let Some(r) = rows.iter_mut().find(|r| r.0 == want) {
+            r.3 = Arm::Lowered;
+        }
+    }
+}
+
+/// Without the emitters there is nothing to probe with, so every row stays derived --
+/// and the report says so rather than quietly reporting a weaker table as the same one.
+#[cfg(not(feature = "emitters"))]
+fn measure_over(_form: &str, _rows: &mut [(&'static str, &'static str, usize, Arm)]) {}
 
 /// How many intrinsics `tile_std` declares. The denominator, taken from the table rather
 /// than restated in prose, because a count written beside the data is the thing that
@@ -127,9 +169,13 @@ pub fn report(form: &str) -> Result<String, String> {
     s.push_str(&format!("{:<w$}{:<9}declared at\n", "intrinsic", "arm"));
     s.push_str(&"-".repeat(w + 9 + 28));
     s.push('\n');
-    let (mut e, mut p) = (0usize, 0usize);
+    let (mut e, mut p, mut m) = (0usize, 0usize, 0usize);
     for (name, file, line, arm) in &rows {
         let tag = match arm {
+            Arm::Lowered => {
+                m += 1;
+                "lowered"
+            }
             Arm::Exact => {
                 e += 1;
                 "exact"
@@ -145,20 +191,29 @@ pub fn report(form: &str) -> Result<String, String> {
     s.push_str(&"-".repeat(w + 9 + 28));
     s.push('\n');
     s.push_str(&format!(
-        "{} of {} declared intrinsics are named by {src}: {e} exactly, {p} by a family \
-         prefix.\n",
-        e + p,
+        "{} of {} declared intrinsics have an arm on {form}: {m} MEASURED (the probe \
+         lowered\na real module), {e} named exactly by {src}, {p} by a family prefix.\n",
+        m + e + p,
         rows.len()
     ));
     s.push_str(
-        "\nDERIVED FROM SOURCE, NOT MEASURED. `exact` means the emitter names that \
-         intrinsic;\n`prefix` means it names a family prefix and dispatches on the \
-         suffix. Neither is proof\nthat the arm emits anything: 42 of 42 spirv \
-         intrinsics once emitted a plain copy at exit\n0. For a MEASURED answer use \
-         `tile --list-ops`, which lowers a real module per cell --\nover 32 portable ops \
-         rather than these ",
+        "\n`lowered` is MEASURED -- a real module went through this emitter and used \
+         the\nintrinsic. `exact` and `prefix` are DERIVED FROM SOURCE: the emitter \
+         names that\nintrinsic, or names a family prefix and dispatches on the suffix. \
+         Neither derived\nverdict is proof that the arm emits anything -- 42 of 42 \
+         spirv intrinsics once emitted\na plain copy at exit 0 -- and a derived `-` is \
+         not proof that none exists, since one\nemitter dispatches on the STEM and \
+         names no full intrinsic at all. The probe behind\n`lowered` is \
+         `tile --list-ops`, and it reaches ",
     );
-    s.push_str(&format!("{}.\n", rows.len()));
+    // Both denominators are READ, never written down. The probe set is 32 ops in one
+    // tree and 29 in another, so a literal here would be wrong in the other one -- which
+    // is the drift this whole command exists to remove, committed into its own footer.
+    s.push_str(&format!(
+        "{} portable ops rather than these {}.\n",
+        crate::emit::PROBE_OPS.len(),
+        rows.len()
+    ));
     s.push_str(
         "A dash is a gap nobody has written, never a gap that cannot be written.\n",
     );
@@ -185,7 +240,7 @@ mod tests {
             .find(|l| l.starts_with("__tile_matmul_i8_acc_i32_dequant_f16"))
             .expect("the row");
         assert!(
-            row.contains("exact") || row.contains("prefix"),
+            row.contains("lowered") || row.contains("exact") || row.contains("prefix"),
             "pto names this intrinsic in mlir_to_pto.rs, so the row must not read `-`: {row}"
         );
     }
@@ -267,6 +322,21 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "derived surface under-reports:\n{}", bad.join("\n"));
+
+        // AND THE OVERLAY MUST BE NON-VACUOUS, or the assertion above can only pass.
+        // It is what makes those rows `Lowered`, so if `measure_over` ever became a
+        // no-op this test would go green while the report went back to printing `-`
+        // for arms the probe demonstrably reaches. A test that cannot fail is worth
+        // nothing, and this one earns its keep only in pairs.
+        let any = backends()
+            .iter()
+            .filter_map(|id| surface(id))
+            .any(|rows| rows.iter().any(|r| r.3 == Arm::Lowered));
+        assert!(
+            any,
+            "no row anywhere reads `lowered`, so the measured overlay did not run and \
+             the check above passed for the wrong reason"
+        );
     }
 
     /// Every backend in the table has a readable source, and every source is a real

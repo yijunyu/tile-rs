@@ -412,7 +412,7 @@ fn register(r: &mut Runner) {
             // Present is not enough: a row of dashes reproduces the wrong conclusion the
             // spec opens with, which is what cost a session.
             assert!(
-                row.contains("exact") || row.contains("prefix"),
+                row.contains("lowered") || row.contains("exact") || row.contains("prefix"),
                 "pto names this intrinsic in its emitter, so the row must not read `-`: {row}"
             );
         },
@@ -433,8 +433,17 @@ fn register(r: &mut Runner) {
         "the report says it is derived from source and names the measured instrument",
         |w: &mut World, _a: &[String]| {
             let out = w.get("surface");
-            assert!(out.contains("DERIVED FROM SOURCE, NOT MEASURED"), "{out}");
-            assert!(out.contains("--list-ops"), "it must point at the measured table");
+            // The footer has to keep the two kinds of verdict apart in words, because
+            // the whole hazard is a reader taking a derived `exact` for a measured one.
+            // Asserted on the distinction, not on a sentence, so rewording the prose
+            // does not fail the scenario while deleting the distinction does.
+            for want in ["MEASURED", "DERIVED FROM SOURCE", "`lowered`", "--list-ops"] {
+                assert!(
+                    out.contains(want),
+                    "the footer no longer carries {want:?}; a reader cannot tell a \
+                     measured arm from a derived one"
+                );
+            }
         },
     );
     r.then(
