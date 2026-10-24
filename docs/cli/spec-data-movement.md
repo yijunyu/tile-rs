@@ -90,12 +90,13 @@ rather than optimisable.
   lowering status, so the answer to *"can pto fold a dequant"* is one command and not four
   greps across three repositories. This is the item that actually cost a session.
   **LANDED 2026-10-24 as `tile --list-intrinsics <form>`.** `build.rs` derives the table
-  from the tree on every build -- every `pub fn __tile_*` `tile_std` declares (**509**,
-  against this probe's 32) against the `__tile_*` tokens each emitter source carries -- so
-  it cannot drift from the sources it describes, and `--list-ops`' output is untouched
-  (asserted as purity: the same report either side of an ask). `pto` reads **162 of 509**,
-  111 exactly and 51 by a family prefix, and `__tile_matmul_i8_acc_i32_dequant_f16` is one
-  of the exact rows, which is the question that cost the session.
+  from the tree on every build -- every `pub fn` and `pub unsafe fn` `__tile_*` `tile_std`
+  declares (**531**, against this probe's 32), after comments are stripped, against the
+  `__tile_*` tokens each emitter source carries -- so it cannot drift from the sources it
+  describes, and `--list-ops`' output is untouched (asserted as purity: the same report
+  either side of an ask). `pto` reads **152 of 531**, and
+  `__tile_matmul_i8_acc_i32_dequant_f16` is one of its exact rows, which is the question
+  that cost the session.
   **Two things the work itself established, neither of them anticipated here.**
   (i) **The cross-check against `--list-ops` FIRED**: a name-derived surface reported
   `rvv` as absent on 25 probed ops and `musa` on 14, because `mlir_to_rvv` is a thin
@@ -106,7 +107,7 @@ rather than optimisable.
   that matters: nothing the probe lowers may be missing from the derived surface. **A
   derived table under-reports where a measured one cannot, and only the measured one can
   catch it.** (ii) `cpp` (AscendC) and `pico` are closed emitters in sibling checkouts, so
-  their surface is **UNKNOWN and refuses in those words** rather than scoring 0 of 509 --
+  their surface is **UNKNOWN and refuses in those words** rather than scoring 0 of 531 --
   and that refusal is a different sentence from the one an unknown form gets, because
   *"nobody wrote that backend"* and *"this build cannot see its source"* are different
   facts.
@@ -185,8 +186,9 @@ the one the installed `tile` is built from is the one with the least CLI work in
 Measured 2026-10-24.
 
     line                        what it is                     tile_cli commits   HEAD
-    tile-cli (ascend-rs-priv)   ORPHAN branch, rooted           257 (of 484)      2026-10-24
-                                2026-06-16 "tile-rs v0.0.1";
+    tile-cli (ascend-rs-priv)   ORPHAN branch, "tile-rs          257 (of 484)      2026-10-24
+                                v0.0.1", authored 2026-06-16
+                                and committed 2026-06-21;
                                 tile_cli born 2026-09-01
     pto-rs-viewpoint (same      the private MAINLINE, rooted     12               2026-10-24
     repo)                       2025-01-17; tile_cli arrived
@@ -195,8 +197,24 @@ Measured 2026-10-24.
                                 seeded from that same copy
 
 `git merge-base tile-cli pto-rs-viewpoint` is **EMPTY** -- unrelated histories inside one
-repository -- so there is no merge to make, only a port. Content distance over
-`crates/tile_cli/src`:
+repository -- so between those two there is no merge to make, only a port.
+
+**"None of them shares a git history" was too strong, and the correction is the useful
+part.** Public `main` has no merge-base with either private line, and that is what the
+emptiness above establishes. But the public REPO carries **29 of its 79 commits in common
+with `ascend-rs-priv` by hash**, including `tile-cli`'s own root `6ef6272c4` -- parked on
+a local branch `pico-backend`, which `git for-each-ref --contains 6ef6272c4` names and
+which is not an ancestor of `main`. So a graft point between the public repo and the
+product line already exists and a future sync is not starting from nothing; it is `main`
+that was published as content rather than as history. The check is by hash, not by commit
+subject: a subject grep across these trees has a false negative, because the published
+commits were reworded.
+
+    for h in $(cd ~/tile-rs && git rev-list --all); do
+      git -C ~/ascend-rs-priv cat-file -e "$h^{commit}" 2>/dev/null && echo "$h"
+    done | wc -l
+
+Content distance over `crates/tile_cli/src`:
 
     tile-rs : pto-rs-viewpoint      595 changed lines     close siblings
     tile-rs : tile-cli             4984
@@ -216,26 +234,45 @@ is a release build of `~/ascend-rs-priv/crates/tile_cli` (pto-rs-viewpoint), 16:
   both, and the `tile-cli` branch's `Cmd` enum is `Run Doctor ListForms ListOps Install
   Daemon License Ui Backlog PtoVerify Tutorial Help Version NotYet`), so §1's item was not
   duplicated work -- it is simply landed in the line with the smallest audience.
-* **`--list-intrinsics` is therefore implemented and NOT DELIVERED.** `tile
-  --list-intrinsics pto` on the installed binary is `unknown option`, exit 2. The port is
-  self-contained and the prerequisites are present in both private lines --
-  `emit::PROBE_OPS`, `forms::by_id`, `crates/tile_std/src/{lib,tile}.rs`,
-  `crates/rustc_codegen_tile/src/mlir_to_*.rs`, and no existing `build.rs` to conflict with
-  -- so it is `build.rs` + `src/intrinsics.rs` + three small wirings + one feature file.
-  Whose branch it lands on is the owner's call, not the finder's.
+* **`--list-intrinsics` was implemented and NOT DELIVERED, and is now on the product
+  line.** `tile --list-intrinsics pto` on the installed binary is `unknown option`, exit
+  2. Ported to the `tile-cli` branch 2026-10-24 as `4cdc6a858` (1248 lib tests and four
+  spec gates green there), so it is now in two of the three lines -- and still not in the
+  binary a caller runs, because that is built from `pto-rs-viewpoint` and nobody should
+  `cargo install` over a shared binary to change that. The port was self-contained:
+  `emit::PROBE_OPS`, `forms::by_id`, `crates/tile_std/src/{lib,tile}.rs` and
+  `crates/rustc_codegen_tile/src/mlir_to_*.rs` are present in both private lines and
+  neither had a `build.rs` to conflict with.
+
+  **And porting it ran its own cross-check against a second corpus, which fired twice
+  more.** On that branch `classify_callee` lives in the shared `mlir_emit_context`, so
+  `csl`, `hexagon` and `ttmetal` lower a whole matmul family while naming no intrinsic at
+  all; and `mlir_to_msl` strips `_f32` and dispatches on the STEM, which no name-derived
+  scan can see at all. The first is fixed by following `use crate::<non-emitter module>`
+  into the basis; the second is fixed by laying the MEASURED `--list-ops` probe over the
+  rows it can reach, so such a row reads `lowered` and the two instruments compose
+  instead of competing. Three mechanisms, three corpora, all three found by the control
+  rather than by review -- **a derived table under-reports where a measured one cannot,
+  and only the measured one can catch it.**
+
+  Two counting defects came out of the same pass, both flattering: `pub unsafe fn` is a
+  declaration too and matching only `pub fn ` dropped **22** intrinsics (the `__tile_v_*`
+  family), and a name in a COMMENT is not an arm -- `mlir_to_pto.rs` alone names ten that
+  appear nowhere in its code. The surface is **531**, not 509, and `pto` reads **152 of
+  531**.
 
 **THE DIVERGENCE IS BIDIRECTIONAL BY SUBSYSTEM, which is why no single "this line wins"
 answer works.** The same measurement that shows `tile-cli` far ahead on the CLI shows it
 behind on the two trees this spec's table is derived FROM:
 
-    tree                tile_std `pub fn __tile_*`   distinct __tile_* in mlir_to_pto.rs
-    tile-rs                      509                              146
-    pto-rs-viewpoint             509                              163
-    tile-cli                     442                               99
+    tree                declared `__tile_*`   distinct __tile_* in mlir_to_pto.rs
+    tile-rs                    531                 146  (136 outside comments)
+    pto-rs-viewpoint           531                 164  (158 outside comments)
+    tile-cli                   454                  99  ( 91 outside comments)
 
 So **the richest `pto` emitter is in the line the binary is built from, and it is the line
 that cannot be asked about it**; and had §1's surface been built on the `tile-cli` branch
-it would have reported 442 intrinsics and 99 pto arms. The numbers in §1 (162 of 509) are a
+it would have reported 454 intrinsics and 99 pto arms. The numbers in §1 (152 of 531) are a
 property of the tree the table is derived in -- which is the intended behaviour of deriving
 it rather than writing it down, and a reason to quote the tree beside the figure.
 
