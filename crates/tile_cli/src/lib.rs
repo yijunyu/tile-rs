@@ -165,6 +165,7 @@ pub(crate) mod mlir_to_pico;
 pub mod emit;
 pub mod engine;
 pub mod forms;
+pub mod intrinsics;
 pub mod json;
 pub mod license;
 pub mod lift_cpp;

@@ -387,6 +387,84 @@ fn register(r: &mut Runner) {
         },
     );
 
+    // — the single-backend intrinsic surface ————————————————————————————————————
+    // `--list-ops` measures 32 portable ops across every backend; this answers the
+    // single-backend question that table deliberately excludes. The two are different
+    // instruments and the scenario checks that the weaker one SAYS it is weaker.
+    r.when(
+        "I ask \"{}\" for its intrinsic surface",
+        |w: &mut World, a: &[String]| {
+            match tile_cli::intrinsics::report(&a[0]) {
+                Ok(r) => w.set("surface", r),
+                Err(e) => panic!("{} has no derivable surface here: {e}", a[0]),
+            }
+        },
+    );
+    r.then(
+        "the fused int8 dequant matmul is listed with an arm",
+        |w: &mut World, _a: &[String]| {
+            let row = w
+                .get("surface")
+                .lines()
+                .find(|l| l.starts_with("__tile_matmul_i8_acc_i32_dequant_f16"))
+                .map(str::to_string)
+                .expect("the fused int8 dequant matmul must be in pto's surface report");
+            // Present is not enough: a row of dashes reproduces the wrong conclusion the
+            // spec opens with, which is what cost a session.
+            assert!(
+                row.contains("exact") || row.contains("prefix"),
+                "pto names this intrinsic in its emitter, so the row must not read `-`: {row}"
+            );
+        },
+    );
+    r.then(
+        "the surface is far larger than the portable op probe",
+        |_w: &mut World, _a: &[String]| {
+            assert!(
+                tile_cli::intrinsics::declared() > 4 * tile_cli::emit::PROBE_OPS.len(),
+                "{} declared intrinsics against a {}-op probe -- if those are comparable, \
+                 this command answers no new question",
+                tile_cli::intrinsics::declared(),
+                tile_cli::emit::PROBE_OPS.len()
+            );
+        },
+    );
+    r.then(
+        "the report says it is derived from source and names the measured instrument",
+        |w: &mut World, _a: &[String]| {
+            let out = w.get("surface");
+            assert!(out.contains("DERIVED FROM SOURCE, NOT MEASURED"), "{out}");
+            assert!(out.contains("--list-ops"), "it must point at the measured table");
+        },
+    );
+    r.then(
+        "asking does not change what --list-ops reports",
+        |_w: &mut World, _a: &[String]| {
+            // The requirement is that the new surface is ADDITIVE. Checked as purity --
+            // the same report either side of an ask -- rather than against a golden
+            // string, because a golden copy of a measured table is the thing that rots.
+            let before = tile_cli::emit::coverage_report();
+            let _ = tile_cli::intrinsics::report("pto");
+            let after = tile_cli::emit::coverage_report();
+            assert_eq!(before, after, "--list-ops moved");
+            assert!(
+                !before.contains("list-intrinsics"),
+                "the portability table must not have grown a column for this"
+            );
+        },
+    );
+    r.then(
+        "a backend whose emitter source this build cannot read is UNKNOWN, not zero",
+        |_w: &mut World, _a: &[String]| {
+            // `cpp` is AscendC: a known, writable form whose emitter is closed and lives
+            // in a sibling checkout. Scoring it 0 of 509 is the one wrong answer.
+            let e = tile_cli::intrinsics::report("cpp")
+                .expect_err("cpp's emitter source is not in this tree");
+            assert!(e.contains("UNKNOWN"), "{e}");
+            assert!(!e.contains("0 of"), "{e}");
+        },
+    );
+
     // — routes ——————————————————————————————————————————————————————————————————
     r.when(
         "I run \"tile --list-forms\"",

@@ -205,3 +205,5 @@
 09_ui.feature::the checked-in bundle has not drifted from its source
 02_transform_dispatch.feature::an intrinsic the emitter does not understand is refused, never copied
 04_profile_and_optimize.feature::-O4 verifies a width before recommending it
+
+14_single_backend_data_movement.feature::the whole intrinsic surface for ONE backend is one command away

@@ -49,6 +49,11 @@ pub enum Cmd {
     ListForms,
     /// `--list-ops`: which tile_std ops each backend actually lowers, measured.
     ListOps,
+    /// `--list-intrinsics <form>`: the whole intrinsic surface for ONE backend, derived
+    /// from the tree. `--list-ops` measures 32 PORTABLE ops across every backend; this
+    /// answers the single-backend question that table deliberately excludes, which is
+    /// the only question Ascend work asks.
+    ListIntrinsics(String),
     /// `tile install [<id>]` — provision a toolchain ahead of time, or list what the
     /// manifest knows about for this platform.
     Install(Option<String>),
@@ -181,6 +186,11 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, UsageError
             "--no-install" => a.no_install = true,
             "--yes" => a.yes = true,
             "--list-ops" => a.cmd = Cmd::ListOps,
+            "--list-intrinsics" => {
+                // A value, not an optional one: the surface is per backend, and a
+                // default would have to pick a backend for the caller.
+                a.cmd = Cmd::ListIntrinsics(need_value(&mut it, "--list-intrinsics")?);
+            }
             "--list-forms" => a.cmd = Cmd::ListForms,
             "-i" | "--info-only" => a.info_only = true,
             "-k" | "--keep" => a.keep = true,
@@ -362,6 +372,8 @@ USAGE
   tile backlog close <id>          mark one fixed
   tile --list-forms                the reader/writer matrix
   tile --list-ops                  which tile_std ops each backend lowers, measured
+  tile --list-intrinsics <form>    every intrinsic tile_std declares, with the arms
+                                   ONE backend carries (derived from source)
 
 WHAT IT DOES
   A single input, no -o     profile the kernel, then optimize it for THIS machine

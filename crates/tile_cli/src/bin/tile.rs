@@ -54,6 +54,21 @@ fn run(args: cli::Args, env: &simenv::Env) -> i32 {
             print!("{}", routes::list_forms());
             exit::OK
         }
+        Cmd::ListIntrinsics(ref form) => {
+            // Derived from the tree at build time rather than probed: the probe needs a
+            // well-formed module per op, which is exactly why --list-ops covers 32 of
+            // 509. A refusal here is a sentence, not an empty table.
+            match tile_cli::intrinsics::report(form) {
+                Ok(r) => {
+                    print!("{r}");
+                    exit::OK
+                }
+                Err(e) => {
+                    eprintln!("tile: {e}");
+                    exit::UNSUPPORTED
+                }
+            }
+        }
         Cmd::ListOps => {
             // Measured on the spot rather than read from a table: each cell is a real
             // lowering attempt, so the report cannot drift from the emitters.

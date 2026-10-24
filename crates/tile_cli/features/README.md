@@ -1,7 +1,7 @@
 # The `tile` CLI executable specification
 
-These eleven `.feature` files are the **normative requirement** for the `tile`
-command. They are staged here rather than under `crates/tile_spec/features/`
+These `.feature` files -- eleven at landing, **fourteen** today -- are the **normative
+requirement** for the `tile` command. They are staged here rather than under `crates/tile_spec/features/`
 because `crates/tile_spec/tests/cucumber.rs` globs that directory and asserts
 every scenario green — dropping undefined steps into it turns the suite red the
 moment the file lands.
@@ -61,3 +61,6 @@ OK: 120 scenarios, 1 tagged, 119 must be green in CI
 | `09_ui` | `-u`, headless degradation |
 | `10_portability_and_grammar` | triples, cfg confinement, option grammar, exit codes |
 | `11_io_edges` | stdin/stdout, many inputs, symlinks, non-UTF8, concurrency, crash sweep |
+| `12_run` | `-r`, the reference comparison, what a disagreement does |
+| `13_backlog` | `tile backlog`, and what the tool could not do |
+| `14_single_backend_data_movement` | the per-backend intrinsic surface, the fused int8 dequant epilogue, a device-computed output extent, and what a kernel should cost |

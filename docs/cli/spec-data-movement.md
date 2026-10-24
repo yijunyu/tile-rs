@@ -89,6 +89,27 @@ rather than optimisable.
   a `--list-intrinsics <form>` that prints the whole surface for one target with its
   lowering status, so the answer to *"can pto fold a dequant"* is one command and not four
   greps across three repositories. This is the item that actually cost a session.
+  **LANDED 2026-10-24 as `tile --list-intrinsics <form>`.** `build.rs` derives the table
+  from the tree on every build -- every `pub fn __tile_*` `tile_std` declares (**509**,
+  against this probe's 32) against the `__tile_*` tokens each emitter source carries -- so
+  it cannot drift from the sources it describes, and `--list-ops`' output is untouched
+  (asserted as purity: the same report either side of an ask). `pto` reads **162 of 509**,
+  111 exactly and 51 by a family prefix, and `__tile_matmul_i8_acc_i32_dequant_f16` is one
+  of the exact rows, which is the question that cost the session.
+  **Two things the work itself established, neither of them anticipated here.**
+  (i) **The cross-check against `--list-ops` FIRED**: a name-derived surface reported
+  `rvv` as absent on 25 probed ops and `musa` on 14, because `mlir_to_rvv` is a thin
+  wrapper over the linalg egress and `mlir_to_musa` delegates to `mlir_to_gpu` -- so the
+  arms are real and the names are in another file. Delegation is now derived too (a call
+  to another emitter's entry point IS the delegation, matched with the open paren so a doc
+  link does not count, iterated to a fixed point), and the test asserts the one direction
+  that matters: nothing the probe lowers may be missing from the derived surface. **A
+  derived table under-reports where a measured one cannot, and only the measured one can
+  catch it.** (ii) `cpp` (AscendC) and `pico` are closed emitters in sibling checkouts, so
+  their surface is **UNKNOWN and refuses in those words** rather than scoring 0 of 509 --
+  and that refusal is a different sentence from the one an unknown form gets, because
+  *"nobody wrote that backend"* and *"this build cannot see its source"* are different
+  facts.
 * **Extend `detect_blocked_matmul_loads` + `translate_matmul_i8`** to the small-shape
   path, which the refusal already names. Not specified further here: the message is more
   precise than anything this document could add.
