@@ -387,6 +387,62 @@ fn register(r: &mut Runner) {
         },
     );
 
+    // — the form ptoas emits ———————————————————————————————————————————————————
+    // A minimal but FAITHFUL specimen: the three markers a real ptoas egress carries,
+    // and none of `cpp`'s. Written inline rather than read from testdata because the
+    // discriminator IS the marker set, and a corpus file would let a later edit to the
+    // file quietly change what the scenario tests.
+    r.when(
+        "I identify a kernel that ptoas emitted",
+        |w: &mut World, _a: &[String]| {
+            let src = "#include \"pto/pto-inst.hpp\"\nusing namespace pto;\n\n                       __global__ AICORE void mm(__gm__ half* a, __gm__ float* c) {}\n";
+            resolve_into(w, "k_kernel.cpp", src, None);
+        },
+    );
+    r.then(
+        "its form is \"ptoc\" and not \"cpp\"",
+        |w: &mut World, _a: &[String]| {
+            assert_eq!(
+                w.get("form"),
+                "ptoc",
+                "ptoas egress must not resolve to AscendC: it carries 0 of cpp's 3 magic \
+                 markers, and cpp's reader profiles it as 0 ops"
+            );
+        },
+    );
+    r.then(
+        "a real AscendC kernel is still identified as \"cpp\"",
+        |w: &mut World, _a: &[String]| {
+            // The control. Adding a form that shares `.cpp` must not capture the form it
+            // was carved out of -- that would trade one misidentification for another.
+            let src = "#include \"kernel_operator.h\"\nusing namespace AscendC;\n                       extern \"C\" __global__ __aicore__ void k() {}\n";
+            resolve_into(w, "argmax_kernel.cpp", src, None);
+            assert_eq!(w.get("form"), "cpp", "the AscendC control moved");
+        },
+    );
+    r.then(
+        "there is no direct route to it yet, and asking says so rather than crashing",
+        |_w: &mut World, _a: &[String]| {
+            // Recognising a form is not routing to it, and this scenario pins the gap
+            // rather than papering it: nothing in tile invokes ptoas, so an edge would be
+            // the hazard emit.rs's gate names -- offered and untakeable. What must hold is
+            // that ASKING is answered, not that it succeeds.
+            match routes::plan("pto", "ptoc", &[]) {
+                Ok(p) => panic!(
+                    "a pto -> ptoc route appeared without anything to execute it: {p:?}"
+                ),
+                Err(e) => {
+                    let shown = format!("{e:?}");
+                    assert!(
+                        !shown.is_empty(),
+                        "the planner must explain a missing route, not return an empty \
+                         refusal"
+                    );
+                }
+            }
+        },
+    );
+
     // — the single-backend intrinsic surface ————————————————————————————————————
     // `--list-ops` measures 32 portable ops across every backend; this answers the
     // single-backend question that table deliberately excludes. The two are different

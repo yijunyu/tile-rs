@@ -25,11 +25,11 @@ changing, not the specification.
 | `11_io_edges.feature` | 16 | 16 | ████████████████████ |
 | `12_run.feature` | 20 | 20 | ████████████████████ |
 | `13_backlog.feature` | 12 | 12 | ████████████████████ |
-| `14_single_backend_data_movement.feature` | 1 | 4 | █████··············· |
+| `14_single_backend_data_movement.feature` | 2 | 6 | ██████·············· |
 
 The rest, by reason — these are different kinds of thing:
 
-* `@planned` — 3: written down, not built yet
+* `@planned` — 4: written down, not built yet
 * `@requires-backend` — 1: conditional: needs the codegen backend; `tile install` provisions it
 * `@requires-cross` — 1: conditional: compiles for another triple (minutes); set TILE_SPEC_CROSS=1
 * `@requires-device` — 4: conditional: needs a device — present here, so these RAN
@@ -40,4 +40,4 @@ The rest, by reason — these are different kinds of thing:
 * `@requires-wasm-runtime` — 1: conditional: a wasm runtime is here, so the bundle's behaviour RAN
 * `@requires-wasm-target` — 1: conditional: the wasm target is here, so the bundle was rebuilt and compared
 
-**176 of 185 scenarios live (95%)**, 240 cases executed green.
+**177 of 187 scenarios live (94%)**, 241 cases executed green.

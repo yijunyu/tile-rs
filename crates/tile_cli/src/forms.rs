@@ -456,6 +456,55 @@ pub const FORMS: &[Form] = &[
         family: "ascend",
         refines: None,
     },
+    // THE FORM ptoas ACTUALLY EMITS, which is not AscendC and was not in this table.
+    //
+    // `ptoas` consumes pto MLIR and emits C++ -- but over `pto/pto-inst.hpp`, not over
+    // `kernel_operator.h`. Measured 2026-10-24 across the 25 kernels in cannbench's
+    // `submissions/pto_mm/op_kernel/`: 24 carry all three markers below and **0 of 3** of
+    // `cpp`'s (`AscendC::`, `namespace AscendC`, `__aicore__`). So folding them into `cpp`
+    // would be wrong twice over -- a different intrinsic layer, and one `cpp`'s reader
+    // cannot parse: forcing `-f cpp` on one returns **rc=0** with `kernel <unnamed>`,
+    // `0 ops` and `0 hazard edges`, a confident profile of nothing, which is worse than a
+    // refusal. Without this row the same file is `.cpp is ambiguous (ttmetal, cpp)` at
+    // rc=2, so the 24 kernels a real pipeline ships were unidentifiable.
+    //
+    // Level 1 like `cpp`: it is target source that a device compiler takes directly
+    // (PASS 25 of 25 under bisheng at dav-c310-vec, device pass and host pass).
+    Form {
+        id: "ptoc",
+        role: Role::Source,
+        display: "PTO intrinsic C++ (ptoas egress)",
+        level: 1,
+        // ptoas writes `-o <file>.cpp` in practice; `cce` because the device compiler
+        // takes either and nothing stops a caller naming it that.
+        exts: &["cpp", "cce"],
+        // `__global__ AICORE` is the entry spelling -- AICORE is a pto macro that expands
+        // to `[aicore]` under `__CCE_AICORE__` and to nothing under `__CPU_SIM`.
+        magic: &["pto/pto-inst.hpp", "using namespace pto", "__global__ AICORE"],
+        // No reader: nothing here parses the pto intrinsic surface. A lift from it is
+        // unwritten work, not an impossibility, and the route planner says so.
+        // NEITHER READ NOR WRITTEN, which is the whole of what is true. tile does not
+        // emit ptoc -- ptoas does -- and nothing here parses the pto intrinsic surface.
+        // So this row buys IDENTIFICATION and claims nothing else, and the three gates
+        // that fire on a writable level-1 form are right to: a writable target owes a
+        // TILERS_CODEGEN_PATH (forms.rs `every_writable_target_form_has_a_codegen_path`)
+        // and a lowering edge owes an emitter or a feature gate (emit.rs
+        // `every_lowering_edge_either_has_an_emitter_or_names_the_feature_gating_it`,
+        // whose own comment names the hazard: "a route the planner offers and nothing
+        // can take, and the user would meet it as a crash rather than a refusal").
+        // A `pto -> ptoc` edge belongs here the day tile invokes ptoas as a toolchain
+        // step; until then offering it would be that hazard.
+        readable: false,
+        writable: false,
+        // No lowering of ours produces it, so there is no fidelity of ours to claim.
+        fidelity: Fidelity::Unvalidated,
+        family: "ascend",
+        // Its ONLY gpu-ish marker is `__global__`, which is the whole of `gpu`'s magic,
+        // so without this it resolves to `gpu` -- tile said exactly that when `-f cpp`
+        // was forced: "its content looks like gpu". Same mechanism as rvv refining
+        // linalg.
+        refines: Some("gpu"),
+    },
     Form {
         id: "pico",
         role: Role::Source,
@@ -899,10 +948,25 @@ mod codegen_path_tests {
         assert_eq!(codegen_path("spirv"), Some("vulkan"));
     }
 
+    /// Every form we can EMIT needs a codegen path -- and the forms without one must be
+    /// exactly the ones we cannot emit.
+    ///
+    /// The condition used to be `f.level == 1 || ...` while the name said *writable*, and
+    /// nothing distinguished the two until `ptoc`: a level-1 form that tile RECOGNISES and
+    /// does not write, because ptoas emits it. A codegen path for a form no codegen
+    /// produces would be a fabricated mapping, so the fix is to make the condition say
+    /// what the name always said.
+    ///
+    /// BOTH DIRECTIONS ARE ASSERTED, because this is a relaxation and a relaxed gate that
+    /// only checks the easy direction stops being a gate. The second loop is what keeps it
+    /// sharp: a level-1 form may be exempt ONLY by being unwritable, so a future form that
+    /// is writable and pathless still fails, and a future unwritable one has to be
+    /// deliberate rather than silently inheriting the exemption.
     #[test]
     fn every_writable_target_form_has_a_codegen_path() {
         for f in FORMS {
-            if f.level == 1 || f.id == "pto" || f.id == "linalg" || f.id == "rvv" {
+            let emittable = f.level == 1 || f.id == "pto" || f.id == "linalg" || f.id == "rvv";
+            if emittable && f.writable {
                 assert!(
                     codegen_path(f.id).is_some(),
                     "{} can be emitted but has no TILERS_CODEGEN_PATH",
@@ -910,6 +974,23 @@ mod codegen_path_tests {
                 );
             }
         }
+        let pathless: Vec<&str> = FORMS
+            .iter()
+            .filter(|f| f.level == 1 && codegen_path(f.id).is_none())
+            .map(|f| f.id)
+            .collect();
+        for id in &pathless {
+            let f = by_id(id).expect("form");
+            assert!(
+                !f.writable,
+                "{id} is a writable level-1 target with no TILERS_CODEGEN_PATH -- an                  unrecognised path falls through to the Ascend default and fails about                  ASCEND_HOME_PATH, which points at entirely the wrong thing"
+            );
+        }
+        assert_eq!(
+            pathless,
+            vec!["ptoc"],
+            "the set of level-1 forms with no codegen path moved; each one is a form tile              cannot emit and that has to be a decision, not a default"
+        );
     }
 
     #[test]

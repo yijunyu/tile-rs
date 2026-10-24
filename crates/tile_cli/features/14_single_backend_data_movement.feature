@@ -22,6 +22,28 @@ Feature: Single-backend data movement, which a portability table cannot describe
     And asking does not change what --list-ops reports
     And a backend whose emitter source this build cannot read is UNKNOWN, not zero
 
+  # ptoas consumes the pto dialect and emits C++ -- but over pto/pto-inst.hpp, not over
+  # kernel_operator.h. Folding that into `cpp` would be wrong twice: a different intrinsic
+  # layer, and one `cpp`'s reader cannot parse, so forcing the form yields a confident
+  # profile of nothing instead of a refusal.
+  Scenario: the C++ ptoas emits is a form of its own, not AscendC
+    When I identify a kernel that ptoas emitted
+    Then its form is "ptoc" and not "cpp"
+    And a real AscendC kernel is still identified as "cpp"
+    And there is no direct route to it yet, and asking says so rather than crashing
+
+  # The edge belongs in the graph the day tile invokes ptoas as a toolchain step, and not
+  # before: `emit.rs`'s own gate refuses an edge with neither an emitter nor a feature
+  # gate, because that is "a route the planner offers and nothing can take, and the user
+  # would meet it as a crash rather than a refusal". Today the only thing that performs
+  # pto -> ptoc is ptoas on the command line.
+  @planned
+  Scenario: a pto kernel lowers to the C++ ptoas emits, through the toolchain
+    Given a kernel in the pto dialect and a provisioned ptoas
+    When I lower it to "ptoc"
+    Then the route taken is pto -> ptoc and names toolchain:ptoas
+    And on a machine without ptoas it is refused as ACQUIRABLE, not as unwritten
+
   @planned
   Scenario: the fused int8 dequant matmul emits ONE kernel, not a matmul and two passes
     Given an i8 matmul module at a shape the single-block path refuses today

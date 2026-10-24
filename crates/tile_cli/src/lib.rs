@@ -238,7 +238,10 @@ mod tests {
             ids,
             vec![
                 "tile", "mlir", "linalg", "rvv", "pto", "msl", "gpu", "musa", "spirv", "nki",
-                "aie", "tpu", "bang", "gaudi", "hexagon", "ttmetal", "cpp", "pico", "csl", "debug",
+                "aie", "tpu", "bang", "gaudi", "hexagon", "ttmetal", "cpp",
+                // Added 2026-10-24: the C++ ptoas emits, which carried 0 of cpp's 3
+                // magic markers and was `.cpp is ambiguous (ttmetal, cpp)` at rc=2.
+                "ptoc", "pico", "csl", "debug",
             ]
         );
     }
