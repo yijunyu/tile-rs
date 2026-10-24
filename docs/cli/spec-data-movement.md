@@ -178,6 +178,67 @@ another lane's live work, 5 Ascend references in `roofline.rs` and 0 in `hardwar
   (optimisable), because that distinction is what made §1's two extra passes a certain
   +2.07 rather than a hope.
 
+## WHICH TREE, measured -- because this spec's own flag list came from the wrong one
+
+**Three lines carry `crates/tile_cli`, none of them share a git history with another, and
+the one the installed `tile` is built from is the one with the least CLI work in it.**
+Measured 2026-10-24.
+
+    line                        what it is                     tile_cli commits   HEAD
+    tile-cli (ascend-rs-priv)   ORPHAN branch, rooted           257 (of 484)      2026-10-24
+                                2026-06-16 "tile-rs v0.0.1";
+                                tile_cli born 2026-09-01
+    pto-rs-viewpoint (same      the private MAINLINE, rooted     12               2026-10-24
+    repo)                       2025-01-17; tile_cli arrived
+                                2026-09-24 as a COPY
+    tile-rs (this repo)         the public GitHub repo,          15 (whole repo)   2026-10-24
+                                seeded from that same copy
+
+`git merge-base tile-cli pto-rs-viewpoint` is **EMPTY** -- unrelated histories inside one
+repository -- so there is no merge to make, only a port. Content distance over
+`crates/tile_cli/src`:
+
+    tile-rs : pto-rs-viewpoint      595 changed lines     close siblings
+    tile-rs : tile-cli             4984
+    pto-rs-viewpoint : tile-cli    5229
+
+**And `ls -l "$(command -v tile)"` plus `~/.cargo/.crates2.json` say the installed binary
+is a release build of `~/ascend-rs-priv/crates/tile_cli` (pto-rs-viewpoint), 16:00 on
+2026-10-23.** Which matters for this document twice over:
+
+* **§3's flag list is that binary's, not the product line's.** The 25 flags quoted there
+  are exactly what `tile --help` prints from pto-rs-viewpoint. The `tile-cli` branch has
+  `pto-verify` (with `--only`), `tutorial`, a Triton ingress, a DSL egress and a
+  route-runnability gate -- 257 commits of CLI work -- and **none of them are in the
+  binary a caller runs**, so a claim of the form "the CLI has no surface for X" has to name
+  the tree it was measured in. Checked for this spec's own ask: neither private line has
+  any intrinsic-discovery surface (`grep -n "list-intrinsics\|ListIntrinsics"` is empty on
+  both, and the `tile-cli` branch's `Cmd` enum is `Run Doctor ListForms ListOps Install
+  Daemon License Ui Backlog PtoVerify Tutorial Help Version NotYet`), so §1's item was not
+  duplicated work -- it is simply landed in the line with the smallest audience.
+* **`--list-intrinsics` is therefore implemented and NOT DELIVERED.** `tile
+  --list-intrinsics pto` on the installed binary is `unknown option`, exit 2. The port is
+  self-contained and the prerequisites are present in both private lines --
+  `emit::PROBE_OPS`, `forms::by_id`, `crates/tile_std/src/{lib,tile}.rs`,
+  `crates/rustc_codegen_tile/src/mlir_to_*.rs`, and no existing `build.rs` to conflict with
+  -- so it is `build.rs` + `src/intrinsics.rs` + three small wirings + one feature file.
+  Whose branch it lands on is the owner's call, not the finder's.
+
+**THE DIVERGENCE IS BIDIRECTIONAL BY SUBSYSTEM, which is why no single "this line wins"
+answer works.** The same measurement that shows `tile-cli` far ahead on the CLI shows it
+behind on the two trees this spec's table is derived FROM:
+
+    tree                tile_std `pub fn __tile_*`   distinct __tile_* in mlir_to_pto.rs
+    tile-rs                      509                              146
+    pto-rs-viewpoint             509                              163
+    tile-cli                     442                               99
+
+So **the richest `pto` emitter is in the line the binary is built from, and it is the line
+that cannot be asked about it**; and had §1's surface been built on the `tile-cli` branch
+it would have reported 442 intrinsics and 99 pto arms. The numbers in §1 (162 of 509) are a
+property of the tree the table is derived in -- which is the intended behaviour of deriving
+it rather than writing it down, and a reason to quote the tree beside the figure.
+
 ## What cannot be specified yet, and why
 
 * **The 950 cube's real MAC rate.** 41-63 against 217-362 TMAC/s are both *implied* from
