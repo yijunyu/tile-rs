@@ -93,6 +93,39 @@ pub struct HardwareParams {
     /// the kernel runs). Ascend950DT is missing `ConcatD` / `Arange` and the
     /// `Cat` family; the full list is still open.
     pub missing_vendor_ops: &'static [&'static str],
+    /// L1 -> L0A and L1 -> L0B feed rates, in the vendor's own
+    /// `[AICoreMemoryRates]` units. `0` = unknown.
+    ///
+    /// A RATE, not a capacity, and it is the one axis 950 MOVES while every
+    /// capacity above stays put: `l1_to_l0_a_rate` 512 -> 256 on every
+    /// `Ascend950*`, which makes it EQUAL to the unchanged `l1_to_l0_b_rate`
+    /// 256, where every `Ascend910*` feeds A at twice B. `l0_a_size` and
+    /// `l0_b_size` are 65536 on both families and `l1_size` is 524288 on both
+    /// -- so a descriptor carrying only capacities CANNOT TELL THE TWO MACHINES
+    /// APART on the axis that decides a cube tile.
+    ///
+    /// Why it has to be representable and not merely known: a SHIPPED cube tile
+    /// was chosen on this asymmetry. cannbench's `gen_mm.py` measured
+    /// 128x256x128 at 1.806 ms against 128x128x128 at 2.295 ms (-21%) on 910
+    /// and records the reason -- filling L0B is necessary and NOT sufficient,
+    /// because `64x512x64` fills L0B too and is the worst of four "because it
+    /// STARVES L0A". That is a statement about the feed rates. On a part where
+    /// they are equal the argument does not obviously carry, and a struct with
+    /// no rate axis cannot express the difference, so it lets a 910-derived
+    /// tile through as though the question had been asked.
+    pub l1_to_l0a_rate: u32,
+    pub l1_to_l0b_rate: u32,
+    /// Were the RATES above established, separately from the capacities?
+    ///
+    /// `measured` below is about CAPACITIES and is already `true` for 950 on
+    /// the strength of a platform-config read -- its own doc comment says it
+    /// was set "because the alternative ... made the planner unable to size
+    /// anything at all". One flag covering every axis therefore stops
+    /// protecting the moment the FIRST axis is filled, which has already
+    /// happened: nothing had read a rate when `measured` was set, because there
+    /// was nowhere to put one. Splitting the flag is what keeps a capacity
+    /// measurement from silently vouching for a rate claim nobody made.
+    pub rates_measured: bool,
     /// Were these numbers MEASURED on this architecture?
     ///
     /// Without this a params set for a chip nobody has run on is
@@ -101,6 +134,33 @@ pub struct HardwareParams {
     /// hardware cannot hold. Unmeasured is not the same as unlimited, so the
     /// checks REFUSE rather than approve.
     pub measured: bool,
+}
+
+impl HardwareParams {
+    /// Does L1 feed L0A FASTER than it feeds L0B? `None` when the rates are
+    /// unknown or unvouched-for.
+    ///
+    /// `Option` and not `bool` on purpose. This is the question a cube tile
+    /// turns on -- cannbench's shipped 128x256x128 beat 128x128x128 by 21% on
+    /// 910 because filling L0B alone starves L0A -- and the wrong answer for an
+    /// unknown part is not `false`, it is "do not choose on this basis". A
+    /// `bool` would make every unfilled descriptor assert symmetry, which is
+    /// true of 950 and false of 910 and must not be guessed for anything else.
+    ///
+    /// Note what this deliberately does NOT do: it does not recommend a tile.
+    /// Whether the 910 ranking survives on a part that feeds A and B equally is
+    /// UNMEASURED -- cannbench's attempt to rank the four candidate tiles under
+    /// the cycle-accurate model produced no checked tick, and the hand-rolled
+    /// cube does not ship on 950 at all (`TILE_MM_CUBE_OK = 0`). This field
+    /// exists so that the question is representable and a 910-derived tile
+    /// cannot ride into a 950 descriptor unexamined; answering it needs a
+    /// measurement this struct is not.
+    pub const fn feeds_a_faster_than_b(&self) -> Option<bool> {
+        if !self.rates_measured || self.l1_to_l0a_rate == 0 || self.l1_to_l0b_rate == 0 {
+            return None;
+        }
+        Some(self.l1_to_l0a_rate > self.l1_to_l0b_rate)
+    }
 }
 
 impl Default for HardwareParams {
@@ -126,6 +186,12 @@ impl Default for HardwareParams {
             npu_arch: "",
             chip: "",
             missing_vendor_ops: &[],
+            // TRUE for the same reason `measured` is: a CUDA or Metal backend
+            // has no L1-to-L0 path at all, so there is no rate claim to be
+            // missing. Only an Ascend set that left them 0 is unknown.
+            rates_measured: true,
+            l1_to_l0a_rate: 0,
+            l1_to_l0b_rate: 0,
             measured: true,
         }
     }
@@ -178,6 +244,13 @@ impl HardwareParams {
             npu_arch: "DAV_2201",
             chip: "Ascend910B2",
             missing_vendor_ops: &[],
+            // 512 against 256: A is fed at TWICE B on every `Ascend910*`.
+            // Same provenance as the capacities above -- the vendor's own
+            // `[AICoreMemoryRates]`, read across all 73 platform configs on
+            // 910b, 2026-10-17, and a family split rather than a SKU quirk.
+            l1_to_l0a_rate: 512,
+            l1_to_l0b_rate: 256,
+            rates_measured: true,
             measured: true,
         }
     }
@@ -236,6 +309,21 @@ impl HardwareParams {
             npu_arch: "DAV_3510",
             chip: "Ascend950",
             missing_vendor_ops: &[],
+            // THE RATES MUST BE OVERRIDDEN HERE, not left to the spread. This
+            // constructor bases itself on `ascend_910b()`, so without these two
+            // lines a 950 descriptor silently inherits `l1_to_l0a_rate: 512` --
+            // A fed at twice B -- which is the one thing that is NOT true of
+            // this family and the one thing a cube tile was chosen on. 256/256
+            // on every `Ascend950*`: A halves to EQUAL the unchanged B.
+            l1_to_l0a_rate: 256,
+            l1_to_l0b_rate: 256,
+            // Stated rather than inherited, so a reader sees the claim: the
+            // rates come from the SAME platform-config read as the capacities
+            // this constructor's doc comment describes, which is authoritative
+            // for a declared rate and is one step removed from the device.
+            // `measured` below stays false -- that flag is about capacities,
+            // and the two provenances are genuinely different.
+            rates_measured: true,
             measured: false,
             ..Self::ascend_910b()
         }

@@ -119,6 +119,53 @@ pub(crate) mod ascend;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn l1_to_l0_rates_distinguish_the_two_families() {
+        use crate::target::HardwareParams as H;
+        // 910 feeds A at twice B -- the asymmetry a shipped cube tile rests on.
+        assert_eq!(H::ascend_910b().feeds_a_faster_than_b(), Some(true));
+        // 950 halves A to EQUAL B, which is the one axis that moves.
+        assert_eq!(H::ascend_950_unmeasured().feeds_a_faster_than_b(), Some(false));
+    }
+
+    #[test]
+    fn a_950_set_does_not_inherit_910s_rate_through_the_spread() {
+        use crate::target::HardwareParams as H;
+        // THE REGRESSION THIS GUARDS. Every 950 constructor bases itself on
+        // `..Self::ascend_910b()`, so without an explicit override a 950
+        // descriptor silently claims A-fed-at-twice-B -- the single thing that
+        // is not true of the family, and the thing a cube tile was chosen on.
+        for h in [H::ascend_950_unmeasured(), H::ascend_950pr_unmeasured(),
+                  H::ascend_950dt_unmeasured()] {
+            assert_eq!(h.l1_to_l0a_rate, 256, "chip {}", h.chip);
+            assert_eq!(h.l1_to_l0b_rate, 256, "chip {}", h.chip);
+            assert_eq!(h.feeds_a_faster_than_b(), Some(false), "chip {}", h.chip);
+        }
+        // and the capacities the rates sit beside are genuinely unchanged,
+        // which is why a capacity-only descriptor cannot tell them apart
+        assert_eq!(H::ascend_910b().l0a_bytes, H::ascend_950_unmeasured().l0a_bytes);
+        assert_eq!(H::ascend_910b().l0b_bytes, H::ascend_950_unmeasured().l0b_bytes);
+    }
+
+    #[test]
+    fn an_unknown_rate_is_none_and_never_false() {
+        use crate::target::HardwareParams as H;
+        // A non-Ascend target has no L1->L0 path, so there is no claim to miss.
+        assert_eq!(H::default().feeds_a_faster_than_b(), None);
+        // AND THE CONTROL THAT MATTERS: `measured` is about CAPACITIES, and a
+        // capacity measurement must not vouch for a rate nobody read. Before
+        // the flags were split, 950's `measured: true` (set from a platform
+        // config, by its own doc comment) covered every axis at once.
+        let capacities_known_rates_not = H { measured: true, rates_measured: false,
+                                             l1_to_l0a_rate: 512, l1_to_l0b_rate: 256,
+                                             ..H::ascend_910b() };
+        assert_eq!(capacities_known_rates_not.feeds_a_faster_than_b(), None,
+                   "a capacity measurement must not vouch for a rate claim");
+        // a zero rate is unknown even when the flag is set
+        let zeroed = H { rates_measured: true, l1_to_l0a_rate: 0, ..H::ascend_910b() };
+        assert_eq!(zeroed.feeds_a_faster_than_b(), None);
+    }
+
     use super::*;
 
     #[test]
