@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::hardware::HwSignature;
 use crate::schedule::Schedule;
 
 /// One arm's running statistics.
@@ -94,6 +95,32 @@ impl BanditState {
             }
         }
         Ok(best.expect("legal non-empty").0.clone())
+    }
+
+    /// UCB over the arms whose target resource still has headroom -- the
+    /// paper's masked index, with [`HwSignature`] as `h(k)` and `theta` as
+    /// `theta_sat`.
+    ///
+    /// This can only NARROW the choice: the DEFAULT arm asks for nothing and so
+    /// is always admissible, and an empty admissible set falls back to the
+    /// unmasked list rather than inventing an arm. A caller with no counters
+    /// passes [`HwSignature::default()`], which prunes nothing and reproduces
+    /// `select_arm` exactly.
+    pub fn select_arm_masked(
+        &self,
+        legal: &[Schedule],
+        sig: &HwSignature,
+        theta: f64,
+    ) -> Result<Schedule, String> {
+        let admissible: Vec<Schedule> = legal
+            .iter()
+            .filter(|a| a.is_default() || !a.mask_blocked(sig, theta))
+            .cloned()
+            .collect();
+        if admissible.is_empty() {
+            return self.select_arm(legal);
+        }
+        self.select_arm(&admissible)
     }
 
     /// Record a **verified** reward for `arm`. Callers that have not run
@@ -181,13 +208,45 @@ impl BanditState {
                         None => break,
                     };
                     let key = body[ks..ke].to_string();
-                    let after = &body[ke..];
-                    let n = json_num(after, "n").unwrap_or(0.0) as u32;
-                    let sum = json_num(after, "sum_reward").unwrap_or(0.0);
+                    i = ke + 1;
+
+                    // An ARM key is followed by `:{`. A nested statistics key is
+                    // followed by `:` and a number. Without this test the nested
+                    // `"n"` and `"sum_reward"` were read as arms -- and because
+                    // the value below used to run to the end of the whole map,
+                    // they even slurped counts from the NEXT arm's object. That
+                    // produced phantom arms, inflated `total_n` (which feeds the
+                    // UCB exploration term), and would corrupt a real arm's
+                    // statistics if a phantom key ever collided with one.
+                    let after = body[i..].trim_start();
+                    let Some(rest) = after.strip_prefix(':') else { continue };
+                    let rest = rest.trim_start();
+                    if !rest.starts_with('{') {
+                        continue;
+                    }
+                    // Bound the value to THIS object, so a missing field cannot
+                    // be satisfied by the next arm's copy of it.
+                    let mut depth = 0i32;
+                    let mut endv = rest.len();
+                    for (idx, ch) in rest.char_indices() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    endv = idx + 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let value = &rest[..endv];
+                    let n = json_num(value, "n").unwrap_or(0.0) as u32;
+                    let sum = json_num(value, "sum_reward").unwrap_or(0.0);
                     if n > 0 {
                         st.arms.insert(key, ArmStat { n, sum_reward: sum });
                     }
-                    i = ke + 1;
                 }
             }
         }
@@ -243,7 +302,8 @@ pub fn bandit_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::Schedule;
+    use crate::hardware::HwSignature;
+use crate::schedule::Schedule;
 
     fn arms() -> Vec<Schedule> {
         Schedule::DEFAULT.legal_arms()
@@ -283,8 +343,8 @@ mod tests {
     #[test]
     fn a_higher_reward_arm_eventually_wins_after_equal_exploration() {
         let mut st = BanditState::new("metal", "matmul");
-        let fast = Schedule { k_unroll: Some(16) };
-        let slow = Schedule { k_unroll: Some(1) };
+        let fast = Schedule { k_unroll: Some(16), ..Schedule::DEFAULT };
+        let slow = Schedule { k_unroll: Some(1), ..Schedule::DEFAULT };
         // equal pull counts, different means
         for _ in 0..20 {
             st.observe(&fast, 10.0);
@@ -293,6 +353,72 @@ mod tests {
         let legal = vec![fast.clone(), slow.clone()];
         let pick = st.select_arm(&legal).unwrap();
         assert_eq!(pick.k_unroll, Some(16));
+    }
+
+    #[test]
+    fn a_saturated_resource_prunes_the_arms_that_target_it() {
+        use crate::hardware::{HwSignature, SATURATION};
+        let legal = Schedule::DEFAULT.legal_arms();
+        let mut st = BanditState::new("c220", "arg_max");
+        let sig = HwSignature { ub: 0.95, ..Default::default() };
+        let mut seen = std::collections::BTreeSet::new();
+        // NOTE: an unobserved arm keeps UCB = +inf, so selection without
+        // recording a pull returns the SAME arm every time (the inf tie-break is
+        // lexicographic). Advancing the state here is what makes this a test of
+        // the mask rather than a test of the tie-break.
+        for _ in 0..60 {
+            let a = st.select_arm_masked(&legal, &sig, SATURATION).unwrap();
+            assert!(a.tile.is_none(), "tile targets UB, which is saturated: {a:?}");
+            seen.insert(a.arm_key());
+            st.observe(&a, 0.1);
+        }
+        // ...and the families targeting other resources are still reachable.
+        assert!(seen.iter().any(|k| k.starts_with("k_unroll=")), "{seen:?}");
+    }
+
+    #[test]
+    fn un_saturating_re_admits_the_arm() {
+        use crate::hardware::{HwSignature, SATURATION};
+        let legal = Schedule::DEFAULT.legal_arms();
+        let hot = HwSignature { ub: 0.95, ..Default::default() };
+        let cool = HwSignature { ub: 0.40, ..Default::default() };
+        let sweep = |sig: &HwSignature| {
+            let mut st = BanditState::new("c220", "arg_max");
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..60 {
+                let a = st.select_arm_masked(&legal, sig, SATURATION).unwrap();
+                seen.insert(a.arm_key());
+                st.observe(&a, 0.1);
+            }
+            seen
+        };
+        let blocked = sweep(&hot);
+        let admitted = sweep(&cool);
+        assert!(!blocked.iter().any(|k| k.starts_with("tile=")), "{blocked:?}");
+        assert!(admitted.iter().any(|k| k.starts_with("tile=")), "{admitted:?}");
+    }
+
+    #[test]
+    fn everything_saturated_still_returns_the_default_not_an_error() {
+        use crate::hardware::{HwSignature, SATURATION};
+        let legal = Schedule::DEFAULT.legal_arms();
+        let st = BanditState::new("c220", "arg_max");
+        let pinned = HwSignature { dram: 0.99, mte2: 0.99, vector: 0.99, ub: 0.99, latency: 0.99 };
+        let a = st.select_arm_masked(&legal, &pinned, SATURATION).unwrap();
+        assert!(a.is_default(), "the do-nothing arm is always admissible, got {a:?}");
+    }
+
+    #[test]
+    fn an_unmeasured_signature_matches_unmasked_selection() {
+        use crate::hardware::{HwSignature, SATURATION};
+        let legal = Schedule::DEFAULT.legal_arms();
+        let a = BanditState::new("c220", "arg_max");
+        let b = BanditState::new("c220", "arg_max");
+        for _ in 0..25 {
+            let plain = a.select_arm(&legal).unwrap();
+            let masked = b.select_arm_masked(&legal, &HwSignature::default(), SATURATION).unwrap();
+            assert_eq!(plain.arm_key(), masked.arm_key());
+        }
     }
 
     #[test]
@@ -305,10 +431,28 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_arm_roundtrip_produces_no_phantom_arms() {
+        // The nested `"n"` / `"sum_reward"` keys must never become arms, and a
+        // missing field must not be satisfied by the next arm's copy. With one
+        // arm this bug is invisible; with several it is not.
+        let mut st = BanditState::new("dav-c220", "arg_max");
+        st.observe(&Schedule { k_unroll: Some(2), ..Schedule::DEFAULT }, 0.25);
+        st.observe(&Schedule { k_unroll: Some(2), ..Schedule::DEFAULT }, 0.75);
+        st.observe(&Schedule { tile: Some(512), ..Schedule::DEFAULT }, 0.5);
+        let back = BanditState::from_json(&st.to_json());
+        assert_eq!(back.arms.len(), st.arms.len(), "arms: {:?}", back.arms.keys().collect::<Vec<_>>());
+        assert!(!back.arms.contains_key("n"), "nested `n` became an arm");
+        assert!(!back.arms.contains_key("sum_reward"), "nested `sum_reward` became an arm");
+        assert_eq!(back.arms.get("k_unroll=2").map(|a| a.n), Some(2));
+        assert!((back.arms.get("k_unroll=2").unwrap().sum_reward - 1.0).abs() < 1e-9);
+        assert_eq!(back.total_n(), st.total_n());
+    }
+
+    #[test]
     fn json_roundtrip_preserves_arch_kernel_and_stats() {
         let mut st = BanditState::new("DAV_2201", "gemm/k=256");
         st.observe(&Schedule::DEFAULT, 3.5);
-        st.observe(&Schedule { k_unroll: Some(4) }, 1.25);
+        st.observe(&Schedule { k_unroll: Some(4), ..Schedule::DEFAULT }, 1.25);
         let j = st.to_json();
         let back = BanditState::from_json(&j);
         assert_eq!(back.arch, st.arch);
