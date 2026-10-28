@@ -1184,6 +1184,42 @@ fn run_one(
             }
         }
         if hop.from == "tile" && hop.to == "mlir" {
+            // REFUSE a kernel that declares no extent, rather than emitting for it.
+            //
+            // This is #009's rule applied one layer down. That issue made the bounds
+            // check answer UNKNOWN instead of ok when nothing declares an extent, on
+            // the grounds that "a check with no input has not passed, and a tiling that
+            // was never examined must not read as one that was". The lowering then went
+            // ahead anyway: with no plan the backend falls through to an elementwise
+            // copy, so `tile k.rs -t msl` printed `bounds (n/a): UNKNOWN` and wrote
+            //
+            //     if (gid < num_elements) p1[gid] = p0[gid];
+            //
+            // as the body of a kernel whose source carried 37 tile_std ops -- at exit 0,
+            // byte-identical across two independent front ends. A copy is FAST, so any
+            // timing gate downstream accepts it as a large win; only an independent
+            // correctness judge stands between that and a certified memcpy. Measured on
+            // every kernel lifted from the AscendC corpus (2026-10-28).
+            //
+            // UNSUPPORTED and not USAGE: there is no flag that supplies an extent, so
+            // there is no nearby command to type. The capability has not been written,
+            // which is what exit 3 means and why its message carries the "yet" tense.
+            if prof.plan.is_none() && forms::codegen_path(out_form.id).is_some() {
+                scratch.finish();
+                eprintln!(
+                    "tile: {} declares no extent, so there is no tile plan and nothing \
+                     to lower against.\n  \
+                     Lowering it anyway would emit an elementwise copy under this \
+                     kernel's own name, which is indistinguishable from a working \
+                     kernel until something checks its OUTPUT.\n  \
+                     Give the kernel a declared extent -- a `GmView<R, C, T>` parameter \
+                     rather than a raw pointer with runtime dims -- or lower a form that \
+                     carries one. Supplying an extent on the command line is not \
+                     possible yet.",
+                    input
+                );
+                return exit::UNSUPPORTED;
+            }
             let mut report = |m: &str| eprintln!("tile: {m}");
             match tile_cli::lower_rs::lower(&current, out_form, &mut report) {
                 Ok(l) => {
