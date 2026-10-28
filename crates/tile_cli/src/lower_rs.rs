@@ -205,13 +205,35 @@ pub fn lower(
         ),
     )
     .map_err(|e| LowerError::Io(e.to_string()))?;
-    std::fs::write(work.join("src/lib.rs"), source).map_err(|e| LowerError::Io(e.to_string()))?;
+    // The two `register_tool` attributes belong in the KERNEL SOURCE, not in
+    // rustflags.
+    //
+    // `[build] rustflags` applies to every crate in the graph, so injecting
+    // them with `-Zcrate-attr` put them on `tile_std` as well -- which
+    // declares both itself -- and the dependency failed to compile before the
+    // kernel was reached: "tool `tile` was already registered" plus E0636,
+    // exit 1 and no output, for every .rs kernel. `--target` cannot scope this
+    // the way it scopes `-Zcodegen-backend` (see the note below), because
+    // tile_std is an ordinary dependency built for the target.
+    //
+    // Dropping the injection is not an option: lifted kernels declare neither
+    // attribute (0 of 17 artifacts out of `ascendc-to-rs`), so it can only be
+    // moved. Inner attributes must precede items but may follow comments, and
+    // a lifted file opens with a comment banner, so prepending is valid. The
+    // guard is for a hand-written kernel that already declares them, which
+    // would otherwise hit the very error this fixes.
+    let kernel_src = if source.contains("register_tool") {
+        source.to_string()
+    } else {
+        format!("#![feature(register_tool)]\n#![register_tool(tile)]\n{source}")
+    };
+    std::fs::write(work.join("src/lib.rs"), &kernel_src)
+        .map_err(|e| LowerError::Io(e.to_string()))?;
     std::fs::write(
         work.join(".cargo/config.toml"),
         format!(
             "[build]\nrustflags = [\n  \"-Zcodegen-backend={}\",\n  \
-             \"-Zcrate-attr=feature(register_tool)\",\n  \
-             \"-Zcrate-attr=register_tool(tile)\",\n  \"-Cpanic=abort\",\n  \
+             \"-Cpanic=abort\",\n  \
              \"-Clto=off\",\n]\n[unstable]\n",
             lib.display()
         ),
