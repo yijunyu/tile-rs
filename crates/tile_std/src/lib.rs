@@ -378,6 +378,14 @@ extern "C" {
     pub fn __tile_buf_store_i32(gm: *mut i32, buf: UbBuf, count: u32);
     pub fn __tile_buf_load_u32(buf: UbBuf, gm: *const u32, count: u32);
     pub fn __tile_buf_store_u32(gm: *mut u32, buf: UbBuf, count: u32);
+    // THE OFFSET FORM EXTENDS TO `Duplicate` AND THE i8 STORE. Signatures read off the
+    // emitter's call sites in the lifted corpus, not inferred:
+    //   __tile_duplicate_f16_at(buf_src, (lenp) as u32, 0.0_f32, (p512 as u32) - (lenp as u32))
+    //   __tile_buf_store_i8_at(y.wrapping_add(...) as *mut i8, buf_os, ...)
+    pub fn __tile_duplicate_f32_at(buf: UbBuf, off: u32, val: f32, count: u32);
+    pub fn __tile_duplicate_f16_at(buf: UbBuf, off: u32, val: f32, count: u32);
+    pub fn __tile_duplicate_bf16_at(buf: UbBuf, off: u32, val: f32, count: u32);
+    pub fn __tile_buf_store_i8_at(gm: *mut i8, buf: UbBuf, off: u32, count: u32);
     pub fn __tile_buf_load_i32_at(buf: UbBuf, off: u32, gm: *const i32, count: u32);
     pub fn __tile_buf_store_i32_at(gm: *mut i32, buf: UbBuf, off: u32, count: u32);
     pub fn __tile_buf_load_u32_at(buf: UbBuf, off: u32, gm: *const u32, count: u32);
