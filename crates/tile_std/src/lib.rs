@@ -131,6 +131,27 @@ extern "C" {
     pub fn __tile_compare_gt_f32(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
     pub fn __tile_compare_eq_f16(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
 
+    // THE BITS-REINTERPRET HELPERS ARE SCALAR, not buffer ops: each takes one u32 of bits and
+    // returns the f32 it represents, which is how the emitter writes a typed zero/pattern
+    // constant into a `Duplicate`. Declaring these as buffer ops would have compiled and then
+    // been wrong at every call site.
+    //   (tile_std::__tile_bits_as_f32(((0)) as u32)) as f32
+    pub fn __tile_bits_as_f32(bits: u32) -> f32;
+    pub fn __tile_bf16_bits_as_f32(bits: u32) -> f32;
+    pub fn __tile_f16_bits_as_f32(bits: u32) -> f32;
+
+    // Remainder of the cast/copy/compare families the emitter emits, each quoted from its call:
+    //   __tile_copy_f32(buf_pos_s, buf_b_pat_, cp as u32)
+    //   __tile_cast_f32_to_i32(buf_res, buf_red, (TailReduce__cnt) as u32)
+    //   __tile_cast_i32_to_f32(buf_pat, buf_pi, 2*(pitch_ as u32))
+    //   __tile_duplicate_u8(buf_ev, (0x55555555), ((n2max as u32)+31)/32*32)
+    //   __tile_compare_scalar_eq_i32(buf_b_m1_, buf_acc, WonMask__val, WonMask__n as u32)
+    pub fn __tile_copy_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_f32_to_i32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_i32_to_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_duplicate_u8(buf: UbBuf, val: u32, count: u32);
+    pub fn __tile_compare_scalar_eq_i32(dst: UbBuf, src: UbBuf, scalar: u32, n: u32);
+
     // Reduce operations (f32)
     pub fn __tile_v_reduce_max_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
     pub fn __tile_reduce_min_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
