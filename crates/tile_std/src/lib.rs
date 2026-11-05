@@ -88,6 +88,22 @@ extern "C" {
     pub fn __tile_buf_store_f16(gm: *mut u16, buf: UbBuf, count: u32);
     pub fn __tile_buf_load_bf16(buf: UbBuf, gm: *const u16, count: u32);
     pub fn __tile_buf_store_bf16(gm: *mut u16, buf: UbBuf, count: u32);
+    // OFFSET (`_at`) FORM OF THE SAME FAMILY. The plain form always writes the
+    // buffer from element 0; this one writes at a caller-chosen element offset,
+    // which is what a kernel that packs ROWS into one buffer needs and what
+    // `ascendc-to-rs` emits for every `DataCopyPad` whose destination is
+    // `buf[row * pitch]`. Argument order follows the plain family exactly and adds
+    // the offset in the position the emitter already uses:
+    //     load (buf, dst_off, gm, count)      store (gm, buf, src_off, count)
+    // Measured from `tile ... --via tile -t tile` on
+    // submissions/fused_causal_conv1d/op_kernel/fused_causal_conv1d_kernel.cpp,
+    // which calls the f32 pair 48 and 36 times.
+    pub fn __tile_buf_load_f32_at(buf: UbBuf, off: u32, gm: *const f32, count: u32);
+    pub fn __tile_buf_store_f32_at(gm: *mut f32, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_f16_at(buf: UbBuf, off: u32, gm: *const u16, count: u32);
+    pub fn __tile_buf_store_f16_at(gm: *mut u16, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_bf16_at(buf: UbBuf, off: u32, gm: *const u16, count: u32);
+    pub fn __tile_buf_store_bf16_at(gm: *mut u16, buf: UbBuf, off: u32, count: u32);
     // Fill a buffer with a scalar constant (AscendC::Duplicate)
     pub fn __tile_buf_fill_f32(buf: UbBuf, val: f32, count: u32);
     pub fn __tile_buf_fill_f16(buf: UbBuf, val: f32, count: u32);
@@ -362,6 +378,10 @@ extern "C" {
     pub fn __tile_buf_store_i32(gm: *mut i32, buf: UbBuf, count: u32);
     pub fn __tile_buf_load_u32(buf: UbBuf, gm: *const u32, count: u32);
     pub fn __tile_buf_store_u32(gm: *mut u32, buf: UbBuf, count: u32);
+    pub fn __tile_buf_load_i32_at(buf: UbBuf, off: u32, gm: *const i32, count: u32);
+    pub fn __tile_buf_store_i32_at(gm: *mut i32, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_u32_at(buf: UbBuf, off: u32, gm: *const u32, count: u32);
+    pub fn __tile_buf_store_u32_at(gm: *mut u32, buf: UbBuf, off: u32, count: u32);
 }
 
 // ---------------------------------------------------------------------------
