@@ -110,6 +110,27 @@ extern "C" {
     pub fn __tile_buf_fill_bf16(buf: UbBuf, val: f32, count: u32);
     pub fn __tile_pipe_barrier();
 
+    // INTRA-UB COPY, CAST AND COMPARE. These were the top of a measured queue: lifting the
+    // hand-written corpus produced 94 distinct `__tile_*` calls of which 45 were undeclared,
+    // and these eight are the ones whose emitted call site is unambiguous. Argument order is
+    // quoted from the emitter, not inferred:
+    //   __tile_copy_ub_f32(buf_gf, buf_gs, (P) as u32)
+    //   __tile_cast_bf16_to_f32(buf_gf, buf_gs, (P) as u32)
+    //   __tile_cast_f32_to_bf16(buf_as, buf_v, (Demote__n) as u32)
+    //   __tile_cast_f16_to_i8(buf_os, buf_hs, (n) as u32)
+    //   __tile_add_i32(buf_cur, buf_cur, buf_b_hi_, PrepChunk__n2 as u32)
+    //   __tile_v_silu_f32(buf_b_res_, buf_b_tmp_, (uint32_t)(tl * RunBlock__cw))
+    //   __tile_compare_gt_f32(buf_m0, buf_cur, buf_acc, WonMask__n as u32)
+    //   __tile_compare_eq_f16(buf_b_mask2_, buf_cv_view1617, buf_cv_view1617, WonMask__n as u32)
+    pub fn __tile_copy_ub_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_bf16_to_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_f32_to_bf16(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_f16_to_i8(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_add_i32(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
+    pub fn __tile_v_silu_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_compare_gt_f32(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
+    pub fn __tile_compare_eq_f16(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
+
     // Reduce operations (f32)
     pub fn __tile_v_reduce_max_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
     pub fn __tile_reduce_min_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
