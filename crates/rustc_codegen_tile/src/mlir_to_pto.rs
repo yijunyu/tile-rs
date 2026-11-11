@@ -4901,6 +4901,22 @@ fn translate_row_argminmax(
     //
     // Offsets are constants, so this is unrolled rather than an scf.for --
     // make_pv_at takes constant offsets and cols/nb is small (4 for the vocab).
+    // THE BLOCKED COMBINE IS NOT IMPLEMENTED, and emitting the loop below would
+    // be a silent wrong reduction: every block writes its LOCAL argmax into the
+    // same `dst`, so the result is the last block's index, not the row-global
+    // one (KNOWN_ISSUES item 2). The PTO has `trowargmax` (index + max value)
+    // but this emitter has no compare/select arm to fold `b*nb` across blocks.
+    // Refuse until that arm exists rather than ship the wrong artifact.
+    let _ = &pto_op;
+    return Err(format!(
+        "{} on a {}-column tile needs the blocked cross-block combine, which \
+         is not modelled: the per-block loop would write the last block's local \
+         argmax instead of the row-global one (KNOWN_ISSUES item 2). The block \
+         width picker and buffer reuse exist; the fold (compare/select + b*nb) \
+         does not",
+        pto_op, cols
+    ));
+    #[allow(unreachable_code)]
     let gm_name = tsrc.gm_name.clone().ok_or_else(|| {
         format!("{}: tile {} has no originating GM buffer to block over", pto_op, srcs[0])
     })?;
@@ -16472,7 +16488,7 @@ module {
     }
 
     #[test]
-    fn test_blocked_argmax_reuses_one_block_and_one_scratch() {
+    fn test_blocked_argmax_refuses_until_the_cross_block_fold_exists() {
         // 154880 f32 at one row: pick_argminmax_nb picks nb=15488, so the
         // reduction is 10 blocks. Allocating a block buffer + scratch per
         // block made all 20 tiles live at once (1.2 MB against a 192 KB UB)
@@ -16492,27 +16508,16 @@ module {
   }
 }
 "#;
-        let pto = convert_mlir_to_pto(mlir)
-            .expect("blocked argmax must fit UB: it should reuse one block+scratch");
-        assert!(
-            pto.contains("// --- blocked pto.trowargmax: 10 blocks of 15488 over 154880 ---"),
-            "expected the 10-block lowering:\n{}",
-            pto
-        );
-        // dst + one block buffer + one scratch tile. Anything proportional to
-        // the block count here is the regression this test exists for.
-        assert_eq!(
-            pto.lines().filter(|l| l.contains("pto.alloc_tile")).count(),
-            3,
-            "blocked argmax must allocate exactly dst + blk + scratch, not one pair per block:\n{}",
-            pto
-        );
-        assert_eq!(
-            pto.matches("pto.tload").count(),
-            10,
-            "all 10 blocks must still be loaded:\n{}",
-            pto
-        );
+        // The picker must fractal-align: 19360 was 128 B past a 512 B block,
+        // and validate_tile_shape refused the emitted view with C2.
+        assert_eq!(pick_argminmax_nb(1, 154880, "f32"), Some(15488));
+        // The cross-block fold is not modelled, so the lowering must REFUSE
+        // rather than write the last block's LOCAL argmax into dst
+        // (KNOWN_ISSUES item 2). The block buffer + scratch reuse stays in the
+        // code for the day the compare/select arm lands.
+        let err = convert_mlir_to_pto(mlir)
+            .expect_err("blocked argmax must refuse until the b*nb fold exists");
+        assert!(err.contains("blocked cross-block combine"), "{err}");
     }
 
     #[test]
