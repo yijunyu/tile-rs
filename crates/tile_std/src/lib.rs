@@ -1,0 +1,598 @@
+#![feature(
+    no_core,
+    lang_items,
+    intrinsics,
+    unboxed_closures,
+    extern_types,
+    decl_macro,
+    rustc_attrs,
+    transparent_unions,
+    auto_traits,
+    freeze_impls,
+    thread_local,
+    f16,
+    f128,
+    const_trait_impl,
+    fundamental,
+    macro_metavar_expr,
+    negative_impls,
+    allow_internal_unstable,
+    doc_notable_trait,
+    prelude_import,
+    never_type,
+    min_specialization,
+    generic_const_exprs,
+    register_tool
+)]
+#![allow(
+    dead_code,
+    internal_features,
+    ambiguous_wide_pointer_comparisons,
+    unused,
+    unused_variables
+)]
+#![no_std]
+#![no_core]
+#![rustc_coherence_is_core]
+#![register_tool(tile)]
+
+pub mod buf;
+pub mod core;
+pub mod kernel_ops;
+pub mod pipeline;
+pub mod emitted_kernels;
+pub mod tile;
+
+pub use core::prelude::v1::*;
+pub use core::*;
+pub use kernel_ops::*;
+pub use tile_std_macros::*;
+
+/// Unified Buffer (UB) buffer ID — returned by __tile_buf_alloc.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct UbBuf(u32);
+
+/// L1/CBUF buffer ID — returned by __tile_buf_alloc_l1.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct L1Buf(u32);
+
+/// L0A buffer ID — returned by __tile_buf_alloc_l0a.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct L0aBuf(u32);
+
+/// L0B buffer ID — returned by __tile_buf_alloc_l0b.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct L0bBuf(u32);
+
+/// L0C buffer ID — returned by __tile_buf_alloc_l0c.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct L0cBuf(u32);
+
+extern "C" {
+    // Block/sub-block index queries
+    pub fn get_block_idx() -> usize;
+    pub fn get_block_num() -> usize;
+    pub fn get_sub_block_num() -> usize;
+    pub fn get_sub_block_idx() -> usize;
+
+    // Buffer management — mapped to TBuf/LocalTensor by mlir_to_cpp
+    pub fn __tile_buf_alloc(elem_count: u32) -> UbBuf;
+    pub fn __tile_buf_load_f32(buf: UbBuf, gm: *const f32, count: u32);
+    pub fn __tile_buf_store_f32(gm: *mut f32, buf: UbBuf, count: u32);
+    pub fn __tile_buf_load_f16(buf: UbBuf, gm: *const u16, count: u32);
+    pub fn __tile_buf_store_f16(gm: *mut u16, buf: UbBuf, count: u32);
+    pub fn __tile_buf_load_bf16(buf: UbBuf, gm: *const u16, count: u32);
+    pub fn __tile_buf_store_bf16(gm: *mut u16, buf: UbBuf, count: u32);
+    // OFFSET (`_at`) FORM OF THE SAME FAMILY. The plain form always writes the
+    // buffer from element 0; this one writes at a caller-chosen element offset,
+    // which is what a kernel that packs ROWS into one buffer needs and what
+    // `ascendc-to-rs` emits for every `DataCopyPad` whose destination is
+    // `buf[row * pitch]`. Argument order follows the plain family exactly and adds
+    // the offset in the position the emitter already uses:
+    //     load (buf, dst_off, gm, count)      store (gm, buf, src_off, count)
+    // Measured from `tile ... --via tile -t tile` on
+    // submissions/fused_causal_conv1d/op_kernel/fused_causal_conv1d_kernel.cpp,
+    // which calls the f32 pair 48 and 36 times.
+    pub fn __tile_buf_load_f32_at(buf: UbBuf, off: u32, gm: *const f32, count: u32);
+    pub fn __tile_buf_store_f32_at(gm: *mut f32, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_f16_at(buf: UbBuf, off: u32, gm: *const u16, count: u32);
+    pub fn __tile_buf_store_f16_at(gm: *mut u16, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_bf16_at(buf: UbBuf, off: u32, gm: *const u16, count: u32);
+    pub fn __tile_buf_store_bf16_at(gm: *mut u16, buf: UbBuf, off: u32, count: u32);
+    // Fill a buffer with a scalar constant (AscendC::Duplicate)
+    pub fn __tile_buf_fill_f32(buf: UbBuf, val: f32, count: u32);
+    pub fn __tile_buf_fill_f16(buf: UbBuf, val: f32, count: u32);
+    pub fn __tile_buf_fill_bf16(buf: UbBuf, val: f32, count: u32);
+    pub fn __tile_pipe_barrier();
+
+    // INTRA-UB COPY, CAST AND COMPARE. These were the top of a measured queue: lifting the
+    // hand-written corpus produced 94 distinct `__tile_*` calls of which 45 were undeclared,
+    // and these eight are the ones whose emitted call site is unambiguous. Argument order is
+    // quoted from the emitter, not inferred:
+    //   __tile_copy_ub_f32(buf_gf, buf_gs, (P) as u32)
+    //   __tile_cast_bf16_to_f32(buf_gf, buf_gs, (P) as u32)
+    //   __tile_cast_f32_to_bf16(buf_as, buf_v, (Demote__n) as u32)
+    //   __tile_cast_f16_to_i8(buf_os, buf_hs, (n) as u32)
+    //   __tile_add_i32(buf_cur, buf_cur, buf_b_hi_, PrepChunk__n2 as u32)
+    //   __tile_v_silu_f32(buf_b_res_, buf_b_tmp_, (uint32_t)(tl * RunBlock__cw))
+    //   __tile_compare_gt_f32(buf_m0, buf_cur, buf_acc, WonMask__n as u32)
+    //   __tile_compare_eq_f16(buf_b_mask2_, buf_cv_view1617, buf_cv_view1617, WonMask__n as u32)
+    pub fn __tile_copy_ub_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_bf16_to_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_f32_to_bf16(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_f16_to_i8(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_add_i32(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
+    pub fn __tile_v_silu_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_compare_gt_f32(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
+    pub fn __tile_compare_eq_f16(dst: UbBuf, a: UbBuf, b: UbBuf, n: u32);
+
+    // THE BITS-REINTERPRET HELPERS ARE SCALAR, not buffer ops: each takes one u32 of bits and
+    // returns the f32 it represents, which is how the emitter writes a typed zero/pattern
+    // constant into a `Duplicate`. Declaring these as buffer ops would have compiled and then
+    // been wrong at every call site.
+    //   (tile_std::__tile_bits_as_f32(((0)) as u32)) as f32
+    pub fn __tile_bits_as_f32(bits: u32) -> f32;
+    pub fn __tile_bf16_bits_as_f32(bits: u32) -> f32;
+    pub fn __tile_f16_bits_as_f32(bits: u32) -> f32;
+
+    // Remainder of the cast/copy/compare families the emitter emits, each quoted from its call:
+    //   __tile_copy_f32(buf_pos_s, buf_b_pat_, cp as u32)
+    //   __tile_cast_f32_to_i32(buf_res, buf_red, (TailReduce__cnt) as u32)
+    //   __tile_cast_i32_to_f32(buf_pat, buf_pi, 2*(pitch_ as u32))
+    //   __tile_duplicate_u8(buf_ev, (0x55555555), ((n2max as u32)+31)/32*32)
+    //   __tile_compare_scalar_eq_i32(buf_b_m1_, buf_acc, WonMask__val, WonMask__n as u32)
+    pub fn __tile_copy_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_f32_to_i32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_cast_i32_to_f32(dst: UbBuf, src: UbBuf, count: u32);
+    pub fn __tile_duplicate_u8(buf: UbBuf, val: u32, count: u32);
+    pub fn __tile_compare_scalar_eq_i32(dst: UbBuf, src: UbBuf, scalar: u32, n: u32);
+
+    // Reduce operations (f32)
+    pub fn __tile_v_reduce_max_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+    pub fn __tile_reduce_min_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+    pub fn __tile_v_reduce_sum_f32(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+
+    // Unary vector operations (f32)
+    pub fn __tile_v_exp_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_v_abs_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_ln_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_v_sqrt_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_v_rsqrt_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_reciprocal_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sign_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_round_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sq_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_ceil_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_floor_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_trunc_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sin_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cos_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_atan_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_erf_f32(dst: UbBuf, src: UbBuf, n: u32);
+
+    // Elementwise math `mlir_to_msl` lowers from its own op table, which gives
+    // both the Metal expression and the operand count — `acos` and friends at 1,
+    // `pow`/`fmod` at 2. Declared in the buffer convention because that is what
+    // their table-neighbours atan and erf already use, so the shape follows the
+    // siblings the same emitter handles rather than a guess.
+    pub fn __tile_acos_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_asin_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cbrt_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cosh_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sinh_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_square_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_pow_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_fmod_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_erfinv_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_fast_gelu_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_not_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_v_softplus_f32(dst: UbBuf, src: UbBuf, n: u32);
+
+    // Scalar-vector operations (f32)
+    pub fn __tile_adds_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_muls_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_maxs_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_mins_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+
+    // Binary vector operations (f32)
+    pub fn __tile_v_add_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_v_sub_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_v_mul_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_v_div_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_v_min_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_v_max_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_and_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_or_f32(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+
+    // Binary vector operations (f16)
+    pub fn __tile_v_add_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_sub_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_v_mul_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_div_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_min_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_max_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_and_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_or_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+
+    // Unary vector operations (f16)
+    pub fn __tile_v_exp_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_v_abs_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_ln_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sqrt_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_rsqrt_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_reciprocal_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sign_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_round_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sq_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_ceil_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_floor_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_trunc_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sin_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cos_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_atan_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_erf_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_acos_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_asin_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cbrt_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cosh_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sinh_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_square_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_pow_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_fmod_f16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_erfinv_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_fast_gelu_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_not_f16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_softplus_f16(dst: UbBuf, src: UbBuf, n: u32);
+
+    // Scalar-vector operations (f16)
+    // Note: scalar parameter is f32 because AscendC Adds/Muls accept float scalars
+    // even for half-precision tensors.
+    pub fn __tile_adds_f16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_muls_f16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_maxs_f16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_mins_f16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+
+    // Reduce operations (f16)
+    pub fn __tile_reduce_max_f16(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+    pub fn __tile_reduce_min_f16(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+    pub fn __tile_reduce_sum_f16(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+
+    // Binary vector operations (bf16) — same physical layout as f16 (u16)
+    pub fn __tile_add_bf16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_sub_bf16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_mul_bf16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_div_bf16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_min_bf16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+    pub fn __tile_max_bf16(dst: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+
+    // Unary vector operations (bf16)
+    pub fn __tile_exp_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_abs_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_ln_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sqrt_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_rsqrt_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_reciprocal_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sign_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_round_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sq_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_ceil_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_floor_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_trunc_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_sin_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cos_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_neg_bf16(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_not_bf16(dst: UbBuf, src: UbBuf, n: u32);
+
+    // Scalar-vector operations (bf16)
+    pub fn __tile_adds_bf16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_muls_bf16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_maxs_bf16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_mins_bf16(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+
+    // Reduce operations (bf16)
+    pub fn __tile_reduce_max_bf16(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+    pub fn __tile_reduce_sum_bf16(dst: UbBuf, src: UbBuf, work: UbBuf, n: u32) -> f32;
+
+    // Duplicate (bf16)
+    pub fn __tile_duplicate_bf16(dst: UbBuf, scalar: f32, n: u32);
+
+    // =========================================================================
+    // Cube engine (matrix multiply) operations
+    // =========================================================================
+    //
+    // The cube engine performs matrix multiply-accumulate (Mmad) using dedicated
+    // L0A/L0B/L0C memory. Data flows through: GM → L1 → L0A/L0B → Mmad → L0C.
+    //
+    // Buffer positions:
+    //   L1 (CBUF)  - Shared staging area between GM and L0
+    //   L0A        - Matrix A input buffer (left operand)
+    //   L0B        - Matrix B input buffer (right operand)
+    //   L0C        - Accumulator output buffer (FP32)
+
+    // Cube buffer allocation — returns buffer ID for the specified memory level
+    pub fn __tile_buf_alloc_l1(elem_count: u32) -> L1Buf;
+    pub fn __tile_buf_alloc_l0a(elem_count: u32) -> L0aBuf;
+    pub fn __tile_buf_alloc_l0b(elem_count: u32) -> L0bBuf;
+    pub fn __tile_buf_alloc_l0c(elem_count: u32) -> L0cBuf;
+
+    // Data movement for cube pipeline
+    pub fn __tile_load_gm_to_l1_f16(l1_buf: L1Buf, gm: *const u16, count: u32);
+    pub fn __tile_copy_l1_to_l0a_f16(l0a_buf: L0aBuf, l1_buf: L1Buf, count: u32);
+    pub fn __tile_copy_l1_to_l0b_f16(l0b_buf: L0bBuf, l1_buf: L1Buf, count: u32);
+    pub fn __tile_copy_l0c_to_ub_f32(ub_buf: UbBuf, l0c_buf: L0cBuf, count: u32);
+
+    // Matrix multiply-accumulate: C[m,n] += A[m,k] * B[k,n]
+    // A, B are f16 in L0A/L0B; C is f32 in L0C.
+    // init: 1 = zero-initialize C before multiply, 0 = accumulate onto existing C
+    pub fn __tile_mmad_f16(
+        c_l0c: L0cBuf,
+        a_l0a: L0aBuf,
+        b_l0b: L0bBuf,
+        m: u32,
+        k: u32,
+        n: u32,
+        init: u32,
+    );
+
+    // L1 → L0A/L0B copy with LoadData2dParams (supports hardware transpose)
+    // repeat_times: number of 16x16 fractal repeats
+    // src_stride: stride between fractal blocks in source
+    // transpose: 1 = transpose during copy, 0 = normal
+    pub fn __tile_copy_l1_to_l0a_f16_2d(
+        l0a_buf: L0aBuf,
+        l1_buf: L1Buf,
+        repeat_times: u32,
+        src_stride: u32,
+        transpose: u32,
+    );
+    pub fn __tile_copy_l1_to_l0b_f16_2d(
+        l0b_buf: L0bBuf,
+        l1_buf: L1Buf,
+        repeat_times: u32,
+        src_stride: u32,
+        transpose: u32,
+    );
+
+    // Extended Mmad: exposes enBias, enATranspose, enBTranspose from MmadParams
+    pub fn __tile_mmad_f16_ex(
+        c_l0c: L0cBuf,
+        a_l0a: L0aBuf,
+        b_l0b: L0bBuf,
+        m: u32,
+        k: u32,
+        n: u32,
+        init: u32,
+        en_bias: u32,
+        transpose_a: u32,
+        transpose_b: u32,
+    );
+
+    // GM→L1 with ND→NZ format conversion (for multi-fractal matrices)
+    // height/width are matrix dimensions (in elements). Rearranges from row-major to
+    // column-major fractal layout. For 16×16 matrices, equivalent to flat DataCopy.
+    pub fn __tile_load_gm_to_l1_nd2nz_f16(l1_buf: L1Buf, gm: *const u16, height: u32, width: u32);
+
+    // L0C→UB with BLOCK_MODE_MATRIX (takes m, n separately for proper blockCount/blockLen)
+    pub fn __tile_copy_l0c_to_ub_f32_matrix(ub_buf: UbBuf, l0c_buf: L0cBuf, m: u32, n: u32);
+
+    // UB→GM with NZ→ND format conversion (for multi-fractal f32 matrices)
+    // m/n are output matrix dimensions. Rearranges from fractal to row-major layout.
+    pub fn __tile_store_ub_to_gm_nz2nd_f32(gm: *mut f32, ub_buf: UbBuf, m: u32, n: u32);
+
+    // Complete cube matmul pipeline: C[m,n] = A[m,k] × B[k,n] (f16→f32)
+    // Generates the full reference-style code including:
+    //   CopyND2NZ for GM→L1, SplitA loop, B-split loop with per-nBlock
+    //   SplitB/Compute/Aggregate, and NZ→ND CopyOut.
+    // This is a "macro intrinsic" — expanded by codegen into complete C++ code.
+    pub fn __tile_matmul_cube(c: *mut f32, a: *const u16, b: *const u16, m: u32, k: u32, n: u32);
+
+    // Type casting (f16 <-> f32)
+    pub fn __tile_cast_f16_to_f32(dst: UbBuf, src: UbBuf, n: u32);
+    pub fn __tile_cast_f32_to_f16(dst: UbBuf, src: UbBuf, n: u32);
+
+    // Vector fill/duplicate
+    pub fn __tile_duplicate_f32(dst: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_duplicate_f16(dst: UbBuf, scalar: f32, n: u32);
+
+    // Scalar element access (GetValue / SetValue)
+    pub fn __tile_get_value_f32(buf: UbBuf, idx: u32) -> f32;
+    pub fn __tile_get_value_f16(buf: UbBuf, idx: u32) -> u16;
+    pub fn __tile_get_value_i32(buf: UbBuf, idx: u32) -> i32;
+    pub fn __tile_get_value_u32(buf: UbBuf, idx: u32) -> u32;
+    pub fn __tile_set_value_f32(buf: UbBuf, idx: u32, val: f32);
+    pub fn __tile_set_value_f16(buf: UbBuf, idx: u32, val: u16);
+    pub fn __tile_set_value_i32(buf: UbBuf, idx: u32, val: i32);
+    pub fn __tile_set_value_u32(buf: UbBuf, idx: u32, val: u32);
+
+    // Compare / Select (conditional vector ops)
+    pub fn __tile_compare_scalar_eq_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_compare_scalar_lt_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_compare_scalar_gt_f32(dst: UbBuf, src: UbBuf, scalar: f32, n: u32);
+    pub fn __tile_select_f32(dst: UbBuf, sel: UbBuf, src1: UbBuf, src2: UbBuf, n: u32);
+
+    // Buffer load/store for integer types
+    pub fn __tile_buf_load_i32(buf: UbBuf, gm: *const i32, count: u32);
+    pub fn __tile_buf_store_i32(gm: *mut i32, buf: UbBuf, count: u32);
+    pub fn __tile_buf_load_u32(buf: UbBuf, gm: *const u32, count: u32);
+    pub fn __tile_buf_store_u32(gm: *mut u32, buf: UbBuf, count: u32);
+    // THE OFFSET FORM EXTENDS TO `Duplicate` AND THE i8 STORE. Signatures read off the
+    // emitter's call sites in the lifted corpus, not inferred:
+    //   __tile_duplicate_f16_at(buf_src, (lenp) as u32, 0.0_f32, (p512 as u32) - (lenp as u32))
+    //   __tile_buf_store_i8_at(y.wrapping_add(...) as *mut i8, buf_os, ...)
+    pub fn __tile_duplicate_f32_at(buf: UbBuf, off: u32, val: f32, count: u32);
+    pub fn __tile_duplicate_f16_at(buf: UbBuf, off: u32, val: f32, count: u32);
+    pub fn __tile_duplicate_bf16_at(buf: UbBuf, off: u32, val: f32, count: u32);
+    pub fn __tile_buf_store_i8_at(gm: *mut i8, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_i32_at(buf: UbBuf, off: u32, gm: *const i32, count: u32);
+    pub fn __tile_buf_store_i32_at(gm: *mut i32, buf: UbBuf, off: u32, count: u32);
+    pub fn __tile_buf_load_u32_at(buf: UbBuf, off: u32, gm: *const u32, count: u32);
+    pub fn __tile_buf_store_u32_at(gm: *mut u32, buf: UbBuf, off: u32, count: u32);
+}
+
+// ---------------------------------------------------------------------------
+// ascend_-prefixed wrappers for kernel_ops composite functions
+// (These delegate to kernel_ops:: implementations so that generated code
+//  can call `tile_std::__tile_v_relu_f32(...)` uniformly.)
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+pub unsafe fn __tile_v_relu_f32(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::relu_f32(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_relu_f16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::relu_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_sigmoid_f32(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::sigmoid_f32(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_sigmoid_f16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::sigmoid_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_tanh_f32(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::tanh_f32(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_tanh_f16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::tanh_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_neg_f32(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::neg_f32(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_neg_f16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::neg_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_expm1_f32(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::expm1_f32(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_expm1_f16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::expm1_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_gelu_f32(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        let mut d = dst;
+        let mut tmp = __tile_buf_alloc(n);
+        kernel_ops::gelu_f32(&mut d, &src, &mut tmp, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_v_gelu_f16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        let mut d = dst;
+        let mut tmp = __tile_buf_alloc(n);
+        kernel_ops::gelu_f16(&mut d, &src, &mut tmp, n);
+    }
+}
+
+// bf16 composite wrappers — delegate to f16 implementations
+// (bf16 uses the same u16 physical representation)
+#[inline(always)]
+pub unsafe fn __tile_relu_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::relu_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_sigmoid_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::sigmoid_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_tanh_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::tanh_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_expm1_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        kernel_ops::expm1_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_gelu_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        let mut d = dst;
+        let mut tmp = __tile_buf_alloc(n);
+        kernel_ops::gelu_f16(&mut d, &src, &mut tmp, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_fast_gelu_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    // fast_gelu delegates to gelu for bf16
+    unsafe {
+        __tile_gelu_bf16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_softplus_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    // softplus(x) = ln(1 + exp(x)) — delegate to f32 version
+    unsafe {
+        kernel_ops::softplus_f32(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_atan_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        __tile_atan_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_erf_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        __tile_erf_f16(dst, src, n);
+    }
+}
+#[inline(always)]
+pub unsafe fn __tile_erfinv_bf16(dst: UbBuf, src: UbBuf, n: u32) {
+    unsafe {
+        __tile_erfinv_f16(dst, src, n);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time capacity guard (F1), no_core-safe.
+//
+// A trait bound that resolves only when the budget condition holds. When a tile
+// footprint exceeds the declared budget the bound BudgetCheck<false>: BudgetOk
+// fails to resolve — a TYPE error at compile time, with no panic/unwind path
+// (kernels are no_std/no_core, where a message-assert would need the panic
+// lang item). The #[tile_kernel(budget=..)] macro emits one bound per view.
+// ---------------------------------------------------------------------------
+pub struct BudgetCheck<const OK: bool>;
+pub trait BudgetOk {}
+impl BudgetOk for BudgetCheck<true> {}

@@ -1,0 +1,11 @@
+# tile_cli pins STABLE, deliberately and separately from the repo root.
+#
+# The root rust-toolchain.toml pins nightly-2025-08-04 because tile_std is
+# `#![no_core]` and only that nightly's matching codegen backend satisfies its
+# intrinsics. rustup resolves the pin by walking UP from the working directory, so
+# without this file the CLI would silently inherit a frozen year-old nightly.
+#
+# `tile` is ordinary Rust and must build on six target triples for users who have
+# never heard of the codegen backend. It tracks stable.
+[toolchain]
+channel = "stable"

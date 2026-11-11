@@ -1,0 +1,11 @@
+[package]
+name = "tile_std"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+[lib]
+test = false
+
+[dependencies]
+tile_std_macros = { path = "../tile_std_macros" }

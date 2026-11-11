@@ -1,0 +1,9 @@
+#include "kernel_operator.h"
+using namespace AscendC;
+
+class KernelSoftmax {
+public:
+    __aicore__ inline void Process() {
+        Exp(outLocal, inLocal, 1024);
+    }
+};

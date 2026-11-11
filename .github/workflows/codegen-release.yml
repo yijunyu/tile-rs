@@ -1,0 +1,337 @@
+name: Codegen Release
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Builds the prebuilt tile-rs Rust→MLIR codegen backend (librustc_codegen_tile +
+# libtile_std_macros) and publishes per-platform tarballs as a Release on THIS
+# repo (yijunyu/tile-rs), where install.sh points.
+#
+# THIS WORKFLOW LIVES + RUNS IN THE PUBLIC tile-rs REPO. That is deliberate, and
+# it is the cargo-slicer pattern (yijunyu/cargo-slicer builds nightly rustc
+# drivers from the private yijunyu/precc the same way):
+#
+#   * Actions on a PUBLIC repo are FREE and immune to the account spending-limit /
+#     failed-payment gate that blocks private-repo runners — incl. macOS runners.
+#   * The codegen SOURCE is private (it links rustc internals and is not open),
+#     so the build checks out the private source repo onto the ephemeral runner
+#     via a READ-only PAT, builds, and uploads ONLY the binary tarball. No source
+#     is ever published.
+#   * The release is created IN THIS repo, so the default GITHUB_TOKEN suffices —
+#     no cross-repo write PAT needed.
+#
+# ── REQUIRED SECRET (read the private source) ────────────────────────────────
+#   Name : PRIVATE_SOURCE_TOKEN
+#   Scope: Contents: Read on yijunyu/ascend-rs-priv (the private codegen source)
+#          (fine-grained PAT limited to that one repo; classic PAT `repo` works too)
+#   Add  : gh secret set PRIVATE_SOURCE_TOKEN --repo yijunyu/tile-rs
+#
+# The checkout step fails fast if the secret is absent/under-scoped.
+#
+# Source of truth: this file is maintained in the PRIVATE repo at
+# ci/tile-rs-public/codegen-release.yml and deployed here via deploy.toml. Edit it
+# there, not in the public tree.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 0.0.1 (the tag becomes v<version>+nightly-2025-08-04)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release'
+        required: false
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*nightly-*'
+
+permissions:
+  contents: write   # publish the Release in THIS repo via the default GITHUB_TOKEN
+
+env:
+  RUST_BACKTRACE: 1
+  RUST_TOOLCHAIN: nightly-2025-08-04
+  PRIVATE_SOURCE_REPO: yijunyu/ascend-rs-priv
+  PRIVATE_SOURCE_REF: main
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            ext: dylib
+            bundle: macos
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            ext: so
+            bundle: linux
+    env:
+      TRIPLE: ${{ matrix.triple }}
+      EXT: ${{ matrix.ext }}
+    steps:
+      - name: Free disk space (linux)
+        if: matrix.bundle == 'linux'
+        run: |
+          set -uo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+
+      - name: Checkout PRIVATE codegen source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPO }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          # Checkout into the workspace root; tile-rs's own tree is not needed to build.
+
+      - name: Derive version + ABI tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"; VERSION="${TAG#v}"; VERSION="${VERSION%%+*}"
+          else
+            VERSION="${{ github.event.inputs.version }}"; VERSION="${VERSION#v}"
+            TAG="v${VERSION}+${RUST_TOOLCHAIN}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
+          echo "Building version=$VERSION tag=$TAG for $TRIPLE"
+
+      - name: Pin toolchain (nightly-2025-08-04 + rustc-dev + llvm-tools)
+        run: |
+          set -euo pipefail
+          cat > rust-toolchain.toml << 'TOML'
+          [toolchain]
+          channel = "nightly-2025-08-04"
+          components = ["rustc", "cargo", "rust-src", "rustc-dev", "llvm-tools", "rustfmt"]
+          TOML
+          rustup show active-toolchain || rustup toolchain install nightly-2025-08-04 \
+            --component rustc-dev --component llvm-tools --component rust-src
+          rustc +nightly-2025-08-04 --version
+
+      - name: Install LLVM 20 (macOS / brew)
+        if: matrix.bundle == 'macos'
+        run: |
+          set -euo pipefail
+          brew install llvm@20 zstd
+          echo "LLVM20_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+          echo "ZSTD_PREFIX=$(brew --prefix zstd)"       >> "$GITHUB_ENV"
+          echo "LIBPATH=/opt/homebrew/lib"               >> "$GITHUB_ENV"
+
+      - name: Install LLVM/MLIR 20 (linux / apt.llvm.org)
+        if: matrix.bundle == 'linux'
+        run: |
+          set -euo pipefail
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 20
+          sudo apt-get install -y --no-install-recommends \
+            llvm-20-dev libmlir-20-dev mlir-20-tools libzstd-dev patchelf
+          echo "LLVM20_PREFIX=/usr/lib/llvm-20"   >> "$GITHUB_ENV"
+          echo "LIBPATH=/usr/lib/llvm-20/lib"     >> "$GITHUB_ENV"
+
+      - name: Build rustc_codegen_tile + tile_std_macros
+        env:
+          MLIR_SYS_200_PREFIX: ${{ env.LLVM20_PREFIX }}
+          LLVM_SYS_200_PREFIX: ${{ env.LLVM20_PREFIX }}
+          TABLEGEN_200_PREFIX: ${{ env.LLVM20_PREFIX }}
+          LIBRARY_PATH: ${{ env.LIBPATH }}
+        run: |
+          set -euo pipefail
+          # Linux RISK: apt ships SHARED libLLVM-20.so (no static .a). If the
+          # vendored mlir-sys/tblgen build emits an empty rustc-link-lib (the 910c
+          # BUILD_SHARED_LIBS failure), it surfaces here — hence -v.
+          cargo +nightly-2025-08-04 build -v \
+            -p rustc_codegen_tile -p tile_std_macros --release
+          ls -lh "target/release/librustc_codegen_tile.${EXT}" "target/release/libtile_std_macros.${EXT}"
+
+      - name: Bundle + rewrite install names (macOS, the P0 fix)
+        if: matrix.bundle == 'macos'
+        run: |
+          set -euo pipefail
+          STAGE="staging/tile-rs-codegen-${TRIPLE}"
+          rm -rf staging && mkdir -p "$STAGE/lib" "$STAGE/.cargo"
+          BACKEND="$STAGE/lib/librustc_codegen_tile.dylib"
+          MACROS="$STAGE/lib/libtile_std_macros.dylib"
+          cp "target/release/librustc_codegen_tile.dylib" "$BACKEND"
+          cp "target/release/libtile_std_macros.dylib"    "$MACROS"
+
+          MLIR_SRC="$LLVM20_PREFIX/lib/libMLIR.dylib"
+          LLVM_SRC="$LLVM20_PREFIX/lib/libLLVM.dylib"
+          if [ -f "$ZSTD_PREFIX/lib/libzstd.1.dylib" ]; then ZSTD_SRC="$ZSTD_PREFIX/lib/libzstd.1.dylib";
+          else ZSTD_SRC="$(find "$ZSTD_PREFIX/lib" -name 'libzstd.*.dylib' | head -1)"; fi
+          for f in "$MLIR_SRC" "$LLVM_SRC" "$ZSTD_SRC"; do
+            [ -f "$f" ] || { echo "::error::missing bundle dependency: $f"; exit 1; }; done
+          cp "$MLIR_SRC" "$STAGE/lib/libMLIR.dylib"
+          cp "$LLVM_SRC" "$STAGE/lib/libLLVM.dylib"
+          cp "$ZSTD_SRC" "$STAGE/lib/libzstd.1.dylib"
+          chmod u+w "$STAGE"/lib/*.dylib
+          ZSTD_BASENAME="$(basename "$ZSTD_SRC")"
+          rewrite() {
+            local target="$1"
+            install_name_tool -id "@loader_path/$(basename "$target")" "$target" 2>/dev/null || true
+            otool -L "$target" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+              case "$dep" in /usr/lib/*|/System/*|@loader_path/*) continue ;; esac
+              local base; base="$(basename "$dep")"
+              case "$base" in libMLIR.dylib|libLLVM.dylib|libzstd*.dylib)
+                install_name_tool -change "$dep" "@loader_path/$base" "$target" ;; esac
+            done
+          }
+          rewrite "$STAGE/lib/libLLVM.dylib"; rewrite "$STAGE/lib/libMLIR.dylib"
+          rewrite "$BACKEND"; rewrite "$MACROS"
+          [ "$ZSTD_BASENAME" != "libzstd.1.dylib" ] && cp "$STAGE/lib/libzstd.1.dylib" "$STAGE/lib/$ZSTD_BASENAME" || true
+          for f in "$STAGE"/lib/*.dylib; do codesign --remove-signature "$f" 2>/dev/null || true; codesign -s - -f "$f"; done
+          if otool -L "$STAGE"/lib/*.dylib | grep -E '/opt/homebrew|/usr/local/(opt|Cellar)'; then
+            echo "::error::a homebrew abspath survived the rpath rewrite"; exit 1; fi
+          STRAY="$(otool -L "$BACKEND" | tail -n +2 | awk '{print $1}' \
+                   | grep -vE '/usr/lib|/System|@loader_path|librustc_codegen_tile|librustc_driver' || true)"
+          [ -z "$STRAY" ] || { echo "::error::unexpected backend dep:"; echo "$STRAY"; exit 1; }
+          echo "macOS bundle OK: only external dep is the librustc_driver ABI pin."
+
+      - name: Bundle + patchelf $ORIGIN rpath (linux, the P0 fix)
+        if: matrix.bundle == 'linux'
+        run: |
+          set -euo pipefail
+          STAGE="staging/tile-rs-codegen-${TRIPLE}"
+          rm -rf staging && mkdir -p "$STAGE/lib" "$STAGE/.cargo"
+          BACKEND="$STAGE/lib/librustc_codegen_tile.so"
+          cp "target/release/librustc_codegen_tile.so" "$BACKEND"
+          cp "target/release/libtile_std_macros.so"    "$STAGE/lib/"
+          copy_dep() {
+            local p; p="$(ldd "$BACKEND" | awk -v n="$1" '$0 ~ n {print $3}' | head -1)"
+            if [ -n "$p" ] && [ -f "$p" ]; then cp -L "$p" "$STAGE/lib/$(basename "$p")"; echo "bundled $1 -> $(basename "$p")";
+            else
+              local f; f="$(find "$LLVM20_PREFIX/lib" /usr/lib/x86_64-linux-gnu -name "$1*.so*" 2>/dev/null | head -1)"
+              [ -n "$f" ] && { cp -L "$f" "$STAGE/lib/$(basename "$f")"; echo "bundled $1 (prefix) -> $(basename "$f")"; } || echo "::warning::$1 not found";
+            fi
+          }
+          copy_dep libMLIR; copy_dep libLLVM; copy_dep libzstd
+          for so in "$STAGE"/lib/*.so*; do patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true; done
+          echo "=== backend external deps ==="; ldd "$BACKEND" || true
+          if ldd "$STAGE"/lib/*.so 2>/dev/null | grep -q '/usr/lib/llvm-20'; then
+            echo "::error::an /usr/lib/llvm-20 abspath survived patchelf"; exit 1; fi
+          echo "linux bundle staged (external dep should be only the librustc_driver ABI pin)."
+
+      - name: Write .cargo/config.toml + USAGE.md
+        run: |
+          set -euo pipefail
+          STAGE="staging/tile-rs-codegen-${TRIPLE}"
+          cat > "$STAGE/.cargo/config.toml" << EOF
+          # tile-rs codegen backend — cargo config (ABI-pinned to nightly-2025-08-04)
+          [build]
+          rustflags = [
+            "-Zcodegen-backend=lib/librustc_codegen_tile.${EXT}",
+            "-Zcrate-attr=feature(register_tool)",
+            "-Zcrate-attr=register_tool(tile)",
+            "-Cpanic=abort",
+            "-Clto=off",
+          ]
+          [unstable]
+          EOF
+          RUNTIME_NOTE="bundled via an \\\`\$ORIGIN\\\` rpath (no apt llvm-20 needed at runtime)"
+          [ "$EXT" = "dylib" ] && RUNTIME_NOTE="bundled via \\\`@loader_path\\\` (no brew llvm@20 needed at runtime)"
+          cat > "$STAGE/USAGE.md" << EOF
+          # tile-rs codegen backend — prebuilt artifact ($TRIPLE)
+
+          Prebuilt **tile-rs Rust→MLIR codegen backend**: lower \`tile_std\` kernels to a
+          vendor source (CUDA / SPIR-V / Metal / AscendC / …) without building the
+          codegen from source. LLVM/MLIR 20 is $RUNTIME_NOTE.
+
+          ## ⚠ Toolchain ABI pin
+          \`librustc_codegen_tile.${EXT}\` links rustc internals and ONLY loads with:
+          \`\`\`
+          nightly-2025-08-04   →   rustc 1.91.0-nightly (f34ba774c 2025-08-03)
+          \`\`\`
+          \`\`\`sh
+          rustup toolchain install nightly-2025-08-04 \\
+            --component rustc-dev --component llvm-tools --component rust-src
+          rustup override set nightly-2025-08-04
+          \`\`\`
+
+          ## Emit a kernel
+          Pick the target with \`TILERS_CODEGEN_PATH\` (cuda / vulkan / metal / cpp / pto /
+          nki / aie / bang / gaudi / musa) and point rustc at the backend via the bundled
+          \`.cargo/config.toml\` or \`TILERS_CODEGEN_SO\`:
+          \`\`\`sh
+          export TILERS_CODEGEN_SO="\$PWD/lib/librustc_codegen_tile.${EXT}"
+          export TILERS_CODEGEN_PATH=cuda
+          cargo +nightly-2025-08-04 build --release   # kernel crate must be crate-type=["cdylib","lib"]
+          \`\`\`
+          (\`metal\` needs the Apple toolchain — use the aarch64-apple-darwin tarball.)
+          EOF
+          echo "Wrote .cargo/config.toml + USAGE.md"
+
+      - name: Create tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          TARBALL="tile-rs-codegen-${TRIPLE}.tar.gz"
+          tar -C staging -czf "$TARBALL" "tile-rs-codegen-${TRIPLE}"
+          ls -lh "$TARBALL"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tile-rs-codegen-${{ matrix.triple }}
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish Release on this repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t ASSETS < <(find dist -name 'tile-rs-codegen-*.tar.gz' -type f)
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "::error::no tarball assets found"; exit 1; }
+          echo "Assets: ${ASSETS[*]}   Tag: $TAG"
+          PRERELEASE_FLAG=""
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          NOTES="$(cat <<EOF
+          Prebuilt tile-rs Rust→MLIR codegen backend (per-platform tarballs).
+
+          - Self-contained LLVM/MLIR 20 (no system LLVM needed at runtime).
+          - **ABI-pinned to \`nightly-2025-08-04\`** (rustc 1.91.0-nightly f34ba774c) — the
+            backend only dlopens with that exact toolchain (\`rustc-dev\` + \`llvm-tools\` + \`rust-src\`).
+          - Unpack the tarball for your platform; see \`USAGE.md\`. Point rustc at
+            \`lib/librustc_codegen_tile.{so,dylib}\` (bundled \`.cargo/config.toml\` or
+            \`TILERS_CODEGEN_SO\`) and pick a target with \`TILERS_CODEGEN_PATH\`.
+
+          Platforms: \`aarch64-apple-darwin\`, \`x86_64-unknown-linux-gnu\`.
+          EOF
+          )"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "tile-rs codegen $VERSION ($RUST_TOOLCHAIN)" --notes "$NOTES" $PRERELEASE_FLAG
+          else
+            gh release create "$TAG" --title "tile-rs codegen $VERSION ($RUST_TOOLCHAIN)" --notes "$NOTES" $PRERELEASE_FLAG
+          fi
+          for a in "${ASSETS[@]}"; do gh release upload "$TAG" "$a" --clobber; done
+          echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG//+/%2B}"
