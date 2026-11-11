@@ -129,7 +129,9 @@ const KNOWN_INTRINSICS: &[&str] = &[
     "__tile_argmax_f",
     "__tile_argmin_f",
     "__tile_arith_progression_i32",
+    "__tile_attention_blocked_f32",
     "__tile_attention_causal_f32",
+    "__tile_attention_dyn_f32",
     "__tile_attention_f",
     "__tile_attention_gqa",
     "__tile_attention_partial_batched_f32",
@@ -2984,6 +2986,26 @@ fn analyze_body(
         }
         if line.contains("__tile_attention_sink_batched_f32") {
             translate_attention_sink_batched(line, ctx, func, &mut ops)?;
+            continue;
+        }
+        // The blocked and dyn decode forms take K/V as RAW GM POINTERS and stream
+        // them in blocks; the sink/f32 expansion below assumes the K/V are
+        // already loaded into tiles. Until the K/V block-streaming arm exists,
+        // say that instead of the misleading "unknown K tile %arg1".
+        if line.contains("__tile_attention_blocked_f32") || line.contains("__tile_attention_dyn_f32") {
+            let args = extract_call_args(line)
+                .ok_or_else(|| format!("attention: cannot parse args: {}", line))?;
+            let k = args.get(2).map(|s| s.trim()).unwrap_or("");
+            let v = args.get(3).map(|s| s.trim()).unwrap_or("");
+            if ctx.get_tile(k).is_none() || ctx.get_tile(v).is_none() {
+                return Err(format!(
+                    "attention: this form streams K/V from GM ({} / {}), but the PTO expansion \
+                     assumes pre-loaded K/V tiles. The K/V block-streaming arm is the missing \
+                     piece; emitting without it would drop the attention silently",
+                    k, v
+                ));
+            }
+            translate_attention(line, ctx, func, &mut ops)?;
             continue;
         }
         if line.contains("__tile_attention_sink_f32") {
