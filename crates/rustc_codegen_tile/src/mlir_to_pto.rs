@@ -4931,22 +4931,10 @@ fn translate_row_argminmax(
     //
     // Offsets are constants, so this is unrolled rather than an scf.for --
     // make_pv_at takes constant offsets and cols/nb is small (4 for the vocab).
-    // THE BLOCKED COMBINE IS NOT IMPLEMENTED, and emitting the loop below would
-    // be a silent wrong reduction: every block writes its LOCAL argmax into the
-    // same `dst`, so the result is the last block's index, not the row-global
-    // one (KNOWN_ISSUES item 2). The PTO has `trowargmax` (index + max value)
-    // but this emitter has no compare/select arm to fold `b*nb` across blocks.
-    // Refuse until that arm exists rather than ship the wrong artifact.
-    let _ = &pto_op;
-    return Err(format!(
-        "{} on a {}-column tile needs the blocked cross-block combine, which \
-         is not modelled: the per-block loop would write the last block's local \
-         argmax instead of the row-global one (KNOWN_ISSUES item 2). The block \
-         width picker and buffer reuse exist; the fold (compare/select + b*nb) \
-         does not",
-        pto_op, cols
-    ));
-    #[allow(unreachable_code)]
+    // THE FOLD (2026-11-11). Each block's local argmax goes into its own
+    // `dst_ty` tile (1x8, v_col=1) and its max into an 8-row col_major tile
+    // (rows*4 % 32 needs the pad; ptoas accepts v_row=rows). The result is then
+    // filled per row by a scalar select chain and `pto.tsetval`.
     let gm_name = tsrc.gm_name.clone().ok_or_else(|| {
         format!("{}: tile {} has no originating GM buffer to block over", pto_op, srcs[0])
     })?;
@@ -4956,35 +4944,88 @@ fn translate_row_argminmax(
     let tv = ctx.get_or_make_tv(&gm_name, rows, cols, dtype, ops);
     let blk_ty = tile_buf_type(rows, nb, dtype);
     let dst = ctx.alloc_tile_typed(&result_ssa, rows, 1, "i32", &dst_ty, ops);
-
-    // ONE block buffer and ONE scratch tile, allocated once and reused by every
-    // chunk. Allocating them inside the loop below made every chunk live at the
-    // same time -- `UbAllocator` is a bump allocator and the per-block SSA names
-    // are distinct, so nothing was reclaimed: at 154880 f32 (10 blocks of
-    // 15488) the first four 61952 B tiles already reached 248320 B and the
-    // emitter refused with "tile of 61952B at offset 186368B would use 248320B >
-    // UB_SIZE 196608B (C1)". Reuse bounds the live set at the 2*rows*nb*elem
-    // bytes `pick_argminmax_nb` budgets for, whatever the block count is. The
-    // blocks are sequentially dependent through these two tiles, so ptoas
-    // inserts the WAR/WAW sync between iterations.
     let blk = ctx.alloc_tile(&format!("{}__arg_blk", result_ssa), rows, nb, dtype, ops);
     let scratch = ctx.alloc_tile(&format!("{}__arg_tmp", result_ssa), rows, nb, dtype, ops);
+
+    let rows_pad = if dtype == "f32" {
+        ((rows + 7) / 8) * 8
+    } else {
+        ((rows + 15) / 16) * 16
+    };
+    let max_ty = format!(
+        "!pto.tile_buf<loc=vec, dtype={}, rows={}, cols=1, v_row={}, v_col=1, \
+         blayout=col_major, slayout=none_box, fractal=512, pad=0>",
+        dtype, rows_pad, rows
+    );
+
     ops.push(format!(
-        "// --- blocked {}: {} blocks of {} over {} ---",
+        "// --- blocked {}: {} blocks of {} over {} (cross-block fold) ---",
         pto_op, n_blocks, nb, cols
     ));
+    let mut idx_tiles: Vec<String> = Vec::new();
+    let mut max_tiles: Vec<String> = Vec::new();
     for b in 0..n_blocks {
+        let idx_b = ctx.alloc_tile_typed(
+            &format!("{}__arg_idx{}", result_ssa, b), rows, 1, "i32", &dst_ty, ops);
+        let max_b = ctx.alloc_tile_typed(
+            &format!("{}__arg_max{}", result_ssa, b), rows_pad, 1, dtype, &max_ty, ops);
         let pv = ctx.make_pv_at(&tv, rows, nb, dtype, 0, b * nb, ops);
         ops.push(format!(
             "pto.tload ins({} : {}) outs({} : {})",
-            pv,
-            ptv_type(rows, nb, dtype),
-            blk,
-            blk_ty
+            pv, ptv_type(rows, nb, dtype), blk, blk_ty
         ));
         ops.push(format!(
             "{} ins({}, {} : {}, {}) outs({} : {})",
-            pto_op, blk, scratch, blk_ty, blk_ty, dst, dst_ty
+            pto_op, blk, scratch, blk_ty, blk_ty, idx_b, dst_ty
+        ));
+        ops.push(format!(
+            "pto.trowmax ins({}, {} : {}, {}) outs({} : {})",
+            blk, scratch, blk_ty, blk_ty, max_b, max_ty
+        ));
+        idx_tiles.push(idx_b);
+        max_tiles.push(max_b);
+    }
+
+    for r in 0..rows {
+        let c_r = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant {} : index", c_r, r));
+        let c_r8 = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant {} : index", c_r8, r * 8));
+        let mut best_v = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant -3.4e38 : f32", best_v));
+        let mut best_i = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant 0 : i32", best_i));
+        for b in 0..n_blocks {
+            let v = ctx.fresh_ssa();
+            ops.push(format!(
+                "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> f32",
+                v, max_tiles[b as usize], c_r, max_ty
+            ));
+            let i = ctx.fresh_ssa();
+            ops.push(format!(
+                "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> i32",
+                i, idx_tiles[b as usize], c_r8, dst_ty
+            ));
+            let gt = ctx.fresh_ssa();
+            ops.push(format!("{} = arith.cmpf ogt, {}, {} : f32", gt, v, best_v));
+            let bnb = ctx.fresh_ssa();
+            ops.push(format!("{} = arith.constant {} : i32", bnb, b * nb));
+            let loc = ctx.fresh_ssa();
+            ops.push(format!("{} = arith.addi {}, {} : i32", loc, i, bnb));
+            let nv = ctx.fresh_ssa();
+            ops.push(format!("{} = arith.select {}, {}, {} : f32", nv, gt, v, best_v));
+            let ni = ctx.fresh_ssa();
+            ops.push(format!("{} = arith.select {}, {}, {} : i32", ni, gt, loc, best_i));
+            best_v = nv;
+            best_i = ni;
+        }
+        let bi = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.index_cast {} : i32 to index", bi, best_i));
+        let off = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant {} : i64", off, r * 8));
+        ops.push(format!(
+            "\"pto.tsetval\"({}, {}, {}) : ({}, index, i64) -> ()",
+            dst, bi, off, dst_ty
         ));
     }
     Ok(())
