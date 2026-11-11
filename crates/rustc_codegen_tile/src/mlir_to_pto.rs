@@ -2990,21 +2990,70 @@ fn analyze_body(
             continue;
         }
         // The blocked and dyn decode forms take K/V as RAW GM POINTERS and stream
-        // them in blocks; the sink/f32 expansion below assumes the K/V are
-        // already loaded into tiles. Until the K/V block-streaming arm exists,
-        // say that instead of the misleading "unknown K tile %arg1".
-        if line.contains("__tile_attention_blocked_f32") || line.contains("__tile_attention_dyn_f32") {
+        // them in blocks. `emit_attention_blocked` already IS that arm: it loads
+        // one [SB x D] K block, folds the softmax with a running max and sum, and
+        // holds nothing proportional to S — which is exactly why the one-shot
+        // path above falls back to it when the working set overflows UB. What was
+        // missing was only the ROUTING: this branch refused because K/V were not
+        // tiles, when the right answer is to pick a block and stream.
+        // `__tile_attention_dyn_f32` is NOT this arm. Its fifth operand is a TILE
+        // holding S at runtime (Kimi's `.tile` passes a loaded 1x1 `%st`), so it
+        // needs a real `scf.for` over a block count known only at run time, with
+        // dynamic partition-view offsets. `emit_attention_blocked` unrolls at emit
+        // time precisely because S is a compile-time constant here, so routing
+        // dyn into it would either mis-read the S operand or emit a wrong loop.
+        // Keep the refusal, and name the actual gap so the next reader does not
+        // go looking for a K/V-streaming arm that now exists.
+        if line.contains("__tile_attention_dyn_f32") {
+            return Err(
+                "attention_dyn: S is a runtime tile operand, so the K/V streaming loop \
+                 cannot be unrolled at emit time. The static `__tile_attention_blocked_f32` \
+                 form IS emitted (streaming, block unrolled); dyn needs a dynamic `scf.for` \
+                 with runtime view offsets, which this emitter does not build for attention."
+                    .to_string(),
+            );
+        }
+        if line.contains("__tile_attention_blocked_f32") {
             let args = extract_call_args(line)
                 .ok_or_else(|| format!("attention: cannot parse args: {}", line))?;
             let k = args.get(2).map(|s| s.trim()).unwrap_or("");
             let v = args.get(3).map(|s| s.trim()).unwrap_or("");
             if ctx.get_tile(k).is_none() || ctx.get_tile(v).is_none() {
-                return Err(format!(
-                    "attention: this form streams K/V from GM ({} / {}), but the PTO expansion \
-                     assumes pre-loaded K/V tiles. The K/V block-streaming arm is the missing \
-                     piece; emitting without it would drop the attention silently",
-                    k, v
-                ));
+                // (dst, q, k, v, S, D) — K and V are GM pointers in this form.
+                if args.len() < 6 {
+                    return Err(format!(
+                        "attention: blocked form expected 6 args, got {}",
+                        args.len()
+                    ));
+                }
+                let result_ssa = extract_result_ssa(line).unwrap_or_else(|| "__att_out".to_string());
+                let q_arg = args[1].trim();
+                let q_gm = ctx
+                    .get_tile(q_arg)
+                    .and_then(|t| t.gm_name.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "attention: blocked form needs a GM-backed Q tile, {} is not",
+                            q_arg
+                        )
+                    })?;
+                let k_res = ctx.resolve_ptr(k);
+                let v_res = ctx.resolve_ptr(v);
+                let k_gm = resolve_gm_name(&k_res, func);
+                let v_gm = resolve_gm_name(&v_res, func);
+                let s = ctx.resolve_const(args[4].trim());
+                let d = ctx.resolve_const(args[5].trim());
+                let sb = pick_s_block(s, d).ok_or_else(|| {
+                    format!(
+                        "attention: blocked form at S={} x D={} has no S-block that fits the \
+                         AIV unified buffer; a single row of D must still fit, which caps D",
+                        s, d
+                    )
+                })?;
+                emit_attention_blocked(
+                    ctx, &mut ops, &result_ssa, &q_gm, &k_gm, &v_gm, None, s, d, sb, None, false,
+                )?;
+                continue;
             }
             translate_attention(line, ctx, func, &mut ops)?;
             continue;
