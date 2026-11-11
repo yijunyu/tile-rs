@@ -1749,6 +1749,15 @@ impl UbAllocator {
     /// Returns the (in-bounds, aligned) UB byte offset.
     fn place(&mut self, bytes: usize) -> Result<u64, String> {
         let base = (self.cursor + self.fractal - 1) / self.fractal * self.fractal; // align_up (C5)
+        if std::env::var_os("TILE_PTO_UB_TRACE").is_some() {
+            eprintln!(
+                "UB place {}B at {}B (cursor {}){}",
+                bytes,
+                base,
+                self.cursor,
+                if base + bytes > self.ub_size { "  <-- OVERFLOW" } else { "" }
+            );
+        }
         let end = base + bytes;
         if end > self.ub_size {
             return Err(format!(
@@ -4882,6 +4891,17 @@ const ARGMINMAX_UB_BUDGET_BYTES: u64 = UB_TILE_BUDGET_BYTES;
 
 /// Largest divisor of `cols` whose source+scratch pair fits the UB budget.
 fn pick_argminmax_nb(rows: u32, cols: u32, dtype: &str) -> Option<u32> {
+    // Debug lever, same role as TILE_PTO_ATTN_SB for attention: force the block
+    // width so the blocked argminmax plan can be exercised (and its UB cost
+    // measured) without editing the budget arithmetic. Ignored unless it divides
+    // `cols`, so it can never emit a plan with a ragged tail.
+    if let Ok(v) = std::env::var("TILE_PTO_ARGMINMAX_NB") {
+        if let Ok(nb) = v.parse::<u32>() {
+            if nb > 0 && cols % nb == 0 {
+                return Some(nb);
+            }
+        }
+    }
     let elem_bytes: u64 = match dtype {
         "f32" => 4,
         "f16" | "bf16" => 2,
@@ -5021,13 +5041,42 @@ fn translate_row_argminmax(
         "// --- blocked {}: {} blocks of {} over {} (cross-block fold) ---",
         pto_op, n_blocks, nb, cols
     ));
-    let mut idx_tiles: Vec<String> = Vec::new();
-    let mut max_tiles: Vec<String> = Vec::new();
+    // The per-block index/max tiles are REUSED, and the fold runs inside the
+    // block loop. Keeping one pair per block was the earlier shape and it put
+    // this kernel exactly on the UB ceiling: ptoas bank-aligns every allocation
+    // to 512 B, so 128 blocks x 2 x 32 B tiles cost 131072 B of alignment for
+    // 8192 B of data — 2 x 8 x 1024 x 4 B of block+scratch (65536) plus 131072
+    // is 196608, precisely UB_SIZE, and the very next 32 B tile refills it.
+    // Every `nb` fails identically for that reason (measured by sweeping the
+    // debug lever): the scheme, not the width, was over budget. One slot pair
+    // drops the per-block term to a constant, and the fold's arithmetic is
+    // untouched — the same `ogt` chain in the same ascending `b` order, so ties
+    // still resolve to the lowest index and the result is bit-identical.
+    let idx_slot = ctx.alloc_tile_typed(
+        &format!("{}__arg_idx", result_ssa), rows, 1, "i32", &dst_ty, ops);
+    let max_slot = ctx.alloc_tile_typed(
+        &format!("{}__arg_max", result_ssa), rows_pad, 1, dtype, &max_ty, ops);
+
+    let mut c_row: Vec<String> = Vec::new();
+    let mut c_row8: Vec<String> = Vec::new();
+    let mut best_v: Vec<String> = Vec::new();
+    let mut best_i: Vec<String> = Vec::new();
+    for r in 0..rows {
+        let c_r = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant {} : index", c_r, r));
+        let c_r8 = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant {} : index", c_r8, r * 8));
+        let v0 = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant -3.4e38 : f32", v0));
+        let i0 = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant 0 : i32", i0));
+        c_row.push(c_r);
+        c_row8.push(c_r8);
+        best_v.push(v0);
+        best_i.push(i0);
+    }
+
     for b in 0..n_blocks {
-        let idx_b = ctx.alloc_tile_typed(
-            &format!("{}__arg_idx{}", result_ssa, b), rows, 1, "i32", &dst_ty, ops);
-        let max_b = ctx.alloc_tile_typed(
-            &format!("{}__arg_max{}", result_ssa, b), rows_pad, 1, dtype, &max_ty, ops);
         let pv = ctx.make_pv_at(&tv, rows, nb, dtype, 0, b * nb, ops);
         ops.push(format!(
             "pto.tload ins({} : {}) outs({} : {})",
@@ -5035,51 +5084,51 @@ fn translate_row_argminmax(
         ));
         ops.push(format!(
             "{} ins({}, {} : {}, {}) outs({} : {})",
-            pto_op, blk, scratch, blk_ty, blk_ty, idx_b, dst_ty
+            pto_op, blk, scratch, blk_ty, blk_ty, idx_slot, dst_ty
         ));
         ops.push(format!(
             "pto.trowmax ins({}, {} : {}, {}) outs({} : {})",
-            blk, scratch, blk_ty, blk_ty, max_b, max_ty
+            blk, scratch, blk_ty, blk_ty, max_slot, max_ty
         ));
-        idx_tiles.push(idx_b);
-        max_tiles.push(max_b);
-    }
-
-    for r in 0..rows {
-        let c_r = ctx.fresh_ssa();
-        ops.push(format!("{} = arith.constant {} : index", c_r, r));
-        let c_r8 = ctx.fresh_ssa();
-        ops.push(format!("{} = arith.constant {} : index", c_r8, r * 8));
-        let mut best_v = ctx.fresh_ssa();
-        ops.push(format!("{} = arith.constant -3.4e38 : f32", best_v));
-        let mut best_i = ctx.fresh_ssa();
-        ops.push(format!("{} = arith.constant 0 : i32", best_i));
-        for b in 0..n_blocks {
+        // Both reductions are read below, and both blk/scratch are rewritten by
+        // the next block, so the read must complete before either is reused.
+        ops.push("pto.barrier <PIPE_ALL>".to_string());
+        for (r, c_r) in c_row.iter().enumerate() {
             let v = ctx.fresh_ssa();
             ops.push(format!(
                 "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> f32",
-                v, max_tiles[b as usize], c_r, max_ty
+                v, max_slot, c_r, max_ty
             ));
             let i = ctx.fresh_ssa();
             ops.push(format!(
                 "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> i32",
-                i, idx_tiles[b as usize], c_r8, dst_ty
+                i, idx_slot, c_row8[r], dst_ty
             ));
             let gt = ctx.fresh_ssa();
-            ops.push(format!("{} = arith.cmpf ogt, {}, {} : f32", gt, v, best_v));
+            ops.push(format!("{} = arith.cmpf ogt, {}, {} : f32", gt, v, best_v[r]));
             let bnb = ctx.fresh_ssa();
             ops.push(format!("{} = arith.constant {} : i32", bnb, b * nb));
             let loc = ctx.fresh_ssa();
             ops.push(format!("{} = arith.addi {}, {} : i32", loc, i, bnb));
             let nv = ctx.fresh_ssa();
-            ops.push(format!("{} = arith.select {}, {}, {} : f32", nv, gt, v, best_v));
+            ops.push(format!(
+                "{} = arith.select {}, {}, {} : f32",
+                nv, gt, v, best_v[r]
+            ));
             let ni = ctx.fresh_ssa();
-            ops.push(format!("{} = arith.select {}, {}, {} : i32", ni, gt, loc, best_i));
-            best_v = nv;
-            best_i = ni;
+            ops.push(format!(
+                "{} = arith.select {}, {}, {} : i32",
+                ni, gt, loc, best_i[r]
+            ));
+            best_v[r] = nv;
+            best_i[r] = ni;
         }
+        ops.push("pto.barrier <PIPE_ALL>".to_string());
+    }
+
+    for (r, bi_src) in best_i.iter().enumerate() {
         let bi = ctx.fresh_ssa();
-        ops.push(format!("{} = arith.index_cast {} : i32 to index", bi, best_i));
+        ops.push(format!("{} = arith.index_cast {} : i32 to index", bi, bi_src));
         let off = ctx.fresh_ssa();
         ops.push(format!("{} = arith.constant {} : i64", off, r * 8));
         ops.push(format!(
@@ -9977,29 +10026,16 @@ fn translate_argmax_rows(
     ));
     for r in 0..rows {
         let out_t = ctx.alloc_tile_typed(&format!("__amr_out{}", r), 1, 8, "i32", &dst_ty, ops);
-        let mut idxs: Vec<String> = Vec::new();
-        let mut maxs: Vec<String> = Vec::new();
-        for b in 0..n_blocks {
-            let idx_b = ctx.alloc_tile_typed(
-                &format!("__amr_i{}_{}", r, b), 1, 8, "i32", &dst_ty, ops);
-            let max_b = ctx.alloc_tile_typed(
-                &format!("__amr_m{}_{}", r, b), 8, 1, dtype, &max_ty, ops);
-            let pv = ctx.make_pv_at(&tv, 1, nb, dtype, r, b * nb, ops);
-            ops.push(format!(
-                "pto.tload ins({} : {}) outs({} : {})",
-                pv, ptv_type(1, nb, dtype), blk, blk_ty
-            ));
-            ops.push(format!(
-                "pto.trowargmax ins({}, {} : {}, {}) outs({} : {})",
-                blk, scratch, blk_ty, blk_ty, idx_b, dst_ty
-            ));
-            ops.push(format!(
-                "pto.trowmax ins({}, {} : {}, {}) outs({} : {})",
-                blk, scratch, blk_ty, blk_ty, max_b, max_ty
-            ));
-            idxs.push(idx_b);
-            maxs.push(max_b);
-        }
+        // ONE index/max slot per row, rewritten by each block, with the fold run
+        // inside the block loop. Allocating a pair per (row, block) put this
+        // kernel exactly on the UB ceiling and the sweep of `nb` showed the
+        // scheme, not the width, was over budget: ptoas bank-aligns every
+        // allocation to 512 B, so 8 rows x 256 blocks x 2 x 32 B tiles spend
+        // 2 MiB of alignment on 256 KiB of data. Reuse costs a barrier per block
+        // and the arithmetic is untouched — same `ogt` chain, same ascending `b`,
+        // so ties still resolve to the lowest index and the result is identical.
+        let idx_slot = ctx.alloc_tile_typed(&format!("__amr_i{}", r), 1, 8, "i32", &dst_ty, ops);
+        let max_slot = ctx.alloc_tile_typed(&format!("__amr_m{}", r), 8, 1, dtype, &max_ty, ops);
         let c0 = ctx.fresh_ssa();
         ops.push(format!("{} = arith.constant 0 : index", c0));
         let mut best_v = ctx.fresh_ssa();
@@ -10007,15 +10043,31 @@ fn translate_argmax_rows(
         let mut best_i = ctx.fresh_ssa();
         ops.push(format!("{} = arith.constant 0 : i32", best_i));
         for b in 0..n_blocks {
+            let pv = ctx.make_pv_at(&tv, 1, nb, dtype, r, b * nb, ops);
+            ops.push(format!(
+                "pto.tload ins({} : {}) outs({} : {})",
+                pv, ptv_type(1, nb, dtype), blk, blk_ty
+            ));
+            ops.push(format!(
+                "pto.trowargmax ins({}, {} : {}, {}) outs({} : {})",
+                blk, scratch, blk_ty, blk_ty, idx_slot, dst_ty
+            ));
+            ops.push(format!(
+                "pto.trowmax ins({}, {} : {}, {}) outs({} : {})",
+                blk, scratch, blk_ty, blk_ty, max_slot, max_ty
+            ));
+            // Both reductions are read just below, and blk/scratch are rewritten
+            // by the next block, so the read must land before either is reused.
+            ops.push("pto.barrier <PIPE_ALL>".to_string());
             let v = ctx.fresh_ssa();
             ops.push(format!(
                 "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> f32",
-                v, maxs[b as usize], c0, max_ty
+                v, max_slot, c0, max_ty
             ));
             let i = ctx.fresh_ssa();
             ops.push(format!(
                 "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> i32",
-                i, idxs[b as usize], c0, dst_ty
+                i, idx_slot, c0, dst_ty
             ));
             let gt = ctx.fresh_ssa();
             ops.push(format!("{} = arith.cmpf ogt, {}, {} : f32", gt, v, best_v));
@@ -10029,6 +10081,7 @@ fn translate_argmax_rows(
             ops.push(format!("{} = arith.select {}, {}, {} : i32", ni, gt, loc, best_i));
             best_v = nv;
             best_i = ni;
+            ops.push("pto.barrier <PIPE_ALL>".to_string());
         }
         let bi = ctx.fresh_ssa();
         ops.push(format!("{} = arith.index_cast {} : i32 to index", bi, best_i));
