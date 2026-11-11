@@ -221,6 +221,11 @@ const KNOWN_INTRINSICS: &[&str] = &[
     "__tile_token_accept_f32",
     "__tile_topk_f32",
     "__tile_transpose_f32",
+    // Declared by tile_std and referenced by its own helpers; the guard scans the
+    // whole merged module, so without these two every kernel is refused. Neither has
+    // a PTO lowering yet, so a kernel that calls one is still an error at the drop site.
+    "__tile_window_mask_f32",
+    "__tile_strided_mask_f32",
     "__tile_unpack_q4_hi",
     "__tile_unpack_q4_lo",
     "__tile_unpack_q4k_scale_min",
@@ -237,6 +242,15 @@ const KNOWN_INTRINSICS: &[&str] = &[
 fn reject_unknown_intrinsics(mlir_text: &str) -> Result<(), String> {
     for line in mlir_text.lines() {
         if line.trim_start().starts_with("//") {
+            continue;
+        }
+        // Declarations are not uses. The merged module carries an `llvm.func` for every
+        // intrinsic tile_std declares, and refusing on those rejects kernels that never
+        // call the operation — which is what made every kernel fail on the window mask.
+        if line.contains("\"llvm.func\"")
+            || line.trim_start().starts_with("llvm.func")
+            || line.contains("\"llvm.mlir.addressof\"")
+        {
             continue;
         }
         let mut rest = line;
@@ -259,7 +273,56 @@ fn reject_unknown_intrinsics(mlir_text: &str) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Keep only the kernel functions and the intrinsic declarations.
+///
+/// The merged module carries every function of `tile_std`, and the translator walks all
+/// of them. That is harmless until one of those helpers calls an operation the translator
+/// does not lower — then a kernel that never mentions the operation is refused on its
+/// behalf. Kernel entries are the unmangled symbols; tile_std's are `_ZN...`.
+fn keep_kernels_only(mlir: &str) -> String {
+    let lines: Vec<&str> = mlir.lines().collect();
+    let mut out = String::with_capacity(mlir.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let is_func_decl = line.contains("\"llvm.func\"") || line.trim_start().starts_with("llvm.func");
+        // The op's attributes can wrap, so look a few lines ahead for the symbol.
+        let mut sym = "";
+        for look in 0..4 {
+            if let Some(l) = lines.get(i + look) {
+                if let Some(rest) = l.split("sym_name = \"").nth(1) {
+                    sym = rest.split('"').next().unwrap_or("");
+                    break;
+                }
+            }
+        }
+        let drop = is_func_decl && (sym.starts_with("_ZN") || sym.starts_with("__rust"));
+        if !drop {
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        // Skip the whole op: balance parentheses from its first line.
+        let mut depth: i32 = 0;
+        while i < lines.len() {
+            depth += lines[i].matches('(').count() as i32 - lines[i].matches(')').count() as i32;
+            i += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 pub fn convert_mlir_to_pto(mlir_text: &str) -> Result<String, String> {
+    let pruned = keep_kernels_only(mlir_text);
+    if std::env::var_os("TILE_DEBUG_PRUNE").is_some() {
+        eprintln!("[prune] {} -> {} bytes; window_mask calls left: {}", mlir_text.len(), pruned.len(), pruned.matches("callee = @__tile_window_mask_f32").count());
+    }
+    let mlir_text: &str = &pruned;
     reject_unknown_intrinsics(mlir_text)?;
 
     convert_mlir_to_pto_with_opts(mlir_text, &PtoOpts::from_env())
@@ -2153,6 +2216,8 @@ impl PtoContext {
         dtype: &str,
         ops: &mut Vec<String>,
     ) -> String {
+        let resolved_owned = self.resolve_ptr(gm_arg);
+        let gm_arg: &str = &resolved_owned;
         if let Some((ssa, r, c, d)) = self.tv_map.get(gm_arg).cloned() {
             if r == rows && c == cols && d == dtype {
                 return ssa;
@@ -2360,6 +2425,17 @@ fn analyze_body(
     func: &MlirFunc,
     ctx: &mut PtoContext,
 ) -> Result<Vec<String>, String> {
+    if std::env::var_os("TILE_DEBUG_BODY").is_some() {
+        eprintln!("[body] {} lines, fn {}", body_lines.len(), func.name);
+        let interesting: Vec<&String> = body_lines
+            .iter()
+            .filter(|l| l.contains("llvm.store") || l.contains("insertvalue") || l.contains("as_ptr"))
+            .collect();
+        eprintln!("[body] {} store/insert/as_ptr lines", interesting.len());
+        for l in interesting.iter().take(5) {
+            eprintln!("[body]   {}", l.trim().chars().take(120).collect::<String>());
+        }
+    }
     // Pre-populate ctx with info about GM pointer args
     for arg in &func.args {
         if arg.is_gm {
@@ -2479,6 +2555,75 @@ fn analyze_body(
                 }
             }
             continue;
+        }
+
+        // View accessors and the struct that carries the GM pointer. At this build the
+        // accessors are not inlined, so the pointer a partition view needs arrives as the
+        // result of calls the emitter does not otherwise lower.
+        if line.contains("GmDeviceCtx") && line.contains("view") && line.contains("llvm.call @") {
+            if let Some(result) = extract_result_ssa(line) {
+                if let Some(open) = line.find('(') {
+                    if let Some(close) = line[open..].find(')') {
+                        let args = &line[open + 1..open + close];
+                        if let Some(last) = args.split(',').map(|a| a.trim()).filter(|a| a.starts_with('%')).last() {
+                            ctx.ptr_aliases.insert(result, last.to_string());
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if (line.contains("as_ptr") || line.contains("as_mut_ptr")) && line.contains("llvm.call @") {
+            if let Some(result) = extract_result_ssa(line) {
+                if let Some(open) = line.find('(') {
+                    if let Some(close) = line[open..].find(')') {
+                        let arg = line[open + 1..open + close].trim().to_string();
+                        if arg.starts_with('%') {
+                            let resolved = ctx.resolve_ptr(&arg);
+                            ctx.ptr_aliases.insert(result, resolved);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if line.contains("wrapping_add") && line.contains("llvm.call @") {
+            if let Some(result) = extract_result_ssa(line) {
+                if let Some(open) = line.find('(') {
+                    if let Some(close) = line[open..].find(')') {
+                        if let Some(base) = line[open + 1..open + close].split(',').map(|a| a.trim()).find(|a| a.starts_with('%')) {
+                            let resolved = ctx.resolve_ptr(base);
+                            ctx.ptr_aliases.insert(result, resolved);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if line.contains("\"llvm.insertvalue\"") && line.contains("position = array<i64: 0>") && line.contains("ptr<1>") {
+            if let Some(result) = extract_result_ssa(line) {
+                if let Some(open) = line.find('(') {
+                    if let Some(close) = line[open..].find(')') {
+                        if let Some(first) = line[open + 1..open + close].split(',').map(|a| a.trim()).find(|a| a.starts_with('%')) {
+                            let resolved = ctx.resolve_ptr(first);
+                            ctx.ptr_aliases.insert(result, resolved);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if line.contains("\"llvm.store\"") && line.contains("ptr<1>") {
+            if let Some(open) = line.find('(') {
+                if let Some(close) = line[open..].find(')') {
+                    let arglist: Vec<&str> = line[open + 1..open + close].split(',').map(|a| a.trim()).filter(|a| a.starts_with('%')).collect();
+                    if arglist.len() == 2 {
+                        let val = ctx.resolve_ptr(arglist[0]);
+                        ctx.ptr_aliases.insert(arglist[1].to_string(), val);
+                        continue;
+                    }
+                }
+            }
         }
 
         // Track pointer aliases so we can resolve derived GM pointers.
@@ -2653,6 +2798,21 @@ fn analyze_body(
         // tile.mul f32
         if line.contains("__tile_mul_f32") {
             translate_binary(line, "f32", "pto.tmul", ctx, &mut ops)?;
+            continue;
+        }
+        // tile.block_expand_sub/mul/div f32: 1xN row with a 1xG vector over
+        // N/G contiguous blocks. Emits the PTO row-expand op with the two
+        // different extents; the operands keep their own tile types.
+        if line.contains("__tile_block_expand_sub_f32") {
+            translate_block_expand(line, "pto.trowexpandsub", ctx, &mut ops)?;
+            continue;
+        }
+        if line.contains("__tile_block_expand_mul_f32") {
+            translate_block_expand(line, "pto.trowexpandmul", ctx, &mut ops)?;
+            continue;
+        }
+        if line.contains("__tile_block_expand_div_f32") {
+            translate_block_expand(line, "pto.trowexpanddiv", ctx, &mut ops)?;
             continue;
         }
         // tile.add f16
@@ -4038,6 +4198,40 @@ fn translate_binary(
     Ok(())
 }
 
+/// `%r = llvm.call @__tile_block_expand_sub_f32(%c0, %src, %vec, %n, %block)`
+///
+/// One 1xN row and one 1xG vector; the PTO op carries both tile types as they
+/// are. Unlike `translate_binary` the two operands do NOT share an extent.
+fn translate_block_expand(
+    line: &str,
+    pto_op: &str,
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+) -> Result<(), String> {
+    let result_ssa = extract_result_ssa(line)
+        .ok_or_else(|| format!("{}: no result SSA in: {}", pto_op, line))?;
+    let args = extract_call_args(line)
+        .ok_or_else(|| format!("{}: cannot parse args in: {}", pto_op, line))?;
+    if args.len() < 3 {
+        return Err(format!("{}: unexpected arity in: {}", pto_op, line));
+    }
+    let ta = ctx
+        .get_tile(args[1].as_str())
+        .ok_or_else(|| format!("{}: unknown row tile {}", pto_op, args[1]))?
+        .clone();
+    let tb = ctx
+        .get_tile(args[2].as_str())
+        .ok_or_else(|| format!("{}: unknown vector tile {}", pto_op, args[2]))?
+        .clone();
+    let tc_ssa = ctx.alloc_tile(&result_ssa, ta.rows, ta.cols, "f32", ops);
+    let tc_ty = tile_buf_type(ta.rows, ta.cols, "f32");
+    ops.push(format!(
+        "{} ins({}, {} : {}, {}) outs({} : {})",
+        pto_op, ta.ssa, tb.ssa, ta.tile_buf_type_str(), tb.tile_buf_type_str(), tc_ssa, tc_ty
+    ));
+    Ok(())
+}
+
 /// Fused matvec: `%r = llvm.call @__tile_matvec_f16(%c0, %act, %w, %rows, %cols)`
 ///
 /// The shim emits this as ONE intrinsic because Metal has a fused
@@ -4615,18 +4809,23 @@ fn pick_argminmax_nb(rows: u32, cols: u32, dtype: &str) -> Option<u32> {
         return None;
     }
     let cap = max_nb.min(cols as u64) as u32;
-    if cols <= cap {
+    // The block's row width in BYTES must be a multiple of the 512-byte fractal,
+    // or `validate_tile_shape` refuses the emitted partition view (C2: "spans
+    // multiple 512B fractals with bad stride"). The largest divisor alone is not
+    // enough: for 154880 f32 it picked 19360 (77440 B, 128 B past a fractal).
+    let aligned = |nb: u32| (nb as u64 * elem_bytes) % 512 == 0;
+    if cols <= cap && aligned(cols) {
         return Some(cols);
     }
     let mut best: Option<u32> = None;
     let mut d = 1u32;
     while (d as u64) * (d as u64) <= cols as u64 {
         if cols % d == 0 {
-            if d <= cap {
+            if d <= cap && aligned(d) {
                 best = Some(best.map_or(d, |b: u32| b.max(d)));
             }
             let q = cols / d;
-            if q <= cap {
+            if q <= cap && aligned(q) {
                 best = Some(best.map_or(q, |b: u32| b.max(q)));
             }
         }
