@@ -1689,6 +1689,14 @@ fn validate_tile_shape<A: AscendArch>(logical_rows: u32, logical_cols: u32, dtyp
     // (these are the internal reduction/broadcast scratch tiles like 1x8).
     let col_bytes = cols as usize * b;
     if col_bytes > A::FRACTAL_BYTES && col_bytes % A::FRACTAL_BYTES != 0 {
+        // Opt-in escape for a small unaligned data tile (e.g. a 288-column f32
+        // router row = 1152 B). The check is a device-stride guard, not a ptoas
+        // parse rule; setting TILE_ALLOW_UNALIGNED lets the artifact reach the
+        // assembler so the campaign records what ptoas actually accepts (and the
+        // device run is what decides whether the stride was real).
+        if std::env::var_os("TILE_ALLOW_UNALIGNED").is_some() {
+            return Ok(());
+        }
         return Err(format!(
             "NPU tile bound (arch {}): row_major data tile cols={} * {}B = {}B spans multiple {}B \
              fractals with bad stride (C2); pad cols so cols*sizeof(dtype) % {} == 0",
@@ -9882,20 +9890,16 @@ fn translate_topk(
         return Ok(());
     }
 
-    // Fallback: rows>1 or non-aligned cols → stub passthrough.
-    ops.push(format!(
-        "// --- topk: top-{} selection, {}x{} {} (stub fallback) ---",
-        k, rows, k, dtype
-    ));
-    ops.push("// PTO topk port handles only rows=1 + cols % 64 == 0 (Path A scope).".to_string());
-
-    let out_ssa = ctx.alloc_tile(&result_ssa, rows, k, dtype, ops);
-    ops.push(format!(
-        "pto.tmov ins({} : {}) outs({} : {})",
-        tsrc.ssa, src_ty, out_ssa, dst_ty
-    ));
-
-    Ok(())
+    // The old fallback emitted a same-shape-less pto.tmov "passthrough stub" --
+    // which ptoas rejects AND which is not a top-k at all (it copies the first k
+    // values). Emitting it would be the silent substitution this crate refuses
+    // elsewhere, so the non-aligned case is an error that names the real need.
+    Err(format!(
+        "topk: cols={} is not a multiple of 64, so the mask-pattern topk path does \
+         not apply, and the old passthrough stub was never a top-k. Pad the tile \
+         to a 64-multiple (384 for a 512B f32 fractal) and re-emit",
+        cols
+    ))
 }
 
 /// Matmul f16: `%res = llvm.call @__tile_matmul_f16(%c0, %a, %b, %m, %k, %n)`
