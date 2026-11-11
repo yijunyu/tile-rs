@@ -4911,13 +4911,24 @@ fn translate_row_argminmax(
     let blk_ty = tile_buf_type(rows, nb, dtype);
     let dst = ctx.alloc_tile_typed(&result_ssa, rows, 1, "i32", &dst_ty, ops);
 
+    // ONE block buffer and ONE scratch tile, allocated once and reused by every
+    // chunk. Allocating them inside the loop below made every chunk live at the
+    // same time -- `UbAllocator` is a bump allocator and the per-block SSA names
+    // are distinct, so nothing was reclaimed: at 154880 f32 (10 blocks of
+    // 15488) the first four 61952 B tiles already reached 248320 B and the
+    // emitter refused with "tile of 61952B at offset 186368B would use 248320B >
+    // UB_SIZE 196608B (C1)". Reuse bounds the live set at the 2*rows*nb*elem
+    // bytes `pick_argminmax_nb` budgets for, whatever the block count is. The
+    // blocks are sequentially dependent through these two tiles, so ptoas
+    // inserts the WAR/WAW sync between iterations.
+    let blk = ctx.alloc_tile(&format!("{}__arg_blk", result_ssa), rows, nb, dtype, ops);
+    let scratch = ctx.alloc_tile(&format!("{}__arg_tmp", result_ssa), rows, nb, dtype, ops);
     ops.push(format!(
         "// --- blocked {}: {} blocks of {} over {} ---",
         pto_op, n_blocks, nb, cols
     ));
     for b in 0..n_blocks {
         let pv = ctx.make_pv_at(&tv, rows, nb, dtype, 0, b * nb, ops);
-        let blk = ctx.alloc_tile(&format!("{}__arg_blk{}", result_ssa, b), rows, nb, dtype, ops);
         ops.push(format!(
             "pto.tload ins({} : {}) outs({} : {})",
             pv,
@@ -4925,8 +4936,6 @@ fn translate_row_argminmax(
             blk,
             blk_ty
         ));
-        let scratch =
-            ctx.alloc_tile(&format!("{}__arg_tmp{}", result_ssa, b), rows, nb, dtype, ops);
         ops.push(format!(
             "{} ins({}, {} : {}, {}) outs({} : {})",
             pto_op, blk, scratch, blk_ty, blk_ty, dst, dst_ty
@@ -16458,6 +16467,50 @@ module {
         assert!(
             !pto.contains("TODO"),
             "an emitted TODO means the kernel computes something other than what was asked:\n{}",
+            pto
+        );
+    }
+
+    #[test]
+    fn test_blocked_argmax_reuses_one_block_and_one_scratch() {
+        // 154880 f32 at one row: pick_argminmax_nb picks nb=15488, so the
+        // reduction is 10 blocks. Allocating a block buffer + scratch per
+        // block made all 20 tiles live at once (1.2 MB against a 192 KB UB)
+        // and the emitter refused at the 4th with C1. The blocked path must
+        // allocate ONE block buffer and ONE scratch tile and reuse them, or
+        // the live set grows with cols/nb.
+        let mlir = r#"
+module {
+  llvm.func @blocked_argmax_k(%arg0: !llvm.ptr<1>, %arg1: !llvm.ptr<1>) attributes {hacc.entry} {
+    %r = llvm.mlir.constant(1 : i32) : i32
+    %cl = llvm.mlir.constant(154880 : i32) : i32
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %v = llvm.call @__tile_load_f32(%arg0, %r, %cl) : (!llvm.ptr<1>, i32, i32) -> i32
+    %o = llvm.call @__tile_argmax_f32(%v, %v, %r, %cl) : (i32, i32, i32, i32) -> i32
+    llvm.call @__tile_store_i32(%arg1, %o, %r, %one) : (!llvm.ptr<1>, i32, i32, i32) -> ()
+    llvm.return
+  }
+}
+"#;
+        let pto = convert_mlir_to_pto(mlir)
+            .expect("blocked argmax must fit UB: it should reuse one block+scratch");
+        assert!(
+            pto.contains("// --- blocked pto.trowargmax: 10 blocks of 15488 over 154880 ---"),
+            "expected the 10-block lowering:\n{}",
+            pto
+        );
+        // dst + one block buffer + one scratch tile. Anything proportional to
+        // the block count here is the regression this test exists for.
+        assert_eq!(
+            pto.lines().filter(|l| l.contains("pto.alloc_tile")).count(),
+            3,
+            "blocked argmax must allocate exactly dst + blk + scratch, not one pair per block:\n{}",
+            pto
+        );
+        assert_eq!(
+            pto.matches("pto.tload").count(),
+            10,
+            "all 10 blocks must still be loaded:\n{}",
             pto
         );
     }
