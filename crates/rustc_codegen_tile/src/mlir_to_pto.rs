@@ -9511,7 +9511,7 @@ fn translate_gather_mask(
 
     ops.push(format!(
         "pto.tgather ins({}, {{maskPattern = #pto.mask_pattern<{}>}} : {}) \
-         outs({} : {})",
+         outs({} : {}) {{axis = \"row\"}}",
         tsrc.ssa, mask_str, src_ty, dst_ssa, dst_ty
     ));
 
@@ -9743,11 +9743,14 @@ fn translate_arith_progression(
     let start_ssa = ctx.fresh_ssa();
     ops.push(format!("{} = arith.constant 0 : i32", start_ssa));
 
-    // Indices are unsigned (matches `pto.tsort32` consumer dtype `ui32`).
-    let dst_ssa = ctx.alloc_tile(&result_ssa, 1, valid_col, "ui32", ops);
-    let dst_ty = tile_buf_type(1, valid_col, "ui32");
+    // The start operand is an i32 constant and ptoas requires the source and
+    // destination element types to be EXACTLY equal ("op expects S and dst
+    // element type to be exactly the same type"), so the destination is i32 too
+    // -- the corpus' own tci line is `ins(%c0 : i32) outs(%t : ...i32...)`.
+    let dst_ssa = ctx.alloc_tile(&result_ssa, 1, valid_col, "i32", ops);
+    let dst_ty = tile_buf_type(1, valid_col, "i32");
     ops.push(format!(
-        "pto.tci ins({} {{descending = false}} : i32) outs({} : {})",
+        "pto.tci ins({} : i32) outs({} : {}) {{descending = false}}",
         start_ssa, dst_ssa, dst_ty
     ));
 
@@ -9826,12 +9829,14 @@ fn translate_topk(
 
         // Step 1: tci → indices [0..cols] ui32
         let idx_key = format!("{}__topk_idx", result_ssa);
-        let idx_ssa = ctx.alloc_tile(&idx_key, 1, cols, "ui32", ops);
-        let idx_ty = tile_buf_type(1, cols, "ui32");
+        // i32, because the tci start operand is an i32 constant and ptoas
+        // requires source and destination element types to be exactly equal.
+        let idx_ssa = ctx.alloc_tile(&idx_key, 1, cols, "i32", ops);
+        let idx_ty = tile_buf_type(1, cols, "i32");
         let start_ssa = ctx.fresh_ssa();
         ops.push(format!("{} = arith.constant 0 : i32", start_ssa));
         ops.push(format!(
-            "pto.tci ins({} {{descending = false}} : i32) outs({} : {})",
+            "pto.tci ins({} : i32) outs({} : {}) {{descending = false}}",
             start_ssa, idx_ssa, idx_ty
         ));
 
@@ -9851,7 +9856,7 @@ fn translate_topk(
         let val_ty = tile_buf_type(1, cols, dtype);
         ops.push(format!(
             "pto.tgather ins({}, {{maskPattern = #pto.mask_pattern<P1010>}} : {}) \
-             outs({} : {})",
+             outs({} : {}) {{axis = \"row\"}}",
             sort_ssa, sort_ty, val_ssa, val_ty
         ));
 
@@ -9864,9 +9869,14 @@ fn translate_topk(
             "// head-extract first {} of {} sorted values (ptoas v_col truncation)",
             k, cols
         ));
+        // A 1xcols -> 1xk tmov is a shape MISMATCH to ptoas ("A2/A3 non-mat
+        // tmov to use matching src/dst shapes"); the reference corpus uses
+        // pto.textract at [0, 0] for the head-K window.
+        let c0 = ctx.fresh_ssa();
+        ops.push(format!("{} = arith.constant 0 : index", c0));
         ops.push(format!(
-            "pto.tmov ins({} : {}) outs({} : {})",
-            val_ssa, val_ty, out_ssa, dst_ty
+            "pto.textract ins({}, {}, {} : {}, index, index) outs({} : {})",
+            val_ssa, c0, c0, val_ty, out_ssa, dst_ty
         ));
 
         return Ok(());

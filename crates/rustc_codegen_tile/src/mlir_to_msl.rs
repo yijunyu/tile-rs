@@ -1610,7 +1610,36 @@ fn reject_unknown_intrinsics(module: &MlirModule) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Rewrite generic-form `llvm.call` lines into the pretty form the scanners expect.
+fn normalize_generic_llvm_calls(mlir: &str) -> String {
+    let mut out = String::with_capacity(mlir.len());
+    for line in mlir.lines() {
+        if line.contains("\"llvm.mlir.addressof\"") { continue; }
+        if !line.contains("\"llvm.call\"") { out.push_str(line); out.push('\n'); continue; }
+        let Some(call_at) = line.find("\"llvm.call\"(") else { out.push_str(line); out.push('\n'); continue; };
+        let lhs = &line[..call_at];
+        let after = &line[call_at + "\"llvm.call\"(".len()..];
+        let Some(args_end) = after.find(") <{") else { out.push_str(line); out.push('\n'); continue; };
+        let args = &after[..args_end];
+        let attrs = &after[args_end..];
+        let Some(callee_pos) = attrs.find("callee = @") else { out.push_str(line); out.push('\n'); continue; };
+        let cs = callee_pos + "callee = @".len();
+        let ce = attrs[cs..].find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '$')).map(|i| cs + i).unwrap_or(attrs.len());
+        let callee = &attrs[cs..ce];
+        let sig = attrs.find("}>").map(|i| &attrs[i + 2..]).unwrap_or("");
+        out.push_str(lhs); out.push_str("llvm.call @"); out.push_str(callee);
+        out.push('('); out.push_str(args); out.push(')'); out.push_str(sig); out.push('\n');
+    }
+    out
+}
+
 pub fn convert_mlir_to_msl(mlir_text: &str) -> Result<String, String> {
+    let normalized = normalize_generic_llvm_calls(mlir_text);
+    if std::env::var_os("TILE_DEBUG_NORM").is_some() {
+        eprintln!("[norm] in {} bytes -> {} bytes, tile calls: {}", mlir_text.len(), normalized.len(), normalized.matches("llvm.call @__tile_").count());
+    }
+    let mlir_text: &str = &normalized;
     let module = parse_module(mlir_text)?;
     reject_unknown_intrinsics(&module)?;
     reject_unfusable_compute_chains(&module)?;

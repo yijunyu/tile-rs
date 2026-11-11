@@ -1171,3 +1171,39 @@ could represent the trade.** #011 bakes a shape, #034 bakes a scalar, #039 read
 a stand-in as an extent -- every one of them is an emitter choosing the value it
 can NAME over the value it was GIVEN. The registry fixes naming. 1c is what
 stops the trade.
+
+## #043, and the partiality one level up (2026-11-04)
+
+Every instance above is an emitter choosing a nameable value over the given one, or an
+intrinsic with no arm. #043 is a different shape of the same partiality, and it is worth
+adding to the order because no emitter is at fault in it:
+
+**The `tile_std` vocabulary has no quantized matvec/matmul at all.** Measured on the
+installed binary:
+
+```
+$ tile --list-ops | awk 'NR==1 || /matvec|matmul|dequant|quant/'
+op                  linalg  rvv  pto  msl  gpu  musa  spirv ...
+matvec              yes     yes  yes  -    -    -     -
+matmul              yes     yes  yes  yes  yes  yes   -
+matmul_transposed   -       -    yes  yes  yes  yes   yes
+```
+
+So a batched IQ2_XXS expert matvec — 2304 rows x 5120 K, dequant a 66-byte ggml block,
+reuse each weight across a 16-64 token tile — cannot be written down, on any target.
+`--list-ops` reports it as per-backend dashes, which reads as "these backends have not
+implemented it yet"; the truth is that **there is no op to implement.**
+
+The consequence is the same user experience the cluster is about: tile-rs answered, and
+what came back was not a lowering of what was asked. Here the caller does not get a copy
+kernel or a wrong constant -- they get a kernel that does not exist, and the work moves to
+hand-written GLSL (measured there: 69 us single-token per matrix, 224 us for 16 tokens,
+1.68 TFLOP/s, below what the incumbent llama.cpp Vulkan path already sustains). The
+workaround is recorded in #043 with its numbers.
+
+What this adds to the order: the vocabulary's **coverage** is currently invisible. A
+`-` cell on `--list-ops` cannot distinguish "this backend lacks an arm" from "this op is
+not in the DSL", and the two call for opposite responses — a lowering job versus a
+language-surface decision. Before 1c, the order needs a zero-eth step: **the op list should
+say which ops exist at all**, so an absent family is answered with "not expressible" rather
+than eleven dashes that look like eleven backlogs.

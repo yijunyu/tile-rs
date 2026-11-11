@@ -192,6 +192,9 @@ extern "C" {
 
     /// Element-wise multiply two f32 tiles of the same shape.
     pub fn __tile_mul_f32(dst: u32, src1: u32, src2: u32, rows: u32, cols: u32) -> u32;
+    pub fn __tile_block_expand_sub_f32(dst: u32, src: u32, vec: u32, n: u32, block: u32) -> u32;
+    pub fn __tile_block_expand_mul_f32(dst: u32, src: u32, vec: u32, n: u32, block: u32) -> u32;
+    pub fn __tile_block_expand_div_f32(dst: u32, src: u32, vec: u32, n: u32, block: u32) -> u32;
 
     /// Element-wise exp of an f32 tile.
     pub fn __tile_exp_f32(dst: u32, src: u32, rows: u32, cols: u32) -> u32;
@@ -3898,6 +3901,12 @@ extern "C" {
     /// (A) or `loc=right` (B) at matmul time.
     pub fn __tile_load_i8(gm: *const i8, rows: u32, cols: u32) -> u32;
 
+    /// Load a `ROWS × COLS` SIGNED-i8 tile from global memory (PTO `si8`).
+    pub fn __tile_load_si8(gm: *const i8, rows: u32, cols: u32) -> u32;
+
+    /// Store a SIGNED-i8 tile buffer to global memory (PTO `si8`).
+    pub fn __tile_store_si8(gm: *mut i8, buf: u32, rows: u32, cols: u32);
+
     /// Store an i8 tile buffer to global memory.
     pub fn __tile_store_i8(gm: *mut i8, buf: u32, rows: u32, cols: u32);
 
@@ -4543,6 +4552,36 @@ pub fn tile_mul_f32<const ROWS: usize, const COLS: usize>(
         buf_id,
         _phantom: PhantomData,
     }
+}
+
+/// Subtract a 1 x G vector from a 1 x N row over G contiguous blocks.
+#[inline(always)]
+pub fn tile_block_expand_sub_f32<const N: usize, const G: usize>(
+    src: Tile<1, N, f32>,
+    vec: Tile<1, G, f32>,
+) -> Tile<1, N, f32> {
+    let buf_id = unsafe { __tile_block_expand_sub_f32(0, src.buf_id, vec.buf_id, N as u32, (N / G) as u32) };
+    Tile { buf_id, _phantom: PhantomData }
+}
+
+/// Multiply a 1 x N row by a 1 x G vector over G contiguous blocks.
+#[inline(always)]
+pub fn tile_block_expand_mul_f32<const N: usize, const G: usize>(
+    src: Tile<1, N, f32>,
+    vec: Tile<1, G, f32>,
+) -> Tile<1, N, f32> {
+    let buf_id = unsafe { __tile_block_expand_mul_f32(0, src.buf_id, vec.buf_id, N as u32, (N / G) as u32) };
+    Tile { buf_id, _phantom: PhantomData }
+}
+
+/// Divide a 1 x N row by a 1 x G vector over G contiguous blocks.
+#[inline(always)]
+pub fn tile_block_expand_div_f32<const N: usize, const G: usize>(
+    src: Tile<1, N, f32>,
+    vec: Tile<1, G, f32>,
+) -> Tile<1, N, f32> {
+    let buf_id = unsafe { __tile_block_expand_div_f32(0, src.buf_id, vec.buf_id, N as u32, (N / G) as u32) };
+    Tile { buf_id, _phantom: PhantomData }
 }
 
 /// Element-wise exp of an f32 tile.

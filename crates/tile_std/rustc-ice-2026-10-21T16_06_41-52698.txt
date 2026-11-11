@@ -1,0 +1,35 @@
+thread 'rustc' panicked at /rustc-dev/f34ba774c78ea32b7c40598b8ad23e75cdac42a6/compiler/rustc_middle/src/ty/layout.rs:823:21:
+assertion failed: i < this.fields.count()
+stack backtrace:
+   0:        0x11102df60 - std::backtrace::Backtrace::create::h084d12e792183287
+   1:        0x10f104ad4 - rustc_driver_impl[2b8324bf128fb61a]::install_ice_hook::{closure#1}
+   2:        0x11104b9b0 - std::panicking::rust_panic_with_hook::hc039740e5c0b9bde
+   3:        0x11104b570 - std::panicking::begin_panic_handler::{{closure}}::hc336ec7fbf085bf3
+   4:        0x111046a40 - std::sys::backtrace::__rust_end_short_backtrace::ha218ee061832c377
+   5:        0x11104b29c - __rustc[46d736129294a9b7]::rust_begin_unwind
+   6:        0x113c86f30 - core::panicking::panic_fmt::hef8cb6c9f60ccf0a
+   7:        0x113c86fa0 - core::panicking::panic::h5a426db8e8a7d1bd
+   8:        0x10ed81e78 - <rustc_middle[a2dbb4c56cc95703]::ty::Ty as rustc_abi[afe36ceefb022dca]::layout::ty::TyAbiInterface<rustc_codegen_llvm[e05a26afc18efb94]::context::GenericCx<rustc_codegen_llvm[e05a26afc18efb94]::context::FullCx>>>::ty_and_layout_field
+   9:        0x10edcb078 - rustc_codegen_llvm[e05a26afc18efb94]::debuginfo::metadata::build_pointer_or_reference_di_node
+  10:        0x10edcbd44 - rustc_codegen_llvm[e05a26afc18efb94]::debuginfo::metadata::type_di_node
+  11:        0x10edd5d64 - <rustc_codegen_llvm[e05a26afc18efb94]::context::GenericCx<rustc_codegen_llvm[e05a26afc18efb94]::context::FullCx> as rustc_codegen_ssa[91d06d064436df0c]::traits::debuginfo::DebugInfoCodegenMethods>::dbg_scope_fn
+  12:        0x10edd4f80 - <rustc_codegen_llvm[e05a26afc18efb94]::context::GenericCx<rustc_codegen_llvm[e05a26afc18efb94]::context::FullCx> as rustc_codegen_ssa[91d06d064436df0c]::traits::debuginfo::DebugInfoCodegenMethods>::create_function_debug_context
+  13:        0x10ecd765c - rustc_codegen_ssa[91d06d064436df0c]::mir::codegen_mir::<rustc_codegen_llvm[e05a26afc18efb94]::builder::GenericBuilder<rustc_codegen_llvm[e05a26afc18efb94]::context::FullCx>>
+  14:        0x10edacc78 - rustc_codegen_llvm[e05a26afc18efb94]::base::compile_codegen_unit::module_codegen
+  15:        0x10edee324 - <rustc_codegen_llvm[e05a26afc18efb94]::LlvmCodegenBackend as rustc_codegen_ssa[91d06d064436df0c]::traits::backend::ExtraBackendMethods>::compile_codegen_unit
+  16:        0x10ece1564 - rustc_codegen_ssa[91d06d064436df0c]::base::codegen_crate::<rustc_codegen_llvm[e05a26afc18efb94]::LlvmCodegenBackend>
+  17:        0x10edf818c - <rustc_codegen_llvm[e05a26afc18efb94]::LlvmCodegenBackend as rustc_codegen_ssa[91d06d064436df0c]::traits::backend::CodegenBackend>::codegen_crate
+  18:        0x10f9f9ef0 - <rustc_interface[55decc61946ef0c8]::queries::Linker>::codegen_and_build_linker
+  19:        0x10f06d594 - rustc_interface[55decc61946ef0c8]::passes::create_and_enter_global_ctxt::<core[ea655e9243ee741e]::option::Option<rustc_interface[55decc61946ef0c8]::queries::Linker>, rustc_driver_impl[2b8324bf128fb61a]::run_compiler::{closure#0}::{closure#2}>
+  20:        0x10f0b5494 - rustc_interface[55decc61946ef0c8]::interface::run_compiler::<(), rustc_driver_impl[2b8324bf128fb61a]::run_compiler::{closure#0}>::{closure#1}
+  21:        0x10f0aa8cc - std[7990f6e2529955f1]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[55decc61946ef0c8]::util::run_in_thread_with_globals<rustc_interface[55decc61946ef0c8]::util::run_in_thread_pool_with_globals<rustc_interface[55decc61946ef0c8]::interface::run_compiler<(), rustc_driver_impl[2b8324bf128fb61a]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  22:        0x10f0b77d0 - <<std[7990f6e2529955f1]::thread::Builder>::spawn_unchecked_<rustc_interface[55decc61946ef0c8]::util::run_in_thread_with_globals<rustc_interface[55decc61946ef0c8]::util::run_in_thread_pool_with_globals<rustc_interface[55decc61946ef0c8]::interface::run_compiler<(), rustc_driver_impl[2b8324bf128fb61a]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[ea655e9243ee741e]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  23:        0x11104ed38 - std::sys::pal::unix::thread::Thread::new::thread_start::hb0199fdebba8fd82
+  24:        0x18ec17c58 - __pthread_cond_wait
+
+
+rustc version: 1.91.0-nightly (f34ba774c 2025-08-03)
+platform: aarch64-apple-darwin
+
+query stack during panic:
+end of query stack
