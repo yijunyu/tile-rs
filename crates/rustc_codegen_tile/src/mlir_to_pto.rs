@@ -3057,11 +3057,61 @@ fn analyze_body(
         // Keep the refusal, and name the actual gap so the next reader does not
         // go looking for a K/V-streaming arm that now exists.
         if line.contains("__tile_attention_dyn_f32") {
+            let args = extract_call_args(line)
+                .ok_or_else(|| format!("attention_dyn: cannot parse args: {}", line))?;
+            let k = args.get(2).map(|s| s.trim()).unwrap_or("");
+            let v = args.get(3).map(|s| s.trim()).unwrap_or("");
+            if ctx.get_tile(k).is_none() || ctx.get_tile(v).is_none() {
+                // (dst, q, k, v, S_tile, D) — S is a 1x1 tile holding the runtime
+                // KV length, so the block loop is an `scf.for` (one body, not
+                // S/sb copies). See `emit_attention_dyn` for the host tail
+                // contract that makes a runtime S correct without a mask.
+                if args.len() < 6 {
+                    return Err(format!(
+                        "attention_dyn: expected 6 args, got {}",
+                        args.len()
+                    ));
+                }
+                let result_ssa = extract_result_ssa(line).unwrap_or_else(|| "__att_out".to_string());
+                let q_arg = args[1].trim();
+                let q_gm = ctx
+                    .get_tile(q_arg)
+                    .and_then(|t| t.gm_name.clone())
+                    .ok_or_else(|| {
+                        format!("attention_dyn: needs a GM-backed Q tile, {} is not", q_arg)
+                    })?;
+                let k_res = ctx.resolve_ptr(k);
+                let v_res = ctx.resolve_ptr(v);
+                let k_gm = resolve_gm_name(&k_res, func);
+                let v_gm = resolve_gm_name(&v_res, func);
+                // args[4] arrives already rewritten to the ALLOCATED SSA, while
+                // the tile registry is keyed by the source name — so look it up
+                // both ways rather than assume which one this line carries.
+                let s_name = args[4].trim().to_string();
+                let (s_tile, s_ty) = match ctx.get_tile(&s_name) {
+                    Some(t) => (t.ssa.clone(), t.tile_buf_type_str()),
+                    None => {
+                        let hit = ctx
+                            .tiles
+                            .values()
+                            .find(|t| t.ssa == s_name)
+                            .map(|t| (t.ssa.clone(), t.tile_buf_type_str()));
+                        hit.ok_or_else(|| {
+                            format!("attention_dyn: unknown S tile {}", s_name)
+                        })?
+                    }
+                };
+                let d = ctx.resolve_const(args[5].trim());
+                // 16 is the largest block the UB budget allows at every D this
+                // corpus uses, and the host tail is a multiple of it.
+                emit_attention_dyn(
+                    ctx, &mut ops, &result_ssa, &q_gm, &k_gm, &v_gm, &s_tile, &s_ty, d, 16,
+                )?;
+                continue;
+            }
             return Err(
-                "attention_dyn: S is a runtime tile operand, so the K/V streaming loop \
-                 cannot be unrolled at emit time. The static `__tile_attention_blocked_f32` \
-                 form IS emitted (streaming, block unrolled); dyn needs a dynamic `scf.for` \
-                 with runtime view offsets, which this emitter does not build for attention."
+                "attention_dyn: pre-loaded K/V tiles are not a supported form for this op; \
+                 it exists to stream K/V from GM at a runtime length"
                     .to_string(),
             );
         }
@@ -3589,6 +3639,19 @@ fn translate_load(
         (1, ctx.resolve_const(args.get(1).map(|s| s.as_str()).unwrap_or("0")))
     };
 
+    // A SCALAR f32 operand cannot be a 1x1 tile: ptoas requires a row-major
+    // none_box tile's row byte size (cols * sizeof(dtype)) to be 32-byte
+    // aligned, and 1 * 4 = 4 is rejected. Load it as a 1x8 tile with v_col=1 —
+    // the same spelling the 1x1 i32 scratch uses — which makes the row 32 B.
+    // The DMA then reads 8 elements, so the host must 32-byte-pad the scalar
+    // buffer; that is part of the accepted host-side tail contract for the
+    // runtime-length attention path, and it is the only operand in the corpus
+    // that hits this case.
+    let scalar_f32 = rows == 1 && cols == 1 && dtype == "f32";
+    let (ar, ac) = if scalar_f32 { (1u32, 8u32) } else { (rows, cols) };
+    let rows = ar;
+    let cols = ac;
+
     // Resolve gm_arg → original GM func arg (following ptr_aliases chain)
     let elem_offset = ctx.resolve_offset(gm_arg);
     let resolved = ctx.resolve_ptr(gm_arg);
@@ -3631,8 +3694,22 @@ fn translate_load(
 
     // partition_view — use GEP-derived element offset if available
     let pv_ssa = ctx.make_pv(&tv_ssa, rows, cols, dtype, elem_offset, ops);
-    // alloc_tile
-    let tb_ssa = ctx.alloc_tile(&result_ssa, rows, cols, dtype, ops);
+    // alloc_tile. A scalar f32 must carry v_col=1 in its DECLARATION too, or the
+    // tload's outs type (v_col=1) disagrees with the alloc (v_col=8).
+    let tb_ty_decl = if scalar_f32 {
+        format!(
+            "!pto.tile_buf<loc=vec, dtype={}, rows={}, cols={}, v_row={}, v_col=1, \
+             blayout=row_major, slayout=none_box, fractal=512, pad=0>",
+            dtype, rows, cols, rows
+        )
+    } else {
+        tile_buf_type(rows, cols, dtype)
+    };
+    let tb_ssa = if scalar_f32 {
+        ctx.alloc_tile_typed(&result_ssa, rows, cols, dtype, &tb_ty_decl, ops)
+    } else {
+        ctx.alloc_tile(&result_ssa, rows, cols, dtype, ops)
+    };
     // record pv association for tstore later
     {
         let ti = ctx.tiles.get_mut(&result_ssa).unwrap();
@@ -3640,7 +3717,7 @@ fn translate_load(
         ti.gm_name = Some(gm_name.clone());
     }
 
-    let tb_ty = tile_buf_type(rows, cols, dtype);
+    let tb_ty = tb_ty_decl.clone();
     let ptv_ty = ptv_type(rows, cols, dtype);
     ops.push(format!(
         "pto.tload ins({} : {}) outs({} : {})",
@@ -6482,6 +6559,318 @@ fn pick_s_block(s: u32, d: u32) -> Option<u32> {
 /// Arithmetic note: blocked summation changes the reduction ORDER, so results
 /// may differ from the one-shot path in the last ulp. The softmax itself is
 /// unchanged — the max and the denominator are both global.
+/// `__tile_attention_dyn_f32` — 1-query decode attention over a RUNTIME KV length.
+///
+/// Same two-pass running-max/sum structure as [`emit_attention_blocked`], but the
+/// block count is read from the 1x1 S tile, so the per-block body is emitted ONCE
+/// inside an `scf.for` instead of unrolled `S/sb` times. Unrolling is what made a
+/// pinned-S artefact cost 4,065 B per block.
+///
+/// TAIL CONTRACT (owner-accepted 2026-11-11): the host pads the K plane with
+/// `-inf` to a multiple of `sb`. A tail lane then scores `-inf`, contributes 0 to
+/// the denominator and 0 to the weighted V, and cannot change the max — so no
+/// mask tile is needed. That matters because PTO has neither a compare nor a
+/// numeric i32->f32 conversion (`pto.tcast` is unknown to ptoas and `tmov`
+/// reinterprets), which is why a runtime S could not otherwise be handled.
+#[allow(clippy::too_many_arguments)]
+fn emit_attention_dyn(
+    ctx: &mut PtoContext,
+    ops: &mut Vec<String>,
+    result_ssa: &str,
+    q_gm: &str,
+    k_gm: &str,
+    v_gm: &str,
+    s_tile_ssa: &str,
+    s_ty: &str,
+    d: u32,
+    sb: u32,
+) -> Result<(), String> {
+    if sb == 0 || d == 0 {
+        return Err(format!("attention_dyn: bad block D={} sb={}", d, sb));
+    }
+    let scale = 1.0_f32 / (d as f32).sqrt();
+    let c_scale = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant {} : f32", c_scale, format_f32_decimal(scale)));
+    let c_zero = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant 0.00000000 : f32", c_zero));
+    let c_one = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant 1.00000000 : f32", c_one));
+    let c0 = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant 0 : index", c0));
+    let c1 = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant 1 : index", c1));
+    let c_sb = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant {} : index", c_sb, sb));
+    let c_d = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant {} : index", c_d, d));
+
+    let vec_1d = tile_buf_type(1, d, "f32");
+    let vec_sbd = tile_buf_type(sb, d, "f32");
+    let vec_dsb = tile_buf_type(d, sb, "f32");
+    let vec_1sb = tile_buf_type(1, sb, "f32");
+    let rr1 = tile_buf_type_rowreduce(1, "f32");
+    let rr_d = tile_buf_type_rowreduce(d, "f32");
+    let ptv_1d = ptv_type(1, d, "f32");
+    let ptv_sbd = ptv_type(sb, d, "f32");
+
+    // Runtime block count: ceil(S / sb). With the host -inf tail S is a multiple
+    // of sb, so the ceil is exact; the ceil is used so an unpadded host still
+    // covers the last partial block rather than dropping it.
+    let s_f = ctx.fresh_ssa();
+    ops.push(format!(
+        "{} = \"pto.tgetval\"({}, {}) : ({}, index) -> f32",
+        s_f, s_tile_ssa, c0, s_ty
+    ));
+    let s_i = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.fptosi {} : f32 to i32", s_i, s_f));
+    let s_idx = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.index_cast {} : i32 to index", s_idx, s_i));
+    let sb_i = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.constant {} : i32", sb_i, sb));
+    let nb_i = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.ceildivsi {}, {} : i32", nb_i, s_i, sb_i));
+    let nb = ctx.fresh_ssa();
+    ops.push(format!("{} = arith.index_cast {} : i32 to index", nb, nb_i));
+    ops.push(format!(
+        "// --- flash-blocked decode attention at RUNTIME S: blocks of {}, D={} ---",
+        sb, d
+    ));
+
+    // GM views: shape [S, D] with S an SSA dim, so the view is legal without
+    // knowing the length at emit time.
+    let k_tv = ctx.fresh_ssa();
+    ops.push(format!(
+        "{} = pto.make_tensor_view {}, shape = [{}, {}], strides = [{}, {}] : !pto.tensor_view<?x?xf32>",
+        k_tv, k_gm, s_idx, c_d, c_d, c1
+    ));
+    let v_tv = ctx.fresh_ssa();
+    ops.push(format!(
+        "{} = pto.make_tensor_view {}, shape = [{}, {}], strides = [{}, {}] : !pto.tensor_view<?x?xf32>",
+        v_tv, v_gm, s_idx, c_d, c_d, c1
+    ));
+
+    let mut alloc = |ty: &str, what: &str, ctx: &mut PtoContext, ops: &mut Vec<String>| {
+        let v = ctx.fresh_ssa();
+        ops.push(format!("{} = pto.alloc_tile : {}  // {}", v, ty, what));
+        v
+    };
+    let qb = alloc(&vec_sbd, "pool: broadcast Q", ctx, ops);
+    let ld = alloc(&vec_sbd, "pool: K or V block", ctx, ops);
+    let pr = alloc(&vec_sbd, "pool: elementwise product", ctx, ops);
+    let t1 = alloc(&vec_dsb, "pool: transpose scratch / product", ctx, ops);
+    let t2 = alloc(&vec_dsb, "pool: transposed", ctx, ops);
+    let t3 = alloc(&vec_dsb, "pool: broadcast weights", ctx, ops);
+    let g0 = alloc(&vec_dsb, "pool: weighted-V accumulator", ctx, ops);
+    let u1 = alloc(&vec_1sb, "pool: [1xSB] scratch", ctx, ops);
+    let u2 = alloc(&vec_1sb, "pool: [1xSB] scratch", ctx, ops);
+    let f0 = alloc(&vec_1sb, "pool: fold", ctx, ops);
+    let mx = alloc(&rr1, "global max", ctx, ops);
+    let sm = alloc(&rr1, "global softmax denominator", ctx, ops);
+
+    let q_tv = ctx.get_or_make_tv(q_gm, 1, d, "f32", ops);
+    let q_pv = ctx.make_pv(&q_tv, 1, d, "f32", 0, ops);
+    let qt = alloc(&vec_1d, "Q[1xD]", ctx, ops);
+    ops.push(format!(
+        "pto.tload ins({} : {}) outs({} : {})  // Q[1xD] (1-query decode)",
+        q_pv, ptv_1d, qt, vec_1d
+    ));
+    ops.push(format!(
+        "pto.tcolexpand ins({} : {}) outs({} : {})  // broadcast Q across SB rows",
+        qt, vec_1d, qb, vec_sbd
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+
+    // Per-block score chain, parameterised by the block offset SSA.
+    let mut emit_scores = |ctx: &mut PtoContext, ops: &mut Vec<String>, off: &str| {
+        let k_pv = ctx.fresh_ssa();
+        ops.push(format!(
+            "{} = pto.partition_view {}, offsets = [{}, {}], sizes = [{}, {}] : !pto.tensor_view<?x?xf32> -> {}",
+            k_pv, k_tv, off, c0, c_sb, c_d, ptv_sbd
+        ));
+        ops.push(format!(
+            "pto.tload ins({} : {}) outs({} : {})",
+            k_pv, ptv_sbd, ld, vec_sbd
+        ));
+        ops.push(format!(
+            "pto.tmul ins({}, {} : {}, {}) outs({} : {})  // K_b .* broadcast(Q)",
+            ld, qb, vec_sbd, vec_sbd, pr, vec_sbd
+        ));
+        ops.push("pto.barrier <PIPE_ALL>".to_string());
+        ops.push(format!(
+            "pto.ttrans ins({}, {} : {}, {}) outs({} : {})",
+            pr, t1, vec_sbd, vec_dsb, t2, vec_dsb
+        ));
+        ops.push("pto.barrier <PIPE_ALL>".to_string());
+        ops.push(format!(
+            "pto.tcolsum ins({} : {}) outs({} : {})  // scores [1xSB]",
+            t2, vec_dsb, u2, vec_1sb
+        ));
+        ops.push(format!(
+            "pto.tmuls ins({}, {} : {}, f32) outs({} : {})  // * 1/sqrt(D)",
+            u2, c_scale, vec_1sb, u1, vec_1sb
+        ));
+        ops.push("pto.barrier <PIPE_ALL>".to_string());
+    };
+
+    // ── pass A: max, seeded from block 0, then folded inside the loop ───────
+    // The fold cannot ping-pong f0/f1 across iterations, so it goes THROUGH u2
+    // and back into f0. One extra tmov per block.
+    ops.push("// block 0: scores (pass A)".to_string());
+    emit_scores(ctx, ops, &c0);
+    ops.push(format!(
+        "pto.tmov ins({} : {}) outs({} : {})  // seed the max fold",
+        u1, vec_1sb, f0, vec_1sb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!("scf.for %b = {} to {} step {} {{", c1, nb, c1));
+    ops.push(format!("  %off = arith.muli %b, {} : index", c_sb));
+    emit_scores(ctx, ops, "%off");
+    ops.push(format!(
+        "  pto.tmax ins({}, {} : {}, {}) outs({} : {})  // elementwise max fold",
+        f0, u1, vec_1sb, vec_1sb, u2, vec_1sb
+    ));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!("  pto.tmov ins({} : {}) outs({} : {})", u2, vec_1sb, f0, vec_1sb));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push("}".to_string());
+    ops.push(format!(
+        "pto.trowmax ins({}, {} : {}, {}) outs({} : {})  // global max",
+        f0, u2, vec_1sb, vec_1sb, mx, rr1
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+
+    // ── pass B: denominator and weighted V, both seeded from block 0 ────────
+    ops.push("// block 0: exp + weighted V (pass B)".to_string());
+    emit_scores(ctx, ops, &c0);
+    ops.push(format!(
+        "pto.trowexpandsub ins({}, {} : {}, {}) outs({} : {})",
+        u1, mx, vec_1sb, rr1, u2, vec_1sb
+    ));
+    ops.push(format!(
+        "pto.texp ins({} : {}) outs({} : {})  // exp(score - global max)",
+        u2, vec_1sb, u1, vec_1sb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "pto.tmov ins({} : {}) outs({} : {})  // seed the sum fold",
+        u1, vec_1sb, f0, vec_1sb
+    ));
+    let v_pv0 = ctx.fresh_ssa();
+    ops.push(format!(
+        "{} = pto.partition_view {}, offsets = [{}, {}], sizes = [{}, {}] : !pto.tensor_view<?x?xf32> -> {}",
+        v_pv0, v_tv, c0, c0, c_sb, c_d, ptv_sbd
+    ));
+    ops.push(format!(
+        "pto.tload ins({} : {}) outs({} : {})",
+        v_pv0, ptv_sbd, ld, vec_sbd
+    ));
+    ops.push(format!(
+        "pto.ttrans ins({}, {} : {}, {}) outs({} : {})  // V_b[SBxD] -> [DxSB]",
+        ld, t1, vec_sbd, vec_dsb, t2, vec_dsb
+    ));
+    ops.push(format!(
+        "pto.tcolexpand ins({} : {}) outs({} : {})  // exp across D rows",
+        u1, vec_1sb, t3, vec_dsb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "pto.tmul ins({}, {} : {}, {}) outs({} : {})",
+        t2, t3, vec_dsb, vec_dsb, t1, vec_dsb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "pto.tmov ins({} : {}) outs({} : {})  // seed the V accumulator",
+        t1, vec_dsb, g0, vec_dsb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+
+    ops.push(format!("scf.for %b = {} to {} step {} {{", c1, nb, c1));
+    ops.push(format!("  %off = arith.muli %b, {} : index", c_sb));
+    emit_scores(ctx, ops, "%off");
+    ops.push(format!(
+        "  pto.trowexpandsub ins({}, {} : {}, {}) outs({} : {})",
+        u1, mx, vec_1sb, rr1, u2, vec_1sb
+    ));
+    ops.push(format!("  pto.texp ins({} : {}) outs({} : {})", u2, vec_1sb, u1, vec_1sb));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "  pto.tadd ins({}, {} : {}, {}) outs({} : {})  // sum fold",
+        f0, u1, vec_1sb, vec_1sb, u2, vec_1sb
+    ));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!("  pto.tmov ins({} : {}) outs({} : {})", u2, vec_1sb, f0, vec_1sb));
+    let v_pv = ctx.fresh_ssa();
+    ops.push(format!(
+        "  {} = pto.partition_view {}, offsets = [%off, {}], sizes = [{}, {}] : !pto.tensor_view<?x?xf32> -> {}",
+        v_pv, v_tv, c0, c_sb, c_d, ptv_sbd
+    ));
+    ops.push(format!(
+        "  pto.tload ins({} : {}) outs({} : {})",
+        v_pv, ptv_sbd, ld, vec_sbd
+    ));
+    ops.push(format!(
+        "  pto.ttrans ins({}, {} : {}, {}) outs({} : {})",
+        ld, t1, vec_sbd, vec_dsb, t2, vec_dsb
+    ));
+    ops.push(format!(
+        "  pto.tcolexpand ins({} : {}) outs({} : {})",
+        u1, vec_1sb, t3, vec_dsb
+    ));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "  pto.tmul ins({}, {} : {}, {}) outs({} : {})",
+        t2, t3, vec_dsb, vec_dsb, t1, vec_dsb
+    ));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "  pto.tadd ins({}, {} : {}, {}) outs({} : {})",
+        g0, t1, vec_dsb, vec_dsb, t2, vec_dsb
+    ));
+    ops.push("  pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!("  pto.tmov ins({} : {}) outs({} : {})", t2, vec_dsb, g0, vec_dsb));
+    ops.push("}".to_string());
+
+    ops.push(format!(
+        "pto.trowsum ins({}, {} : {}, {}) outs({} : {})  // global denominator",
+        f0, u2, vec_1sb, vec_1sb, sm, rr1
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+
+    // Epilogue identical in shape to the unrolled path: build 1/l per lane,
+    // broadcast down D rows, multiply, reduce.
+    ops.push(format!(
+        "pto.tmuls ins({}, {} : {}, f32) outs({} : {})  // zero",
+        u2, c_zero, vec_1sb, u1, vec_1sb
+    ));
+    ops.push(format!(
+        "pto.tadds ins({}, {} : {}, f32) outs({} : {})  // ones",
+        u1, c_one, vec_1sb, u2, vec_1sb
+    ));
+    ops.push(format!(
+        "pto.trowexpanddiv ins({}, {} : {}, {}) outs({} : {})  // 1/l per lane",
+        u2, sm, vec_1sb, rr1, u1, vec_1sb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "pto.tcolexpand ins({} : {}) outs({} : {})",
+        u1, vec_1sb, t3, vec_dsb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    ops.push(format!(
+        "pto.tmul ins({}, {} : {}, {}) outs({} : {})  // acc / l",
+        g0, t3, vec_dsb, vec_dsb, t1, vec_dsb
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+
+    let out = ctx.alloc_tile_rowreduce(result_ssa, d, "f32", ops);
+    ops.push(format!(
+        "pto.trowsum ins({}, {} : {}, {}) outs({} : {})  // out[d]=sum_s w[s].V[s][d]",
+        t1, t3, vec_dsb, vec_dsb, out, rr_d
+    ));
+    ops.push("pto.barrier <PIPE_ALL>".to_string());
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_attention_blocked(
     ctx: &mut PtoContext,
