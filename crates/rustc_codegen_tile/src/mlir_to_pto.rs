@@ -621,10 +621,17 @@ fn infer_arg_dtype_from_emitted(arg: &str, emitted: &[String]) -> Option<String>
         // what the two users differ in — `deqf16_vec` dequantises the per-column
         // scale in flight (int8 GMM), `no_convert` passes the accumulator
         // through (plain matmul, nothing to scale).
-        let slot_size = c2v.m * c2v.nb * c2v_elem_bytes(&c2v.quant, &c2v.out_dtype);
+        // ptoas requires a fixpipe producer slot of at least 8192 B for the
+        // resolved post-fixpipe consumer entry, so the slot is the padded shape
+        // with a hard floor rather than the raw m*nb*bytes. Both halves compute
+        // this identically — they must, or the FIFO rendezvous misses.
+        let raw_slot = c2v.mpad.max(c2v.m) * c2v.nb * c2v_elem_bytes(&c2v.quant, &c2v.out_dtype);
+        let slot_size = raw_slot.max(8192);
         // Elements per block on the f32 side — the slot stride the pipe indexes
         // by. Sized in ELEMENTS, unlike slot_size which is bytes.
-        let slot_stride_f32 = c2v.m * c2v.nb;
+        // Keep the historical m*nb stride so every already-banked kernel emits
+        // byte-identically; only widen it if the 8192 B floor needs more room.
+        let slot_stride_f32 = (c2v.mpad.max(c2v.m) * c2v.nb).max(slot_size / 4);
         writeln!(out, "    %c0_i32 = arith.constant 0 : i32").unwrap();
         writeln!(
             out,
@@ -729,9 +736,10 @@ fn emit_c2v_vector_func(
         .rfind(|(_, dtype)| dtype == odt)
         .unwrap_or_else(|| &arg_sig[arg_sig.len() - 1])
         .0;
-    let slot_size = m * nb * c2v_elem_bytes(&c2v.quant, &c2v.out_dtype);
+    let raw_slot = c2v.mpad.max(m) * nb * c2v_elem_bytes(&c2v.quant, &c2v.out_dtype);
+    let slot_size = raw_slot.max(8192); // see the cube-half comment: ptoas floor
     let reserve_size = slot_size * 2; // slot_num = 2
-    let slot_stride_f32 = m * nb; // f32 elements per block (see cube-half comment)
+    let slot_stride_f32 = (c2v.mpad.max(m) * nb).max(slot_size / 4); // f32 elements per block
 
     writeln!(out, "  func.func @{}_aiv(", func.name).unwrap();
     for (i, (name, dtype)) in arg_sig.iter().enumerate() {
@@ -799,10 +807,24 @@ fn emit_c2v_vector_func(
     )
     .unwrap();
 
+    // The cube pushes `mpad` rows (M padded up to the 16-row fractal for the M<16
+    // dequant GEMM). The pop must agree with the PUSH, not with the GM shape, or
+    // ptoas rejects the pair on element count; rows [0, m) are extracted before
+    // the store so the GM write stays the declared M.
+    let mpad = c2v.mpad.max(m);
     let recv_ty = format!(
+        "!pto.tile_buf<loc=vec, dtype={}, rows={}, cols={}, v_row={}, v_col={}, blayout=row_major, slayout=none_box, fractal=512, pad=0>",
+        odt, mpad, nb, mpad, nb
+    );
+    let store_ty = format!(
         "!pto.tile_buf<loc=vec, dtype={}, rows={}, cols={}, v_row={}, v_col={}, blayout=row_major, slayout=none_box, fractal=512, pad=0>",
         odt, m, nb, m, nb
     );
+    let (trecv, trecv_indent) = if mpad != m {
+        ("%recv_m", true)
+    } else {
+        ("%recv", false)
+    };
     let out_ptv = format!("!pto.partition_tensor_view<{}x{}x{}>", m, nb, odt);
     let out_tv = format!("!pto.tensor_view<?x?x{}>", odt);
 
@@ -826,10 +848,14 @@ fn emit_c2v_vector_func(
         )
         .unwrap();
         writeln!(out, "      %recv = pto.tpop_from_aic {{id = 0, split = 0}} -> {}", recv_ty).unwrap();
+        if trecv_indent {
+            writeln!(out, "      %recv_m = pto.alloc_tile : {}", store_ty).unwrap();
+            writeln!(out, "      pto.textract ins(%recv, %c0, %c0 : {}, index, index) outs({} : {})", recv_ty, trecv, store_ty).unwrap();
+        }
         writeln!(
             out,
-            "      pto.tstore ins(%recv : {}) outs(%out_part : {})",
-            recv_ty, out_ptv
+            "      pto.tstore ins({} : {}) outs(%out_part : {})",
+            trecv, store_ty, out_ptv
         )
         .unwrap();
         writeln!(out, "      pto.tfree_from_aic {{id = 0, split = 0}}").unwrap();
@@ -842,10 +868,14 @@ fn emit_c2v_vector_func(
         )
         .unwrap();
         writeln!(out, "    %recv = pto.tpop_from_aic {{id = 0, split = 0}} -> {}", recv_ty).unwrap();
+        if trecv_indent {
+            writeln!(out, "    %recv_m = pto.alloc_tile : {}", store_ty).unwrap();
+            writeln!(out, "    pto.textract ins(%recv, %c0, %c0 : {}, index, index) outs({} : {})", recv_ty, trecv, store_ty).unwrap();
+        }
         writeln!(
             out,
-            "    pto.tstore ins(%recv : {}) outs(%out_part : {})",
-            recv_ty, out_ptv
+            "    pto.tstore ins({} : {}) outs(%out_part : {})",
+            trecv, store_ty, out_ptv
         )
         .unwrap();
         writeln!(out, "    pto.tfree_from_aic {{id = 0, split = 0}}").unwrap();
@@ -1905,6 +1935,10 @@ impl MatmulDtypes {
 #[derive(Clone)]
 struct PendingBlockedMatmul {
     m: u32,
+    /// Rows the cube tiles are allocated at. `m` rounded up to the 16-row cube
+    /// fractal when the source M is below it (M<16 decode GEMMs); equal to `m`
+    /// otherwise, so every existing kernel emits byte-identically.
+    mpad: u32,
     k: u32,
     n: u32,
     kb: u32,
@@ -2066,6 +2100,15 @@ impl C2vSplitSpec {
 #[derive(Clone)]
 struct C2vSplitSpec {
     m: u32,
+    /// Rows actually PUSHED by the cube half. Equal to `m` for every kernel whose
+    /// M is already a multiple of the 16-row cube fractal; larger for the M<16
+    /// decode GEMM, whose accumulator must be padded to 16 to be a legal cube
+    /// destination. The vector half pops `mpad` rows and `textract`s rows
+    /// `[0, m)` before storing, so the pushed and popped shapes agree while the
+    /// GM write stays the declared `m`. Kept separate from `m` because `m` is
+    /// also the output shape, and conflating the two is exactly the mismatch
+    /// ptoas reports as a tpop/tstore element-count error.
+    mpad: u32,
     n: u32,
     nb: u32,
     n_iters: u32,
@@ -4032,6 +4075,7 @@ fn emit_blocked_matmul_loops(
             ));
             ctx.c2v = Some(C2vSplitSpec {
                 m: p.m,
+                mpad: p.mpad,
                 n: p.n,
                 nb: p.nb,
                 n_iters: p.n_iters,
@@ -4080,6 +4124,7 @@ fn emit_blocked_matmul_loops(
             let quant = plain_c2v_quant_for(acc_dtype, out_dtype).unwrap_or("no_convert");
             ctx.c2v = Some(C2vSplitSpec {
                 m: p.m,
+                mpad: p.mpad,
                 n: p.n,
                 nb: p.nb,
                 n_iters: p.n_iters,
@@ -5397,13 +5442,21 @@ fn translate_matmul_blocked(
     ctx: &mut PtoContext,
     ops: &mut Vec<String>,
 ) -> Result<(), String> {
-    if m % PTO_MM_MROW_ALIGN != 0 {
+    // M below the cube fractal is PADDED here rather than refused, but only for
+    // the int8-dequant store kind: that path hands the accumulator to the vector
+    // half through `tpush_to_aiv`, so the popped tile can be `textract`ed back to
+    // the declared M before the GM write. The f32/f16 and i8-raw paths store
+    // straight from the cube, where a padded accumulator would write rows the
+    // kernel never defined — they keep refusing.
+    let pad_m = m % PTO_MM_MROW_ALIGN != 0;
+    if pad_m && !matches!(dtypes.dst, "i32") {
         return Err(format!(
             "blocked matmul: M={} must be a multiple of {} (910B2 cube fixedRowSize). \
              Pad the M dim of your Rust tile_matmul kernel source.",
             m, PTO_MM_MROW_ALIGN
         ));
     }
+    let mpad = if pad_m { (m + PTO_MM_MROW_ALIGN - 1) / PTO_MM_MROW_ALIGN * PTO_MM_MROW_ALIGN } else { m };
     let kb = pick_kb_for_mn_dtype(m, k, n, dtypes.lhs_bytes() as u32);
     let nb = pick_nb_for_dtype(n, dtypes.lhs_bytes() as u32);
     if k % kb != 0 {
@@ -5438,20 +5491,20 @@ fn translate_matmul_blocked(
     //   a_left (M × Kb)  — L0A working copy, dtype=lhs
     //   b_right (Kb × Nb) — L0B working copy, dtype=rhs
     //   acc    (M × Nb)  — L0C accumulator (one block-column at a time), dtype=dst
-    let mat_a_ty = mat_tile_type(m, kb, dtypes.lhs);
+    let mat_a_ty = mat_tile_type(mpad, kb, dtypes.lhs);
     // A transposed B reaches CBUF through the DN->ZN path, which needs a ZN staging tile.
     let mat_b_ty = if b_transposed {
         mat_tile_type_zn(kb, nb, dtypes.rhs)
     } else {
         mat_tile_type(kb, nb, dtypes.rhs)
     };
-    let left_ty = left_tile_type(m, kb, dtypes.lhs);
+    let left_ty = left_tile_type(mpad, kb, dtypes.lhs);
     let right_ty = right_tile_type(kb, nb, dtypes.rhs);
-    let acc_ty = acc_tile_type(m, nb, dtypes.dst);
+    let acc_ty = acc_tile_type(mpad, nb, dtypes.dst);
 
     let mat_a_ssa = ctx.alloc_tile_typed(
         &format!("{}__mat_a_blk", result_ssa),
-        m,
+        mpad,
         kb,
         dtypes.lhs,
         &mat_a_ty,
@@ -5467,7 +5520,7 @@ fn translate_matmul_blocked(
     );
     let a_left_ssa = ctx.alloc_tile_typed(
         &format!("{}__a_left_blk", result_ssa),
-        m,
+        mpad,
         kb,
         dtypes.lhs,
         &left_ty,
@@ -5485,7 +5538,7 @@ fn translate_matmul_blocked(
     // tstore lookup finds it — but we actually tstore it per-N-block
     // inline below. The downstream tstore must recognise "already stored"
     // to avoid a duplicate emit.
-    let acc_ssa = ctx.alloc_tile_typed(result_ssa, m, nb, dtypes.dst, &acc_ty, ops);
+    let acc_ssa = ctx.alloc_tile_typed(result_ssa, mpad, nb, dtypes.dst, &acc_ty, ops);
 
     // Per the design note: we emit the per-N-block tstore inline below.
     // To avoid translate_store re-emitting a full-shape tstore for
@@ -5538,6 +5591,7 @@ fn translate_matmul_blocked(
     };
     let pending = PendingBlockedMatmul {
         m,
+        mpad,
         k,
         n,
         kb,
@@ -10990,6 +11044,7 @@ fn translate_grouped_matmul_swiglu_quant(
 
     ctx.c2v = Some(C2vSplitSpec {
         m,
+        mpad: m,
         n: concat_n,
         nb,
         n_iters,
